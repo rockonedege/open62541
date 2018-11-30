@@ -1018,13 +1018,16 @@ UA_WriterGroup_publishCallback(UA_Server *server, UA_WriterGroup *writerGroup) {
     UA_PubSubConnection *connection =
         UA_PubSubConnection_findConnectionbyId(server, writerGroup->linkedConnection);
     if(!connection){
-        UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER, "Publish failed. PubSubConnection invalid.");
+        UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER,
+                     "Publish failed. PubSubConnection invalid.");
         return;
     }
-    //prevent error if the maxEncapsulatedDataSetMessageCount is set to 0->1
-    writerGroup->config.maxEncapsulatedDataSetMessageCount = (UA_UInt16) (writerGroup->config.maxEncapsulatedDataSetMessageCount == 0 ||
-                                                                          writerGroup->config.maxEncapsulatedDataSetMessageCount > UA_BYTE_MAX
-                                                                          ? 1 : writerGroup->config.maxEncapsulatedDataSetMessageCount);
+
+    /* If the maxEncapsulatedDataSetMessageCount is set to 0->1 */
+    writerGroup->config.maxEncapsulatedDataSetMessageCount = (UA_UInt16)
+        (writerGroup->config.maxEncapsulatedDataSetMessageCount == 0 ||
+         writerGroup->config.maxEncapsulatedDataSetMessageCount > UA_BYTE_MAX
+         ? 1 : writerGroup->config.maxEncapsulatedDataSetMessageCount);
 
     UA_DataSetMessage *dsmStore = (UA_DataSetMessage *) UA_calloc(writerGroup->writersCount, sizeof(UA_DataSetMessage));
     if(!dsmStore) {
