@@ -993,23 +993,30 @@ UA_DataSetWriter_generateDataSetMessage(UA_Server *server, UA_DataSetMessage *da
     return UA_STATUSCODE_GOOD;
 }
 
-/*
- * This callback triggers the collection and publish of NetworkMessages and the contained DataSetMessages.
- */
+/* This callback triggers the collection and publish of NetworkMessages and the
+ * contained DataSetMessages. */
 void
 UA_WriterGroup_publishCallback(UA_Server *server, UA_WriterGroup *writerGroup) {
     if(!writerGroup){
-        UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER, "Publish failed. WriterGroup not found");
+        UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER,
+                     "Publish failed. WriterGroup not found");
         return;
     }
+
+    /* Nothing to do? */
     if(writerGroup->writersCount <= 0)
         return;
 
+    /* Binary encoding? */
     if(writerGroup->config.encodingMimeType != UA_PUBSUB_ENCODING_UADP) {
-        UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER, "Unknown encoding type.");
+        UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER,
+                     "Unknown encoding type.");
         return;
     }
-    UA_PubSubConnection *connection = UA_PubSubConnection_findConnectionbyId(server, writerGroup->linkedConnection);
+
+    /* Find the connection associated with the writer */
+    UA_PubSubConnection *connection =
+        UA_PubSubConnection_findConnectionbyId(server, writerGroup->linkedConnection);
     if(!connection){
         UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER, "Publish failed. PubSubConnection invalid.");
         return;
@@ -1030,9 +1037,11 @@ UA_WriterGroup_publishCallback(UA_Server *server, UA_WriterGroup *writerGroup) {
     UA_STACKARRAY(UA_UInt16, dsWriterIds, writerGroup->writersCount);
     memset(dsmSizes, 0, writerGroup->writersCount * sizeof(UA_UInt16));
     memset(dsWriterIds, 0, writerGroup->writersCount * sizeof(UA_UInt16));
-    /*
-     * Calculate the number of needed NetworkMessages. The previous allocated DataSetMessage array is
-     * filled from left for combined DSM messages and from the right for single DSM.
+
+    /* Calculate the number of needed NetworkMessages. The previous allocated
+     * DataSetMessage array is filled from left for combined DSM messages and
+     * from the right for single DSM.
+     *
      *     Allocated DSM Array
      *    +----------------------------+
      *    |DSM1||DSM2||DSM3||DSM4||DSM5|
@@ -1050,13 +1059,15 @@ UA_WriterGroup_publishCallback(UA_Server *server, UA_WriterGroup *writerGroup) {
         //if promoted fields are contained in the PublishedDataSet, then this DSM must encapsulated in one NM
         UA_PublishedDataSet *tmpPublishedDataSet = UA_PublishedDataSet_findPDSbyId(server, tmpDataSetWriter->connectedDataSet);
         if(!tmpPublishedDataSet) {
-            UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER, "Publish failed. PublishedDataSet not found");
+            UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER,
+                         "Publish failed. PublishedDataSet not found");
             return;
         }
         if(tmpPublishedDataSet->promotedFieldsCount > 0) {
             if(UA_DataSetWriter_generateDataSetMessage(server, &dsmStore[(writerGroup->writersCount - 1) - singleNetworkMessagesCount],
                                                        tmpDataSetWriter) != UA_STATUSCODE_GOOD){
-                UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER, "Publish failed. DataSetMessage creation failed");
+                UA_LOG_ERROR(server->config.logger, UA_LOGCATEGORY_SERVER,
+                             "Publish failed. DataSetMessage creation failed");
                 return;
             };
             dsWriterIds[(writerGroup->writersCount - 1) - singleNetworkMessagesCount] = tmpDataSetWriter->config.dataSetWriterId;
@@ -1073,6 +1084,7 @@ UA_WriterGroup_publishCallback(UA_Server *server, UA_WriterGroup *writerGroup) {
             combinedNetworkMessageCount++;
         }
     }
+
     UA_UInt32 networkMessageCount = singleNetworkMessagesCount;
     if(combinedNetworkMessageCount != 0){
         combinedNetworkMessageCount = (UA_UInt16) (
@@ -1080,7 +1092,8 @@ UA_WriterGroup_publishCallback(UA_Server *server, UA_WriterGroup *writerGroup) {
                 (combinedNetworkMessageCount % writerGroup->config.maxEncapsulatedDataSetMessageCount) == 0 ? 0 : 1);
         networkMessageCount += combinedNetworkMessageCount;
     }
-    if(networkMessageCount < 1){
+
+    if(networkMessageCount == 0) {
         for(size_t i = 0; i < writerGroup->writersCount; i++){
             UA_DataSetMessage_free(&dsmStore[i]);
         }
@@ -1131,7 +1144,7 @@ UA_WriterGroup_publishCallback(UA_Server *server, UA_WriterGroup *writerGroup) {
         if(UA_ByteString_allocBuffer(&buf, msgSize) == UA_STATUSCODE_GOOD) {
             UA_Byte *bufPos = buf.data;
             memset(bufPos, 0, msgSize);
-            const UA_Byte *bufEnd = &(buf.data[buf.length]);
+            const UA_Byte *bufEnd = &buf.data[buf.length];
             if(UA_NetworkMessage_encodeBinary(&nmStore[i], &bufPos, bufEnd) != UA_STATUSCODE_GOOD){
                 UA_ByteString_deleteMembers(&buf);
                 return;
