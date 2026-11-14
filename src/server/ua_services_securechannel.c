@@ -1,205 +1,52 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. 
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
  *    Copyright 2014-2017 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
  *    Copyright 2014, 2017 (c) Florian Palm
  *    Copyright 2015 (c) Oleksiy Vasylyev
  *    Copyright 2017 (c) Stefan Profanter, fortiss GmbH
  *    Copyright 2017 (c) Mark Giraud, Fraunhofer IOSB
+ *    Copyright 2023 (c) Hilscher Gesellschaft für Systemautomation mbH (Author: Phuong Nguyen)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
  */
 
+#include <open62541/types.h>
 #include "ua_server_internal.h"
 #include "ua_services.h"
 
-#ifndef container_of
-#define container_of(ptr, type, member) \
-    (type *)((uintptr_t)ptr - offsetof(type,member))
-#endif
-
-static void
-removeSecureChannelCallback(void *_, channel_entry *entry) {
-    UA_SecureChannel_close(&entry->channel);
-}
-
-/* Half-closes the channel. Will be completely closed / deleted in a deferred
- * callback. Deferring is necessary so we don't remove lists that are still
- * processed upwards the call stack. */
-static void
-removeSecureChannel(UA_Server *server, channel_entry *entry,
-                    UA_DiagnosticEvent event) {
-    if(entry->channel.state == UA_SECURECHANNELSTATE_CLOSING)
-        return;
-    entry->channel.state = UA_SECURECHANNELSTATE_CLOSING;
-
-    /* Detach from the connection and close the connection */
-    if(entry->channel.connection) {
-        if(entry->channel.connection->state != UA_CONNECTIONSTATE_CLOSED)
-            entry->channel.connection->close(entry->channel.connection);
-        UA_Connection_detachSecureChannel(entry->channel.connection);
-    }
-
-    /* Detach the channel */
-    TAILQ_REMOVE(&server->channels, entry, pointers);
-
-    /* Update the statistics */
-    UA_SecureChannelStatistics *scs = &server->serverStats.scs;
-    UA_atomic_subSize(&scs->currentChannelCount, 1);
-    switch(event) {
-    case UA_DIAGNOSTICEVENT_CLOSE:
-        break;
-    case UA_DIAGNOSTICEVENT_TIMEOUT:
-        UA_atomic_addSize(&scs->channelTimeoutCount, 1);
-        break;
-    case UA_DIAGNOSTICEVENT_PURGE:
-        UA_atomic_addSize(&scs->channelPurgeCount, 1);
-        break;
-    case UA_DIAGNOSTICEVENT_REJECT:
-    case UA_DIAGNOSTICEVENT_SECURITYREJECT:
-        UA_atomic_addSize(&scs->rejectedChannelCount, 1);
-        break;
-    case UA_DIAGNOSTICEVENT_ABORT:
-        UA_atomic_addSize(&scs->channelAbortCount, 1);
-        break;
-    default:
-        UA_assert(false);
-        break;
-    }
-
-    /* Add a delayed callback to remove the channel when the currently
-     * scheduled jobs have completed */
-    entry->cleanupCallback.callback = (UA_ApplicationCallback)removeSecureChannelCallback;
-    entry->cleanupCallback.application = NULL;
-    entry->cleanupCallback.data = entry;
-    entry->cleanupCallback.nextTime = UA_DateTime_nowMonotonic() + 1;
-    entry->cleanupCallback.interval = 0; /* Remove the structure */
-    UA_Timer_addTimerEntry(&server->timer, &entry->cleanupCallback, NULL);
-}
-
-void
-UA_Server_deleteSecureChannels(UA_Server *server) {
-    channel_entry *entry, *temp;
-    TAILQ_FOREACH_SAFE(entry, &server->channels, pointers, temp)
-        removeSecureChannel(server, entry, UA_DIAGNOSTICEVENT_CLOSE);
-}
-
-/* remove channels that were not renewed or who have no connection attached */
-void
-UA_Server_cleanupTimedOutSecureChannels(UA_Server *server,
-                                        UA_DateTime nowMonotonic) {
-    channel_entry *entry, *temp;
-    TAILQ_FOREACH_SAFE(entry, &server->channels, pointers, temp) {
-        /* The channel was closed internally */
-        if(entry->channel.state == UA_SECURECHANNELSTATE_CLOSED ||
-           !entry->channel.connection) {
-            removeSecureChannel(server, entry, UA_DIAGNOSTICEVENT_CLOSE);
-            continue;
-        }
-
-        /* Is the SecurityToken already created? */
-        if(entry->channel.securityToken.createdAt == 0) {
-        	/* No -> channel is still in progress of being opened, do not remove */
-        	continue;
-        }
-
-        /* Has the SecurityToken timed out? */
-        UA_DateTime timeout =
-            entry->channel.securityToken.createdAt +
-            (UA_DateTime)(entry->channel.securityToken.revisedLifetime * UA_DATETIME_MSEC);
-
-        /* There is a new token. But it has not been used by the client so far.
-         * Do the rollover now instead of shutting the channel down.
-         *
-         * Part 4, 5.5.2 says: Servers shall use the existing SecurityToken to
-         * secure outgoing Messages until the SecurityToken expires or the
-         * Server receives a Message secured with a new SecurityToken.*/
-        if(timeout < nowMonotonic &&
-           entry->channel.renewState == UA_SECURECHANNELRENEWSTATE_NEWTOKEN_SERVER) {
-            /* Compare with the rollover in checkSymHeader */
-            entry->channel.renewState = UA_SECURECHANNELRENEWSTATE_NORMAL;
-            entry->channel.securityToken = entry->channel.altSecurityToken;
-            UA_ChannelSecurityToken_init(&entry->channel.altSecurityToken);
-            UA_SecureChannel_generateLocalKeys(&entry->channel);
-            generateRemoteKeys(&entry->channel);
-
-            /* Use the timeout of the new SecurityToken */
-            timeout = entry->channel.securityToken.createdAt +
-                (UA_DateTime)(entry->channel.securityToken.revisedLifetime * UA_DATETIME_MSEC);
-        }
-
-        if(timeout < nowMonotonic) {
-            UA_LOG_INFO_CHANNEL(&server->config.logger, &entry->channel,
-                                "SecureChannel has timed out");
-            removeSecureChannel(server, entry, UA_DIAGNOSTICEVENT_TIMEOUT);
-        }
-    }
-}
-
-/* remove the first channel that has no session attached */
-static UA_Boolean
-purgeFirstChannelWithoutSession(UA_Server *server) {
-    channel_entry *entry;
-    TAILQ_FOREACH(entry, &server->channels, pointers) {
-        if(SLIST_FIRST(&entry->channel.sessions))
-            continue;
-        UA_LOG_INFO_CHANNEL(&server->config.logger, &entry->channel,
-                            "Channel was purged since maxSecureChannels was "
-                            "reached and channel had no session attached");
-        removeSecureChannel(server, entry, UA_DIAGNOSTICEVENT_PURGE);
-        return true;
-    }
-    return false;
-}
+/* The OpenSecureChannel Service in the server is split as follows:
+ *
+ * - Decode the OPN Asymmetric Header (SecureChannel)
+ * - Process the OPN Asymmetric Header (here, via channel->processOPNHeader callback)
+ *   - Verify the remote certificate and configure the SecureChannel
+ * - Verify the OPN message signature and decrypt (SecureChannel)
+ * - Process the OpenSecureChannelRequest (here, via standard service call logic)
+ */
 
 UA_StatusCode
-UA_Server_createSecureChannel(UA_Server *server, UA_Connection *connection) {
-    /* connection already has a channel attached. */
-    if(connection->channel != NULL)
-        return UA_STATUSCODE_BADINTERNALERROR;
+processOPN_AsymHeader(void *application, UA_SecureChannel *channel,
+                      const UA_AsymmetricAlgorithmSecurityHeader *asymHeader) {
+    if(channel->securityPolicy)
+        return UA_STATUSCODE_GOOD;
 
-    /* Check if there exists a free SC, otherwise try to purge one SC without a
-     * session the purge has been introduced to pass CTT, it is not clear what
-     * strategy is expected here */
-    if(server->serverStats.scs.currentChannelCount >= server->config.maxSecureChannels &&
-       !purgeFirstChannelWithoutSession(server))
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-
-    channel_entry *entry = (channel_entry *)UA_malloc(sizeof(channel_entry));
-    if(!entry)
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-
-    /* Channel state is closed (0) */
-    /* TODO: Use the connection config from the correct network layer */
-    UA_SecureChannel_init(&entry->channel, &server->config.networkLayers[0].localConnectionConfig);
-    entry->channel.certificateVerification = &server->config.certificateVerification;
-    entry->channel.processOPNHeader = UA_Server_configSecureChannel;
-
-    TAILQ_INSERT_TAIL(&server->channels, entry, pointers);
-    UA_Connection_attachSecureChannel(connection, &entry->channel);
-    UA_atomic_addSize(&server->serverStats.scs.currentChannelCount, 1);
-    UA_atomic_addSize(&server->serverStats.scs.cumulatedChannelCount, 1);
-    return UA_STATUSCODE_GOOD;
-}
-
-UA_StatusCode
-UA_Server_configSecureChannel(void *application, UA_SecureChannel *channel,
-                              const UA_AsymmetricAlgorithmSecurityHeader *asymHeader) {
     /* Iterate over available endpoints and choose the correct one */
+    UA_Server *server = (UA_Server *)application;
+    UA_ServerConfig *sc = &server->config;
     UA_SecurityPolicy *securityPolicy = NULL;
-    UA_Server *const server = (UA_Server *const) application;
-    for(size_t i = 0; i < server->config.securityPoliciesSize; ++i) {
-        UA_SecurityPolicy *policy = &server->config.securityPolicies[i];
-        if(!UA_ByteString_equal(&asymHeader->securityPolicyUri, &policy->policyUri))
+    for(size_t i = 0; i < sc->securityPoliciesSize; ++i) {
+        UA_SecurityPolicy *policy = &sc->securityPolicies[i];
+        if(!UA_String_equal(&asymHeader->securityPolicyUri, &policy->policyUri))
             continue;
 
-        UA_StatusCode retval = policy->asymmetricModule.
-            compareCertificateThumbprint(policy, &asymHeader->receiverCertificateThumbprint);
-        if(retval != UA_STATUSCODE_GOOD)
+        UA_StatusCode res = policy->
+            compareCertThumbprint(policy, &asymHeader->receiverCertificateThumbprint);
+        if(res != UA_STATUSCODE_GOOD)
             continue;
 
-        /* We found the correct policy (except for security mode). The endpoint
-         * needs to be selected by the client / server to match the security
-         * mode in the endpoint for the session. */
+        /* We found the correct policy. The endpoint is selected later during
+         * CreateSession. There the channel's SecurityMode also gets checked
+         * against the endpoint definition. */
         securityPolicy = policy;
         break;
     }
@@ -207,180 +54,298 @@ UA_Server_configSecureChannel(void *application, UA_SecureChannel *channel,
     if(!securityPolicy)
         return UA_STATUSCODE_BADSECURITYPOLICYREJECTED;
 
-    /* Create the channel context and parse the sender (remote) certificate used for the
-     * secureChannel. */
-    UA_StatusCode retval =
-        UA_SecureChannel_setSecurityPolicy(channel, securityPolicy,
-                                           &asymHeader->senderCertificate);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    channel->securityToken.tokenId = server->lastTokenId++;
-    return UA_STATUSCODE_GOOD;
-}
-
-static UA_StatusCode
-UA_SecureChannelManager_open(UA_Server *server, UA_SecureChannel *channel,
-                             const UA_OpenSecureChannelRequest *request,
-                             UA_OpenSecureChannelResponse *response) {
-    if(channel->state != UA_SECURECHANNELSTATE_ACK_SENT) {
-        UA_LOG_ERROR_CHANNEL(&server->config.logger, channel,
-                             "Called open on already open or closed channel");
-        return UA_STATUSCODE_BADINTERNALERROR;
+    /* Verify the client certificate (chain).
+     * Here we don't have the ApplicationDescription.
+     * This check follows in the CreateSession service. */
+    if(asymHeader->senderCertificate.length > 0) {
+        UA_StatusCode res =
+            validateCertificate(server, &sc->secureChannelPKI, securityPolicy,
+                                channel, NULL,
+                                "OpenSecureChannel", NULL, asymHeader->senderCertificate);
+        UA_CHECK_STATUS(res, return res);
     }
 
-    if(request->securityMode != UA_MESSAGESECURITYMODE_NONE &&
-       UA_ByteString_equal(&channel->securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI)) {
-        return UA_STATUSCODE_BADSECURITYMODEREJECTED;
-    }
+    /* If the sender provides a chain of certificates then we shall extract the
+     * ApplicationInstanceCertificate and ignore the extra bytes. See also: OPC
+     * UA Part 6, V1.04, 6.7.2.3 Security Header, Table 42 - Asymmetric
+     * algorithm Security header */
+    UA_ByteString appInstCert = getLeafCertificate(asymHeader->senderCertificate);
 
-    channel->securityMode = request->securityMode;
-    channel->securityToken.channelId = server->lastChannelId++;
-    channel->securityToken.createdAt = UA_DateTime_nowMonotonic();
-
-    /* Set the lifetime. Lifetime 0 -> set the maximum possible */
-    channel->securityToken.revisedLifetime =
-        (request->requestedLifetime > server->config.maxSecurityTokenLifetime) ?
-        server->config.maxSecurityTokenLifetime : request->requestedLifetime;
-    if(channel->securityToken.revisedLifetime == 0)
-        channel->securityToken.revisedLifetime = server->config.maxSecurityTokenLifetime;
-
-    UA_StatusCode retval = UA_ByteString_copy(&request->clientNonce, &channel->remoteNonce);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    /* Generate the nonce. The syymmetric encryption keys are generated when the
-     * first symmetric message is received */
-    retval = UA_SecureChannel_generateLocalNonce(channel);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    /* Set the response. The token will be revolved to the new token when the
-     * first symmetric messages is received. */
-    response->securityToken = channel->securityToken;
-    response->securityToken.createdAt = UA_DateTime_now(); /* Only for sending */
-    response->responseHeader.timestamp = response->securityToken.createdAt;
-    response->responseHeader.requestHandle = request->requestHeader.requestHandle;
-    retval = UA_ByteString_copy(&channel->localNonce, &response->serverNonce);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    /* The channel is open */
-    channel->state = UA_SECURECHANNELSTATE_OPEN;
-
-    /* For the first revolve */
-    channel->renewState = UA_SECURECHANNELRENEWSTATE_NEWTOKEN_SERVER;
-    channel->altSecurityToken = channel->securityToken;
-    channel->securityToken.tokenId = 0;
-    return UA_STATUSCODE_GOOD;
+    /* Create the channel context and parse the sender (remote) certificate used
+     * for the secureChannel. This sets a "temporary SecurityMode" so that we
+     * can properly decrypt the remaining OPN message. The final SecurityMode is
+     * set in the OpenSecureChannel service. */
+    return UA_SecureChannel_setSecurityPolicy(channel, securityPolicy, &appInstCert);
 }
 
-static UA_StatusCode
-UA_SecureChannelManager_renew(UA_Server *server, UA_SecureChannel *channel,
-                              const UA_OpenSecureChannelRequest *request,
-                              UA_OpenSecureChannelResponse *response) {
-    if(channel->state != UA_SECURECHANNELSTATE_OPEN) {
-        UA_LOG_ERROR_CHANNEL(&server->config.logger, channel,
-                             "Called renew on channel which is not open");
-        return UA_STATUSCODE_BADINTERNALERROR;
-    }
+static void
+Service_OpenSecureChannel_inner(UA_Server *server, UA_SecureChannel *channel,
+                                UA_OpenSecureChannelRequest *request,
+                                UA_OpenSecureChannelResponse *response) {
+    UA_ServerConfig *sc = &server->config;
+    UA_EventLoop *el = server->config.eventLoop;
+    const UA_SecurityPolicy *sp = channel->securityPolicy;
 
-    /* Check whether the nonce was reused */
-    if(channel->securityMode != UA_MESSAGESECURITYMODE_NONE &&
-       UA_ByteString_equal(&channel->remoteNonce, &request->clientNonce)) {
-        UA_LOG_ERROR_CHANNEL(&server->config.logger, channel,
-                             "The client reused the last nonce");
-        return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
-    }
-
-    /* Create a new SecurityToken. Will be switched over when the first message
-     * is received. */
-    channel->altSecurityToken = channel->securityToken;
-    channel->altSecurityToken.tokenId = server->lastTokenId++;
-    channel->altSecurityToken.createdAt = UA_DateTime_nowMonotonic();
-    channel->altSecurityToken.revisedLifetime =
-        (request->requestedLifetime > server->config.maxSecurityTokenLifetime) ?
-        server->config.maxSecurityTokenLifetime : request->requestedLifetime;
-    if(channel->altSecurityToken.revisedLifetime == 0) /* lifetime 0 -> return the max lifetime */
-        channel->altSecurityToken.revisedLifetime = server->config.maxSecurityTokenLifetime;
-
-    /* Replace the nonces */
-    UA_ByteString_clear(&channel->remoteNonce);
-    UA_StatusCode retval = UA_ByteString_copy(&request->clientNonce, &channel->remoteNonce);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    retval = UA_SecureChannel_generateLocalNonce(channel);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    /* Set the response */
-    response->securityToken = channel->altSecurityToken;
-    response->securityToken.createdAt = UA_DateTime_now(); /* Only for sending */
-    response->responseHeader.requestHandle = request->requestHeader.requestHandle;
-    retval = UA_ByteString_copy(&channel->localNonce, &response->serverNonce);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    channel->renewState = UA_SECURECHANNELRENEWSTATE_NEWTOKEN_SERVER;
-    return UA_STATUSCODE_GOOD;
-}
-
-void
-UA_Server_closeSecureChannel(UA_Server *server, UA_SecureChannel *channel,
-                             UA_DiagnosticEvent event) {
-    removeSecureChannel(server, container_of(channel, channel_entry, channel), event);
-}
-
-void
-Service_OpenSecureChannel(UA_Server *server, UA_SecureChannel *channel,
-                          const UA_OpenSecureChannelRequest *request,
-                          UA_OpenSecureChannelResponse *response) {
-    if(request->requestType == UA_SECURITYTOKENREQUESTTYPE_RENEW) {
-        /* Renew the channel */
-        response->responseHeader.serviceResult =
-            UA_SecureChannelManager_renew(server, channel, request, response);
-
-        /* Logging */
-        if(response->responseHeader.serviceResult == UA_STATUSCODE_GOOD) {
-            UA_Float lifetime = (UA_Float)response->securityToken.revisedLifetime / 1000;
-            UA_LOG_INFO_CHANNEL(&server->config.logger, channel, "SecureChannel renewed "
-                                "with a revised lifetime of %.2fs", lifetime);
-        } else {
-            UA_LOG_DEBUG_CHANNEL(&server->config.logger, channel,
-                                 "Renewing SecureChannel failed");
+    switch(request->requestType) {
+    /* Open the channel */
+    case UA_SECURITYTOKENREQUESTTYPE_ISSUE: {
+        /* We must expect an OPN handshake */
+        if(channel->state != UA_SECURECHANNELSTATE_ACK_SENT) {
+            UA_LOG_ERROR_CHANNEL(sc->logging, channel,
+                                 "OpenSecureChannel: Cannot open "
+                                 "already open or closed channel");
+            response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
+            return;
         }
-        return;
+
+        /* Ensure the SecurityMode does not cause a wrong array access during
+         * logging */
+        if((UA_UInt32)request->securityMode > UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
+            request->securityMode = UA_MESSAGESECURITYMODE_INVALID;
+
+        /* Set the SecurityMode. This overwrites the "temporary SecurityMode"
+         * that has been set set in UA_SecureChannel_setSecurityPolicy.*/
+        response->responseHeader.serviceResult =
+            UA_SecureChannel_setSecurityMode(channel, request->securityMode);
+        if(response->responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR_CHANNEL(sc->logging, channel,
+                                 "OpenSecureChannel: Client tries mismatching "
+                                 "SecurityMode %s for SecurityPolicy %S",
+                                 securityModeNames[request->securityMode],
+                                 sp->policyUri);
+            return;
+        }
+        break;
     }
 
-    /* Must be ISSUE or RENEW */
-    if(request->requestType != UA_SECURITYTOKENREQUESTTYPE_ISSUE) {
+    /* Renew the channel */
+    case UA_SECURITYTOKENREQUESTTYPE_RENEW:
+        /* The channel must be open to be renewed */
+        if(channel->state != UA_SECURECHANNELSTATE_OPEN) {
+            UA_LOG_ERROR_CHANNEL(sc->logging, channel,
+                                 "OpenSecureChannel: The client called renew on "
+                                 "channel which is not open");
+            response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
+            return;
+        }
+
+        /* Check whether the nonce was reused */
+        if(channel->securityMode != UA_MESSAGESECURITYMODE_NONE &&
+           UA_ByteString_equal(&channel->remoteNonce, &request->clientNonce)) {
+            UA_LOG_ERROR_CHANNEL(sc->logging, channel,
+                                 "OpenSecureChannel: The client called renew "
+                                 "reusing the previous nonce");
+            response->responseHeader.serviceResult =
+                UA_STATUSCODE_BADSECURITYCHECKSFAILED;
+            return;
+        }
+
+        break;
+
+    /* Unknown request type */
+    default:
+        UA_LOG_ERROR_CHANNEL(sc->logging, channel,
+                             "OpenSecureChannel: Unknown request type");
         response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
         return;
     }
 
-    /* Open the channel */
-    response->responseHeader.serviceResult =
-        UA_SecureChannelManager_open(server, channel, request, response);
+    /* Create a new SecurityToken. It will be switched over when the first
+     * message is received. The ChannelId is left unchanged. */
+    channel->altSecurityToken.channelId = channel->securityToken.channelId;
+    if(server->lastTokenId == 0)
+        server->lastTokenId++; /* TokenId zero is the placeholder */
+    channel->altSecurityToken.tokenId = server->lastTokenId++;
+    channel->altSecurityToken.createdAt = el->dateTime_nowMonotonic(el);
+    channel->altSecurityToken.revisedLifetime =
+        (request->requestedLifetime > sc->maxSecurityTokenLifetime) ?
+        sc->maxSecurityTokenLifetime : request->requestedLifetime;
+    if(channel->altSecurityToken.revisedLifetime == 0)
+        channel->altSecurityToken.revisedLifetime =
+            sc->maxSecurityTokenLifetime;
 
-    /* Logging */
-    if(response->responseHeader.serviceResult == UA_STATUSCODE_GOOD) {
-        UA_Float lifetime = (UA_Float)response->securityToken.revisedLifetime / 1000;
-        UA_LOG_INFO_CHANNEL(&server->config.logger, channel,
-                            "SecureChannel opened with SecurityPolicy %.*s "
-                            "and a revised lifetime of %.2fs",
-                            (int)channel->securityPolicy->policyUri.length,
-                            channel->securityPolicy->policyUri.data, lifetime);
-    } else {
-        UA_LOG_INFO_CHANNEL(&server->config.logger, channel,
-                            "Opening a SecureChannel failed");
+    /* Set the nonces. The remote nonce will be "rotated in" when it is first used. */
+    UA_ByteString_clear(&channel->remoteNonce);
+    channel->remoteNonce = request->clientNonce;
+    UA_ByteString_init(&request->clientNonce);
+
+    response->responseHeader.serviceResult = UA_SecureChannel_generateLocalNonce(channel);
+    if(response->responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR_CHANNEL(sc->logging, channel,
+                             "OpenSecureChannel: Cannot generate the local nonce");
+        return;
     }
+
+    /* Update the channel state */
+    channel->renewState = UA_SECURECHANNELRENEWSTATE_NEWTOKEN_SERVER;
+    channel->state = UA_SECURECHANNELSTATE_OPEN;
+
+    /* Set the response */
+    response->securityToken = channel->altSecurityToken;
+    response->securityToken.createdAt = el->dateTime_now(el); /* only for sending */
+    response->responseHeader.timestamp = response->securityToken.createdAt;
+    response->responseHeader.requestHandle = request->requestHeader.requestHandle;
+    response->responseHeader.serviceResult =
+        UA_ByteString_copy(&channel->localNonce, &response->serverNonce);
+    UA_CHECK_STATUS(response->responseHeader.serviceResult, return);
+
+    /* Success */
+    if(request->requestType == UA_SECURITYTOKENREQUESTTYPE_ISSUE) {
+        UA_LOG_INFO_CHANNEL(sc->logging, channel,
+                            "OpenSecureChannel: Channel opened with SecurityMode %s for "
+                            "SecurityPolicy %S and a revised lifetime of %.2fs",
+                            securityModeNames[channel->securityMode],
+                            channel->securityPolicy->policyUri,
+                            (UA_Double)response->securityToken.revisedLifetime / 1000);
+
+        /* Notify the application about the open SecureChannel */
+        notifySecureChannel(server, channel,
+                            UA_APPLICATIONNOTIFICATIONTYPE_SECURECHANNEL_OPENED);
+    } else {
+        UA_LOG_INFO_CHANNEL(sc->logging, channel,
+                            "OpenSecureChannel: Channel renewed with a revised "
+                            "lifetime of %.2fs",
+                            (UA_Double)response->securityToken.revisedLifetime / 1000);
+    }
+}
+
+void
+Service_OpenSecureChannel(UA_Server *server, UA_SecureChannel *channel,
+                          void *request_, void *response_) {
+    UA_OpenSecureChannelRequest *request = (UA_OpenSecureChannelRequest*)request_;
+    UA_OpenSecureChannelResponse *response = (UA_OpenSecureChannelResponse*)response_;
+    /* Call the main OpenSecureChannel implementation */
+    Service_OpenSecureChannel_inner(server, channel, request, response);
+
+#ifdef UA_ENABLE_AUDITING
+    auditOpenSecureChannelEvent(server, channel, request, response);
+#endif
 }
 
 /* The server does not send a CloseSecureChannel response */
 void
 Service_CloseSecureChannel(UA_Server *server, UA_SecureChannel *channel) {
-    UA_LOG_INFO_CHANNEL(&server->config.logger, channel, "CloseSecureChannel");
-    removeSecureChannel(server, container_of(channel, channel_entry, channel),
-                        UA_DIAGNOSTICEVENT_CLOSE);
+    if(UA_SecureChannel_isConnected(channel)) {
+        UA_assert(channel->transport == UA_SECURECHANNEL_TRANSPORT_UACP);
+
+#ifdef UA_ENABLE_AUDITING
+        auditCloseSecureChannelEvent(server, channel);
+#endif
+
+        UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_CLOSE);
+    }
+}
+
+/* The built-in, read-only ns0 SecureChannel attribute keys. Also the
+ * payload keys of the SECURECHANNEL notification below. See the doc
+ * comment on UA_Server_setSecureChannelAttribute in server.h and
+ * UA_SecureChannel_getBuiltinAttribute below. */
+const UA_QualifiedName UA_SecureChannel_builtinAttributeKeys[UA_SECURECHANNEL_BUILTIN_ATTRIBUTES_SIZE] = {
+    {0, UA_STRING_STATIC("securechannel-id")},
+    {0, UA_STRING_STATIC("connection-manager-name")},
+    {0, UA_STRING_STATIC("connection-id")},
+    {0, UA_STRING_STATIC("remote-address")},
+    {0, UA_STRING_STATIC("protocol-version")},
+    {0, UA_STRING_STATIC("recv-buffer-size")},
+    {0, UA_STRING_STATIC("recv-max-message-size")},
+    {0, UA_STRING_STATIC("recv-max-chunk-count")},
+    {0, UA_STRING_STATIC("send-buffer-size")},
+    {0, UA_STRING_STATIC("send-max-message-size")},
+    {0, UA_STRING_STATIC("send-max-chunk-count")},
+    {0, UA_STRING_STATIC("endpoint-url")},
+    {0, UA_STRING_STATIC("security-mode")},
+    {0, UA_STRING_STATIC("security-policy-url")},
+    {0, UA_STRING_STATIC("certificate-type-id")},
+    {0, UA_STRING_STATIC("remote-certificate")}
+};
+
+UA_Boolean
+UA_SecureChannel_getBuiltinAttribute(UA_SecureChannel *channel,
+                                     const UA_QualifiedName *key,
+                                     UA_Variant *out) {
+    /* Backing storage for the handful of values that are not stable,
+     * addressable members of *channel and must be computed or defaulted on
+     * the fly -- see the doc comment on channel->builtinAttributeScratch.
+     * It lives on the channel itself, not a local of this function, so
+     * *out stays valid for as long as the channel does, no matter when (or
+     * whether) the caller consumes it. */
+    const UA_QualifiedName *k = UA_SecureChannel_builtinAttributeKeys;
+    if(UA_QualifiedName_equal(key, &k[0])) {
+        UA_Variant_setScalar(out, &channel->securityToken.channelId,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[1])) {
+        channel->builtinAttributeScratch.connectionManagerName = channel->connectionManager ?
+            channel->connectionManager->eventSource.name : UA_STRING_NULL;
+        UA_Variant_setScalar(out, &channel->builtinAttributeScratch.connectionManagerName,
+                             &UA_TYPES[UA_TYPES_STRING]);
+    } else if(UA_QualifiedName_equal(key, &k[2])) {
+        channel->builtinAttributeScratch.connectionId = channel->connectionId;
+        UA_Variant_setScalar(out, &channel->builtinAttributeScratch.connectionId,
+                             &UA_TYPES[UA_TYPES_UINT64]);
+    } else if(UA_QualifiedName_equal(key, &k[3])) {
+        UA_Variant_setScalar(out, &channel->remoteAddress,
+                             &UA_TYPES[UA_TYPES_STRING]);
+    } else if(UA_QualifiedName_equal(key, &k[4])) {
+        UA_Variant_setScalar(out, &channel->config.protocolVersion,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[5])) {
+        UA_Variant_setScalar(out, &channel->config.recvBufferSize,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[6])) {
+        UA_Variant_setScalar(out, &channel->config.localMaxMessageSize,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[7])) {
+        UA_Variant_setScalar(out, &channel->config.localMaxChunkCount,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[8])) {
+        UA_Variant_setScalar(out, &channel->config.sendBufferSize,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[9])) {
+        UA_Variant_setScalar(out, &channel->config.remoteMaxMessageSize,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[10])) {
+        UA_Variant_setScalar(out, &channel->config.remoteMaxChunkCount,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+    } else if(UA_QualifiedName_equal(key, &k[11])) {
+        UA_Variant_setScalar(out, &channel->endpointUrl,
+                             &UA_TYPES[UA_TYPES_STRING]);
+    } else if(UA_QualifiedName_equal(key, &k[12])) {
+        UA_Variant_setScalar(out, &channel->securityMode,
+                             &UA_TYPES[UA_TYPES_MESSAGESECURITYMODE]);
+    } else if(UA_QualifiedName_equal(key, &k[13])) {
+        channel->builtinAttributeScratch.securityPolicyUri = channel->securityPolicy ?
+            channel->securityPolicy->policyUri : UA_STRING_NULL;
+        UA_Variant_setScalar(out, &channel->builtinAttributeScratch.securityPolicyUri,
+                             &UA_TYPES[UA_TYPES_STRING]);
+    } else if(UA_QualifiedName_equal(key, &k[14])) {
+        channel->builtinAttributeScratch.certificateTypeId = channel->securityPolicy ?
+            channel->securityPolicy->certificateTypeId : UA_NODEID_NULL;
+        UA_Variant_setScalar(out, &channel->builtinAttributeScratch.certificateTypeId,
+                             &UA_TYPES[UA_TYPES_NODEID]);
+    } else if(UA_QualifiedName_equal(key, &k[15])) {
+        UA_Variant_setScalar(out, &channel->remoteCertificate,
+                             &UA_TYPES[UA_TYPES_BYTESTRING]);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+void
+notifySecureChannel(UA_Server *server, UA_SecureChannel *channel,
+                    UA_ApplicationNotificationType type) {
+    /* Prepare the payload -- the same built-in attributes exposed via
+     * UA_Server_getSecureChannelAttribute and friends. */
+    UA_STATIC_THREAD_LOCAL UA_KeyValuePair
+        notifySCData[UA_SECURECHANNEL_BUILTIN_ATTRIBUTES_SIZE];
+    for(size_t i = 0; i < UA_SECURECHANNEL_BUILTIN_ATTRIBUTES_SIZE; i++) {
+        notifySCData[i].key = UA_SecureChannel_builtinAttributeKeys[i];
+        UA_SecureChannel_getBuiltinAttribute(
+            channel, &UA_SecureChannel_builtinAttributeKeys[i], &notifySCData[i].value);
+    }
+    UA_KeyValueMap notifySCMap =
+        {UA_SECURECHANNEL_BUILTIN_ATTRIBUTES_SIZE, notifySCData};
+
+    /* Notify the application */
+    notifyApplication(server, type, notifySCMap);
 }

@@ -1,187 +1,258 @@
 # Contributing to open62541
 
-Contributions to open62541 include code, documentation, answering user
-questions, running the project's infrastructure, and advocating for all types of
-open62541 users.
+Contributions to open62541 include code, documentation, testing, issue reports,
+answers to user questions, and work on project infrastructure. We welcome
+contributions made in good faith and value improvements of every size.
 
-The open62541 project welcomes all contributions from anyone willing to work in
-good faith with other contributors and the community. No contribution is too
-small and all contributions are valued.
-
-This guide explains the process for contributing to the open62541 project's core
-repository and describes what to expect at each step. Thank you for considering
-these point.
-
-Your friendly open62541 community!
+This guide covers contributions to the core open62541 repository. If anything
+is unclear, open an issue or ask in the relevant pull request.
 
 ## Code of Conduct
 
-The open62541 project has a [Code of Conduct](./CODE_OF_CONDUCT.md) that *all*
-contributors are expected to follow. This code describes the *minimum* behavior
-expectations for all contributors.
+All contributors must follow the project [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Before You Start
+
+Search existing issues and pull requests before beginning substantial work.
+Discuss large features, architectural changes, new dependencies, and public API
+changes with the maintainers early. This avoids duplicate work and allows the
+design to be reviewed before much code is written.
+
+Do not open a public issue or pull request for a suspected vulnerability.
+Follow [SECURITY.md](SECURITY.md) to report it privately.
 
 ## Pull Requests
 
-Everybody can propose a pull request (PR). But only the core-maintainers of the
-project can merge PR.
+Anyone may open a pull request. A maintainer reviews and merges it.
 
-### Minimal requirements for a PR
+Keep each pull request focused on one change. Separate unrelated refactoring,
+formatting, generated output, and dependency updates. Small, self-contained
+changes are easier to understand, test, and review. Use a draft pull request if
+you want early feedback on unfinished work.
 
-The following are the minimal requirements that every PR needs to meet.
+A pull request should:
 
-- **Pass Continuous Integration (CI)**: Every PR has to pass our CI. This
-  includes compilation with a range of compilers and for a range of target
-  architectures, passing the unit tests and no detected issues with static code
-  analysis tools.
+- explain the problem and the chosen solution;
+- identify important behavior, compatibility, or configuration effects;
+- include tests for new behavior and relevant failure cases;
+- update affected documentation and `CHANGES.md` where appropriate;
+- avoid unrelated changes; and
+- pass the required continuous integration checks.
 
-- **Code-Style**: Please consider the
-  [Code-Style](https://github.com/open62541/open62541/wiki/Code-Style)
-  recommendations when formatting your code.
+Link related issues. Include enough context for a reviewer to understand the
+change without reconstructing the reasoning from the commit history.
 
-- **Signed CLA**: Every contributor must sign the Contributor License Agreement
-  (CLA) before we can merge his first PR. The signing can be done online. The
-  link automatically appears on the page of the first PR. In addition, the CLA
-  text can be accessed [here](https://cla-assistant.io/open62541/open62541).
+Respond to review comments and keep the branch current with its target branch.
+Prefer rebasing over merge commits in the pull request branch. If a pull request
+has received no response after a reasonable time, a polite follow-up is
+welcome.
 
-## Commit and PR Hygiene
+Before a contributor's first pull request can be merged, the contributor must
+sign the [Contributor License Agreement](https://cla-assistant.io/open62541/open62541).
+The signing link is added automatically to the pull request.
 
-We have very precise rules over how our git commit messages can be formatted.  This leads to **more
-readable messages** that are easy to follow when looking through the **project history**.  But also,
-we use the git commit messages to **generate the change log**.
+## Security-Sensitive Changes
 
-This convention is identical to the [Conventional Commits](https://www.conventionalcommits.org) specification or the one used by Angular.
+Treat data from networks, files, public APIs, callbacks, and plug-ins as
+untrusted. Validate it before it controls memory access, allocation, iteration,
+dispatch, security decisions, or persistent state. Check bounds, arithmetic,
+conversions, ownership, resource use, error paths, authentication, and
+authorization. Use existing OPC UA security mechanisms and maintained
+cryptographic backends. Add tests for intended behavior and relevant failure
+cases. If you are unsure, mention the possible security effect in the pull
+request. Report suspected vulnerabilities privately through
+[SECURITY.md](SECURITY.md).
 
-### Commit Message Format
-Each commit message consists of a **header**, a **body** and a **footer**.  The header has a special
-format that includes a **type**, a **scope** and a **subject**:
+Use the [SEI CERT C Coding Standard](https://wiki.sei.cmu.edu/confluence/display/c)
+as guidance. Continuous integration runs the supported CERT checks so that
+detected rule violations are explicit in code review. The checks do not cover
+every CERT rule. Fix a finding or use the narrowest supported suppression with
+a short explanation for the reviewer.
+
+## Changes to the Public API
+
+Headers under `include/` define the public API. Discuss public API changes with
+the maintainers before implementation.
+
+Preserve source and binary compatibility where practical. Prefer adding a new
+API and deprecating the old one with `UA_DEPRECATED` over changing or removing
+an existing API. A breaking API change requires the `breaking` commit type and
+an entry in `CHANGES.md`.
+
+Document ownership, lifetime, thread-safety, callback, and error-handling
+expectations for new public APIs.
+
+## Commits and Pull Request Titles
+
+Use this Conventional Commits-style header for commit subjects and pull
+request titles:
 
 ```text
 <type>(<scope>): <subject>
-<BLANK LINE>
-<body>
-<BLANK LINE>
-<footer>
 ```
 
-The **header** is mandatory and the **scope** of the header is optional.
+The scope is optional. Use the component a reader of the changelog would
+recognize, such as `client`, `server`, `core`, `pubsub`, `plugin`, `arch`,
+`build`, `deps`, `ci`, `tests`, or `sec`.
 
-Any line of the commit message cannot be longer 100 characters! This allows the message to be easier
-to read on GitHub as well as in various git tools.
+Use one of these types:
 
-The footer should contain a [closing reference to an issue](https://help.github.com/articles/closing-issues-via-commit-messages/) if any.
+- `build`: build system or dependency changes
+- `breaking`: changes that break an existing public API
+- `ci`: continuous integration changes
+- `docs`: documentation-only changes
+- `feat`: new functionality
+- `fix`: bug fixes
+- `perf`: performance improvements
+- `refactor`: code changes without a feature or bug fix
+- `style`: formatting or other non-functional changes
+- `test`: test additions or corrections
 
-Samples: (even more [samples](https://github.com/angular/angular/commits/master))
+Write the subject in the imperative present tense, begin it with a lowercase
+letter, and omit the final period. Keep every commit-message line at or below
+100 characters.
+
+Use the body to explain why the change is needed and any behavior that is not
+obvious from the diff. Reference affected issues in the footer when applicable.
+
+Examples:
 
 ```text
-docs(server): add function documentation
+docs(server): clarify lifecycle callback ownership
 ```
+
 ```text
-fix(core): fix parsing of endpoint url
+fix(core): reject an out-of-range message length
 
-Parsing of endpoint urls now also supports https
+Validate the decoded length before using it to advance the input buffer.
 ```
 
-### Revert
-If the commit reverts a previous commit, it should begin with `revert: `, followed by the header of the reverted commit. In the body it should say: `This reverts commit <hash>.`, where the hash is the SHA of the commit being reverted.
+Keep commits coherent. Fixup commits may be useful during review, but squash
+them before merge when they do not add lasting value to the history.
 
-### Type
-Must be one of the following:
+## Code Style
 
-- **build**: Changes that affect the build system or external dependencies
-- **ci**: Changes to our CI configuration files and scripts (example scopes: travis, appveyor, fuzz)
-- **docs**: Documentation only changes
-- **feat**: A new feature
-- **fix**: A bug fix
-- **perf**: A code change that improves performance
-- **refactor**: A code change that neither fixes a bug nor adds a feature
-- **style**: Changes that do not affect the meaning of the code (white-space, formatting, missing semi-colons, etc)
-- **test**: Adding missing tests or correcting existing tests
+Follow the style of the surrounding code. In particular:
 
-### Scope
-The scope is optional, but recommended to be used. It should be the name of the component which is affected (as perceived by the person reading the changelog generated from commit messages).
+- indent with four spaces, not tabs;
+- put opening braces on the same line as the statement and closing braces on a
+  separate line;
+- do not add a space before parentheses in control statements or function
+  calls;
+- place spaces around binary operators, but not unary or member-access
+  operators;
+- write pointer declarations as `const int *value`;
+- use `/* ... */` comments in C source and `/** ... */` for public API
+  documentation;
+- keep comments focused on purpose, assumptions, and non-obvious constraints;
+- avoid unexplained numeric constants and unnecessary global state; and
+- prefer clear, focused functions over deeply nested or duplicated code.
 
-The following is the list of supported scopes:
+An `if` statement with multiple branches is formatted as follows:
 
-- **arch**: Changes to specific architecture code in `root/arch`
-- **client**: Changes only affecting client code
-- **core**: Core functionality used by the client and server
-- **ex**: Example code changes
-- **mt**: Changes specifically for multithreading
-- **nc**: Nodeset compiler
-- **pack**: Packaging setting changes
-- **plugin**: Change to any (optional) plugin
-- **pubsub**: Changes to the pubsub code
-- **sec**: Changes to security, encryption, etc.
-- **server**: Changes only affecting server code
+```c
+if(a) {
+    doA();
+} else if(b) {
+    doB();
+} else {
+    doC();
+}
+```
 
-### Subject
-The subject contains a succinct description of the change:
+Do not reformat unrelated code in a functional change.
 
-- use the imperative, present tense: "change" not "changed" nor "changes"
-- don't capitalize the first letter
-- no dot (.) at the end
+### Names and Declarations
 
-### Body
-Just as in the **subject**, use the imperative, present tense: "change" not "changed" nor "changes".
-The body should include the motivation for the change and contrast this with previous behavior.
+- Public identifiers begin with `UA_`.
+- Public server and client functions normally begin with `UA_Server_` and
+  `UA_Client_` respectively.
+- Functions and variables use lower camel case, such as `calculateSize`.
+- Types use upper camel case, such as `UA_ResponseHeader`.
+- Constants, enumeration values, and macros use uppercase names, such as
+  `UA_STATUSCODE_GOOD`.
+- Do not introduce identifiers reserved by the C implementation, including
+  names beginning with a double underscore.
+- Use descriptive names. Familiar short names such as loop indices are fine
+  when their meaning is clear.
+- Do not use Hungarian notation.
+- Mark variables and input parameters `const` when they are not modified.
+- Place input parameters before output parameters.
 
-### Footer
-The footer should contain any information about **Breaking Changes** and is also the place to
-reference GitHub issues that this commit **Closes**.
+Use the existing initialization and cleanup functions for open62541 types. Make
+ownership transfers clear and ensure every acquired resource is released
+exactly once.
 
-**Breaking Changes** should start with the word `BREAKING CHANGE:` with a space or two newlines. The rest of the commit message is then used for this.
+## Error Handling and Cleanup
 
-## General commit hygiene
+Check every result that can report failure. Preserve the original error unless
+the caller needs a more appropriate open62541 status code. Log only when the
+current layer adds useful context; avoid logging the same failure repeatedly at
+several layers.
 
-We are using the [Conventional Commits](https://www.conventionalcommits.org) specification (see previous section).
+Internal code provides `UA_CHECK`, `UA_CHECK_STATUS`, and `UA_CHECK_MEM`, plus
+logging variants. Use them when they make the success path and cleanup easier
+to read. A direct conditional is equally appropriate when special handling is
+needed.
 
-These sites explain a core set of good practice rules for preparing a PR:
+Use a cleanup label when multiple paths release the same resources:
 
-- https://wiki.openstack.org/wiki/GitCommitMessages
-- https://nvie.com/posts/a-successful-git-branching-model/
+```c
+static UA_StatusCode
+performWork(void) {
+    void *data = UA_malloc(128);
+    UA_CHECK_MEM(data, return UA_STATUSCODE_BADOUTOFMEMORY);
 
-The following points will be especially looked at during the review.
+    UA_StatusCode res = firstStep(data);
+    UA_CHECK_STATUS(res, goto cleanup);
 
-- **Separation of Concerns**: Small changes are much easier to review.
-  Typically, small PR are merged much faster. For larger contributions, it might
-  make sense to break them up into a series of PR. For example, a PR with a new
-  feature should not contain other commits with only stylistic improvements to
-  another portion of the code.
+    res = secondStep(data);
+    UA_CHECK_STATUS(res, goto cleanup);
 
-- **Feature Commits**: The same holds true for the individual PR as well. Every
-  commit inside the PR should do one thing only. If many changes have been
-  applied at the same time, `git add --patch` can be used to partially stage and
-  commit changes that belong together.
+cleanup:
+    UA_free(data);
+    return res;
+}
+```
 
-- **Commit Messages**: Good commit messages help in understanding changes.
-  See previous section.
+Avoid a cleanup label when a direct return is clearer and does not duplicate
+cleanup logic.
 
-- **Linear Commit History**: Our goal is to maintain a linear commit history
-  where possible. Use the `git rebase` functionality before pushing a PR. Use
-  `git rebase --interactive` to squash bugfix commits.
+## Tests and Automated Checks
 
-### Review Process
+Add or update tests for behavior changed by the pull request. A bug fix should
+normally include a regression test that fails without the fix. Cover relevant
+boundaries, invalid input, failure paths, cleanup, and configuration variants.
 
-These labels can be used for the PR title to indicate its status.
+Unit tests are under `tests/` and conventionally use filenames beginning with
+`check_`. A typical local test build is:
 
-- `[WIP]`: The PR is work in progress and at this point simply informative.
-- `[Review]`: The PR is ready from the developers perspective. He requests a review from a core-maintainer.
-- `[Discussion]`: The PR is a contribution to ongoing technical discussions. The PR may be incomplete and is not intended to be merged before the discussion has concluded.
+```sh
+cmake -S . -B build -DUA_BUILD_UNIT_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
-The core-maintainers are busy people. If they take especially long to react,
-feel free to trigger them by additional comments in the PR thread. Again, small
-PR are much faster to review.
+Run the tests relevant to the change locally. Continuous integration builds
+additional compilers, platforms, options, and analysis configurations. All
+required checks must pass before merge.
 
-It is the job of the developer that posts the PR to rebase the PR on the target
-branch when the two diverge.
+When changing generated code, modify the generator or authoritative input and
+regenerate the output. Do not hand-edit generated files unless the repository
+explicitly treats them as authoritative source.
 
-### Changes to the public API
+## Documentation
 
-The *public* API is the collection of header files in the /include folder.
+Update documentation when a change affects public APIs, configuration,
+behavior, compatibility, security assumptions, or deployment. Keep examples
+small enough to copy and run, and verify that names and options match the code.
 
-Changes to the public API are under especially high scrutiny. Public API changes
-are best discussed with the core-maintainers early on. Simply to avoid duplicate
-work when changes to the proposed API become necessary.
+Public declarations under `include/` use documentation comments beginning with
+`/**`. Explain constraints and ownership that callers must know; do not merely
+repeat the function signature.
 
-You can create a special issue or PR just for the sake of discussing a proposed
-API change. The actual implementation can follow later on.
+## Getting Help
+
+If you are unsure about design, code style, testing, or compatibility, ask in
+an issue or pull request. For possible vulnerabilities, use the private
+reporting channels in [SECURITY.md](SECURITY.md) instead.

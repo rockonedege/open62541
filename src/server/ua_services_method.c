@@ -11,69 +11,113 @@
  *    Copyright 2017 (c) Stefan Profanter, fortiss GmbH
  *    Copyright 2017 (c) Julian Grothoff
  *    Copyright 2020 (c) Hilscher Gesellschaft für Systemautomation mbH (Author: Martin Lang)
+ *    Copyright (c) 2025 Pilz GmbH & Co. KG, Author: Marcel Patzlaff
  */
 
 #include "ua_services.h"
 #include "ua_server_internal.h"
 
-#ifdef UA_ENABLE_METHODCALLS /* conditional compilation */
+
+#define UA_MAX_METHOD_ARGUMENTS 64
+
+struct GetArgumentsNodeContext {
+    UA_Server *server;
+    UA_String withBrowseName;
+};
+
+static UA_StatusCode
+getArgumentsValue(const UA_VariableNode *argRequirements,
+                  const UA_Variant **argVal, size_t *argsSize) {
+    if(argRequirements->valueSourceType != UA_VALUESOURCETYPE_INTERNAL)
+        return UA_STATUSCODE_BADINTERNALERROR;
+    if(!argRequirements->valueSource.internal.value.hasValue)
+        return UA_STATUSCODE_BADINTERNALERROR;
+
+    const UA_Variant *value =
+        &argRequirements->valueSource.internal.value.value;
+    if(value->type != &UA_TYPES[UA_TYPES_ARGUMENT])
+        return UA_STATUSCODE_BADINTERNALERROR;
+
+    if(argVal)
+        *argVal = value;
+    *argsSize = value->arrayLength;
+    if(UA_Variant_isScalar(value))
+        *argsSize = 1;
+    if(*argsSize > UA_MAX_METHOD_ARGUMENTS)
+        return UA_STATUSCODE_BADTOOMANYARGUMENTS;
+    return UA_STATUSCODE_GOOD;
+}
+
+static void *
+getArgumentsNodeCallback(void *context, UA_ReferenceTarget *t) {
+    struct GetArgumentsNodeContext *ctx = (struct GetArgumentsNodeContext*)context;
+    const UA_Node *refTarget =
+        UA_NODESTORE_GETFROMREF_SELECTIVE(ctx->server, t->targetId,
+                                          UA_NODEATTRIBUTESMASK_NODECLASS |
+                                          UA_NODEATTRIBUTESMASK_VALUE,
+                                          UA_REFERENCETYPESET_NONE,
+                                          UA_BROWSEDIRECTION_INVALID);
+    if(!refTarget)
+        return NULL;
+    if(refTarget->head.nodeClass == UA_NODECLASS_VARIABLE &&
+       refTarget->head.browseName.namespaceIndex == 0 &&
+       UA_String_equal(&ctx->withBrowseName, &refTarget->head.browseName.name)) {
+        return (void*)(uintptr_t)&refTarget->variableNode;
+    }
+    UA_NODESTORE_RELEASE(ctx->server, refTarget);
+    return NULL;
+}
 
 static const UA_VariableNode *
 getArgumentsVariableNode(UA_Server *server, const UA_NodeHead *head,
                          UA_String withBrowseName) {
     for(size_t i = 0; i < head->referencesSize; ++i) {
-        const UA_NodeReferenceKind *rk = &head->references[i];
-        if(rk->isInverse != false)
+        UA_NodeReferenceKind *rk = &head->references[i];
+        if(rk->isInverse)
             continue;
         if(rk->referenceTypeIndex != UA_REFERENCETYPEINDEX_HASPROPERTY)
             continue;
-        for(UA_ReferenceTarget *t = UA_NodeReferenceKind_firstTarget(rk);
-            t; t = UA_NodeReferenceKind_nextTarget(rk, t)) {
-            const UA_Node *refTarget = UA_NODESTORE_GETFROMREF(server, t);
-            if(!refTarget)
-                continue;
-            if(refTarget->head.nodeClass == UA_NODECLASS_VARIABLE &&
-               refTarget->head.browseName.namespaceIndex == 0 &&
-               UA_String_equal(&withBrowseName, &refTarget->head.browseName.name)) {
-                return &refTarget->variableNode;
-            }
-            UA_NODESTORE_RELEASE(server, refTarget);
-        }
+        struct GetArgumentsNodeContext ctx;
+        ctx.server = server;
+        ctx.withBrowseName = withBrowseName;
+        return (const UA_VariableNode*)
+            UA_NodeReferenceKind_iterate(rk, getArgumentsNodeCallback, &ctx);
     }
     return NULL;
 }
 
 /* inputArgumentResults has the length request->inputArgumentsSize */
 static UA_StatusCode
-typeCheckArguments(UA_Server *server, UA_Session *session,
-                   const UA_VariableNode *argRequirements, size_t argsSize,
-                   UA_Variant *args, UA_StatusCode *inputArgumentResults) {
+checkAdjustArguments(UA_Server *server, UA_Session *session,
+                     const UA_VariableNode *argRequirements, size_t argsSize,
+                     UA_Variant *args, UA_StatusCode *inputArgumentResults) {
     /* Verify that we have a Variant containing UA_Argument (scalar or array) in
      * the "InputArguments" node */
-    if(argRequirements->valueSource != UA_VALUESOURCE_DATA)
-        return UA_STATUSCODE_BADINTERNALERROR;
-    if(!argRequirements->value.data.value.hasValue)
-        return UA_STATUSCODE_BADINTERNALERROR;
-    if(argRequirements->value.data.value.value.type != &UA_TYPES[UA_TYPES_ARGUMENT])
-        return UA_STATUSCODE_BADINTERNALERROR;
+    const UA_Variant *argVal;
+    size_t argReqsSize;
+    UA_StatusCode retval =
+        getArgumentsValue(argRequirements, &argVal, &argReqsSize);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
 
-    /* Verify the number of arguments. A scalar argument value is interpreted as
-     * an array of length 1. */
-    size_t argReqsSize = argRequirements->value.data.value.value.arrayLength;
-    if(UA_Variant_isScalar(&argRequirements->value.data.value.value))
-        argReqsSize = 1;
+    /* Verify the number of arguments */
     if(argReqsSize > argsSize)
         return UA_STATUSCODE_BADARGUMENTSMISSING;
     if(argReqsSize < argsSize)
         return UA_STATUSCODE_BADTOOMANYARGUMENTS;
 
     /* Type-check every argument against the definition */
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    UA_Argument *argReqs = (UA_Argument*)argRequirements->value.data.value.value.data;
+    retval = UA_STATUSCODE_GOOD;
+    UA_Argument *argReqs = (UA_Argument*)argVal->data;
+    const char *reason;
     for(size_t i = 0; i < argReqsSize; ++i) {
+        /* Incompatible value. Try to correct the type if possible. */
+        adjustValueType(server, &args[i], &argReqs[i].dataType);
+
+        /* Check */
         if(!compatibleValue(server, session, &argReqs[i].dataType, argReqs[i].valueRank,
                             argReqs[i].arrayDimensionsSize, argReqs[i].arrayDimensions,
-                            &args[i], NULL)) {
+                            &args[i], NULL, &reason)) {
             inputArgumentResults[i] = UA_STATUSCODE_BADTYPEMISMATCH;
             retval = UA_STATUSCODE_BADINVALIDARGUMENT;
         }
@@ -81,376 +125,295 @@ typeCheckArguments(UA_Server *server, UA_Session *session,
     return retval;
 }
 
-/* inputArgumentResults has the length request->inputArgumentsSize */
 static UA_StatusCode
-validMethodArguments(UA_Server *server, UA_Session *session, const UA_MethodNode *method,
-                     const UA_CallMethodRequest *request,
-                     UA_StatusCode *inputArgumentResults) {
-    /* Get the input arguments node */
-    const UA_VariableNode *inputArguments =
-        getArgumentsVariableNode(server, &method->head, UA_STRING("InputArguments"));
-    if(!inputArguments) {
-        if(request->inputArgumentsSize > 0)
-            return UA_STATUSCODE_BADTOOMANYARGUMENTS;
-        return UA_STATUSCODE_GOOD;
+checkMethodInTypeHierarchy(UA_Server *server, UA_Session *session,
+                           const UA_NodeId *contextId, const UA_NodeId *methodId,
+                           const UA_QualifiedName *methodBrowseName) {
+    /* Get the type hierarchy "upwards" from the context */
+    UA_NodeId *typeHierarchy;
+    size_t typeHierarchySize;
+    UA_StatusCode res =
+        getTypeAndInterfaceHierarchy(server, contextId, false,
+                                     &typeHierarchy, &typeHierarchySize);
+    if(res != UA_STATUSCODE_GOOD)
+        return res;
+
+    /* Check if the method is in the type hierarchy */
+    for(size_t i = 0; i < typeHierarchySize; i++) {
+        UA_NodeId contained;
+        res = findChildByBrowsename(server, session, typeHierarchy[i],
+                                    UA_NODECLASS_METHOD,
+                                    UA_REFERENCETYPEINDEX_HASCOMPONENT,
+                                    UA_NS0ID(HASCOMPONENT),
+                                    methodBrowseName, &contained);
+        if(res == UA_STATUSCODE_BADNOTFOUND)
+            continue;
+        if(res != UA_STATUSCODE_GOOD)
+            break;
+        UA_Boolean found = UA_NodeId_equal(&contained, methodId);
+        UA_NodeId_clear(&contained);
+        res = (found) ? UA_STATUSCODE_GOOD : UA_STATUSCODE_BADNOTFOUND;
+        if(found)
+            break;
     }
 
-    /* Verify the request */
-    UA_StatusCode retval =
-        typeCheckArguments(server, session, inputArguments, request->inputArgumentsSize,
-                           request->inputArguments, inputArgumentResults);
-
-    /* Release the input arguments node */
-    UA_NODESTORE_RELEASE(server, (const UA_Node*)inputArguments);
-    return retval;
+    /* Clean up and return */
+    UA_Array_delete(typeHierarchy, typeHierarchySize, &UA_TYPES[UA_TYPES_NODEID]);
+    return res;
 }
 
-static const UA_NodeId hasComponentNodeId = {0, UA_NODEIDTYPE_NUMERIC, {UA_NS0ID_HASCOMPONENT}};
-static const UA_NodeId organizedByNodeId = {0, UA_NODEIDTYPE_NUMERIC, {UA_NS0ID_ORGANIZES}};
-static const UA_String namespaceDiModel = UA_STRING_STATIC("http://opcfoundation.org/UA/DI/");
-static const UA_NodeId hasTypeDefinitionNodeId = {0, UA_NODEIDTYPE_NUMERIC, {UA_NS0ID_HASTYPEDEFINITION}};
-// ns=0 will be replace dynamically. DI-Spec. 1.01: <UAObjectType NodeId="ns=1;i=1005" BrowseName="1:FunctionalGroupType">
-static UA_NodeId functionGroupNodeId = {0, UA_NODEIDTYPE_NUMERIC, {1005}};
-
-static void
-callWithMethodAndObject(UA_Server *server, UA_Session *session,
-                        const UA_CallMethodRequest *request, UA_CallMethodResult *result,
-                        const UA_MethodNode *method, const UA_ObjectNode *object) {
-    /* Verify the object's NodeClass */
-    if(object->head.nodeClass != UA_NODECLASS_OBJECT &&
-       object->head.nodeClass != UA_NODECLASS_OBJECTTYPE) {
-        result->statusCode = UA_STATUSCODE_BADNODECLASSINVALID;
-        return;
-    }
-
-    /* Verify the method's NodeClass */
-    if(method->head.nodeClass != UA_NODECLASS_METHOD) {
-        result->statusCode = UA_STATUSCODE_BADNODECLASSINVALID;
-        return;
-    }
-
+static UA_StatusCode
+callWithResolvedMethodAndObject(UA_Server *server, UA_Session *session,
+                                const UA_CallMethodRequest *request,
+                                UA_CallMethodResult *result,
+                                const UA_MethodNode *resolvedMethod,
+                                const UA_Node *callContext) {
     /* Is there a method to execute? */
-    if(!method->method) {
-        result->statusCode = UA_STATUSCODE_BADINTERNALERROR;
-        return;
-    }
-
-    /* Verify method/object relations. Object must have a hasComponent or a
-     * subtype of hasComponent reference to the method node. Therefore, check
-     * every reference between the parent object and the method node if there is
-     * a hasComponent (or subtype) reference */
-    UA_ReferenceTypeSet hasComponentRefs;
-    result->statusCode =
-        referenceTypeIndices(server, &hasComponentNodeId, &hasComponentRefs, true);
-    if(result->statusCode != UA_STATUSCODE_GOOD)
-        return;
-
-    UA_Boolean found = false;
-    for(size_t i = 0; i < object->head.referencesSize && !found; ++i) {
-        const UA_NodeReferenceKind *rk = &object->head.references[i];
-        if(rk->isInverse)
-            continue;
-        if(!UA_ReferenceTypeSet_contains(&hasComponentRefs, rk->referenceTypeIndex))
-            continue;
-        for(UA_ReferenceTarget *t = UA_NodeReferenceKind_firstTarget(rk);
-            t; t = UA_NodeReferenceKind_nextTarget(rk, t)) {
-            if(UA_ExpandedNodeId_isLocal(&t->targetId) &&
-               UA_NodeId_equal(&t->targetId.nodeId, &request->methodId)) {
-                found = true;
-                break;
-            }
-        }
-    }
-
-    if(!found) {
-        /* The following ParentObject evaluation is a workaround only to fulfill
-         * the OPC UA Spec. Part 100 - Devices requirements regarding functional
-         * groups. Compare OPC UA Spec. Part 100 - Devices, Release 1.02
-         *    - 5.4 FunctionalGroupType
-         *    - B.1 Functional Group Usages
-         * A functional group is a sub-type of the FolderType and is used to
-         * organize the Parameters and Methods from the complete set (named
-         * ParameterSet and MethodSet) in (Functional) groups for instance
-         * Configuration or Identification. The same Property, Parameter or
-         * Method can be referenced from more than one FunctionalGroup. */
-
-        /* Check whether the DI namespace is available */
-        size_t foundNamespace = 0;
-        UA_StatusCode res = getNamespaceByName(server, namespaceDiModel, &foundNamespace);
-        if(res != UA_STATUSCODE_GOOD) {
-            result->statusCode = UA_STATUSCODE_BADMETHODINVALID;
-            return;
-        }
-        functionGroupNodeId.namespaceIndex = (UA_UInt16)foundNamespace;
-
-        UA_ReferenceTypeSet hasTypeDefinitionRefs;
-        result->statusCode =
-            referenceTypeIndices(server, &hasTypeDefinitionNodeId,
-                                 &hasTypeDefinitionRefs, true);
-        if(result->statusCode != UA_STATUSCODE_GOOD)
-            return;
-
-        /* Search for a HasTypeDefinition (or sub-) reference in the parent object */
-        for(size_t i = 0; i < object->head.referencesSize && !found; ++i) {
-            const UA_NodeReferenceKind *rk = &object->head.references[i];
-            if(rk->isInverse)
-                continue;
-            if(!UA_ReferenceTypeSet_contains(&hasTypeDefinitionRefs, rk->referenceTypeIndex))
-                continue;
-            
-            /* Verify that the HasTypeDefinition is equal to FunctionGroupType
-             * (or sub-type) from the DI model */
-            for(UA_ReferenceTarget *t = UA_NodeReferenceKind_firstTarget(rk);
-                t && !found; t = UA_NodeReferenceKind_nextTarget(rk, t)) {
-                if(!UA_ExpandedNodeId_isLocal(&t->targetId))
-                    continue;
-                
-                if(!isNodeInTree_singleRef(server, &t->targetId.nodeId,
-                                           &functionGroupNodeId,
-                                           UA_REFERENCETYPEINDEX_HASSUBTYPE))
-                    continue;
-
-                /* Search for the called method with reference Organize (or
-                 * sub-type) from the parent object */
-                for(size_t k = 0; k < object->head.referencesSize && !found; ++k) {
-                    const UA_NodeReferenceKind *rkInner = &object->head.references[k];
-                    if(rkInner->isInverse)
-                        continue;
-                    const UA_NodeId * refId = 
-                        UA_NODESTORE_GETREFERENCETYPEID(server, rkInner->referenceTypeIndex);
-                    if(!isNodeInTree_singleRef(server, refId, &organizedByNodeId,
-                                               UA_REFERENCETYPEINDEX_HASSUBTYPE))
-                        continue;
-                    
-                    for(UA_ReferenceTarget *t2 = UA_NodeReferenceKind_firstTarget(rkInner);
-                        t2; t2 = UA_NodeReferenceKind_nextTarget(rkInner, t2)) {
-                        if(!UA_ExpandedNodeId_isLocal(&t2->targetId))
-                            continue;
-                        if(UA_NodeId_equal(&t2->targetId.nodeId, &request->methodId)) {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if(!found) {
-            result->statusCode = UA_STATUSCODE_BADMETHODINVALID;
-            return;
-        }
-    }
+    if(!resolvedMethod->method)
+        return UA_STATUSCODE_BADINTERNALERROR;
 
     /* Verify access rights */
-    UA_Boolean executable = method->executable;
-    if(session != &server->adminSession) {
-        UA_UNLOCK(&server->serviceMutex);
-        executable = executable && server->config.accessControl.
-            getUserExecutableOnObject(server, &server->config.accessControl, &session->sessionId,
-                                      session->sessionHandle, &request->methodId, method->head.context,
-                                      &request->objectId, object->head.context);
-        UA_LOCK(&server->serviceMutex);
-    }
+    UA_Boolean executable = resolvedMethod->executable;
+    if(!executable)
+        return UA_STATUSCODE_BADNOTEXECUTABLE;
 
-    if(!executable) {
-        result->statusCode = UA_STATUSCODE_BADNOTEXECUTABLE;
-        return;
+    if(session != &server->adminSession) {
+        executable = server->config.accessControl.
+            getUserExecutableOnObject(server, &server->config.accessControl,
+                                      &session->sessionId, session->context,
+                                      &resolvedMethod->head.nodeId,
+                                      resolvedMethod->head.context,
+                                      &request->objectId,
+                                      callContext->head.context);
     }
+    if(!executable)
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+
+    /* The input arguments are const and not changed. We move the input
+     * arguments to a secondary array that is mutable. This is used for small
+     * adjustments on the type level during the type checking. But it has to be
+     * ensured that the original array can still by _clear'ed after the methods
+     * call. */
+    if(request->inputArgumentsSize > UA_MAX_METHOD_ARGUMENTS)
+        return UA_STATUSCODE_BADTOOMANYARGUMENTS;
+
+    UA_Variant mutableInputArgs[UA_MAX_METHOD_ARGUMENTS];
+    if(request->inputArgumentsSize > 0)
+        memcpy(mutableInputArgs, request->inputArguments,
+               sizeof(UA_Variant) * request->inputArgumentsSize);
 
     /* Allocate the inputArgumentResults array */
     result->inputArgumentResults = (UA_StatusCode*)
         UA_Array_new(request->inputArgumentsSize, &UA_TYPES[UA_TYPES_STATUSCODE]);
-    if(!result->inputArgumentResults) {
-        result->statusCode = UA_STATUSCODE_BADOUTOFMEMORY;
-        return;
-    }
+    if(!result->inputArgumentResults)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
     result->inputArgumentResultsSize = request->inputArgumentsSize;
 
-    /* Verify Input Arguments */
-    result->statusCode = validMethodArguments(server, session, method, request,
-                                              result->inputArgumentResults);
+    /* Type-check the input arguments */
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    const UA_VariableNode *inputArguments =
+        getArgumentsVariableNode(server, &resolvedMethod->head,
+                                 UA_STRING("InputArguments"));
+    if(inputArguments) {
+        res = checkAdjustArguments(server, session,
+                                   inputArguments, request->inputArgumentsSize,
+                                   mutableInputArgs, result->inputArgumentResults);
+        UA_NODESTORE_RELEASE(server, (const UA_Node*)inputArguments);
+    } else if(request->inputArgumentsSize > 0) {
+        res = UA_STATUSCODE_BADTOOMANYARGUMENTS;
+    }
 
     /* Return inputArgumentResults only for BADINVALIDARGUMENT */
-    if(result->statusCode != UA_STATUSCODE_BADINVALIDARGUMENT) {
-        UA_Array_delete(result->inputArgumentResults, result->inputArgumentResultsSize,
+    if(res != UA_STATUSCODE_BADINVALIDARGUMENT) {
+        UA_Array_delete(result->inputArgumentResults,
+                        result->inputArgumentResultsSize,
                         &UA_TYPES[UA_TYPES_STATUSCODE]);
         result->inputArgumentResults = NULL;
         result->inputArgumentResultsSize = 0;
     }
 
     /* Error during type-checking? */
-    if(result->statusCode != UA_STATUSCODE_GOOD)
-        return;
+    if(res != UA_STATUSCODE_GOOD)
+        return res;
 
     /* Get the output arguments node */
     const UA_VariableNode *outputArguments =
-        getArgumentsVariableNode(server, &method->head, UA_STRING("OutputArguments"));
+        getArgumentsVariableNode(server, &resolvedMethod->head,
+                                 UA_STRING("OutputArguments"));
 
-    /* Allocate the output arguments array */
+    /* Allocate the output arguments array. Always allocate memory, hence the
+     * +1, even if the length is zero. Because we need a unique outputArguments
+     * pointer as the key for async operations. The memory gets deleted in
+     * UA_Array_delete even if the outputArgumentsSize is zero. */
     size_t outputArgsSize = 0;
-    if(outputArguments)
-        outputArgsSize = outputArguments->value.data.value.value.arrayLength;
-    result->outputArguments = (UA_Variant*)
-        UA_Array_new(outputArgsSize, &UA_TYPES[UA_TYPES_VARIANT]);
-    if(!result->outputArguments) {
-        result->statusCode = UA_STATUSCODE_BADOUTOFMEMORY;
-        return;
+    if(outputArguments) {
+        res = getArgumentsValue(outputArguments, NULL, &outputArgsSize);
+        UA_NODESTORE_RELEASE(server, (const UA_Node*)outputArguments);
+        if(res != UA_STATUSCODE_GOOD)
+            return res;
     }
+    result->outputArguments = (UA_Variant*)
+        UA_Array_new(outputArgsSize+1, &UA_TYPES[UA_TYPES_VARIANT]);
+    if(!result->outputArguments)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
     result->outputArgumentsSize = outputArgsSize;
 
-    /* Release the output arguments node */
-    UA_NODESTORE_RELEASE(server, (const UA_Node*)outputArguments);
+    /* Invoke the method with the server mutex held. Async callbacks schedule
+     * work and return without waiting for it. */
+    res = resolvedMethod->method(server, &session->sessionId, session->context,
+                                 &resolvedMethod->head.nodeId,
+                                 resolvedMethod->head.context,
+                                 &callContext->head.nodeId, callContext->head.context,
+                                 request->inputArgumentsSize, mutableInputArgs,
+                                 result->outputArgumentsSize, result->outputArguments);
 
-    /* Call the method */
-    UA_UNLOCK(&server->serviceMutex);
-    result->statusCode = method->method(server, &session->sessionId, session->sessionHandle,
-                                        &method->head.nodeId, method->head.context,
-                                        &object->head.nodeId, object->head.context,
-                                        request->inputArgumentsSize, request->inputArguments,
-                                        result->outputArgumentsSize, result->outputArguments);
-    UA_LOCK(&server->serviceMutex);
     /* TODO: Verify Output matches the argument definition */
-}
 
-#if UA_MULTITHREADING >= 100
-
-static void
-Operation_CallMethodAsync(UA_Server *server, UA_Session *session, UA_UInt32 requestId,
-                          UA_UInt32 requestHandle, size_t opIndex,
-                          UA_CallMethodRequest *opRequest, UA_CallMethodResult *opResult,
-                          UA_AsyncResponse **ar) {
-    /* Get the method node */
-    const UA_Node *method = UA_NODESTORE_GET(server, &opRequest->methodId);
-    if(!method) {
-        opResult->statusCode = UA_STATUSCODE_BADNODEIDUNKNOWN;
-        return;
+#ifdef UA_ENABLE_AUDITING
+    /* Async output remains application-owned; only audit synchronous calls. */
+    if(res != UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY &&
+       server->config.auditingEnabled && server->config.auditMethodUpdateEnabled) {
+        auditMethodUpdateEvent(server, session->channel, session, (res == UA_STATUSCODE_GOOD),
+                               &callContext->head.nodeId, &resolvedMethod->head.nodeId,
+                               res, request->inputArgumentsSize, mutableInputArgs,
+                               result->outputArgumentsSize, result->outputArguments);
     }
-
-    /* Get the object node */
-    const UA_Node *object = UA_NODESTORE_GET(server, &opRequest->objectId);
-    if(!object) {
-        opResult->statusCode = UA_STATUSCODE_BADNODEIDUNKNOWN;
-        UA_NODESTORE_RELEASE(server, method);
-        return;
-    }
-
-    /* Synchronous execution */
-    if(!method->methodNode.async) {
-        callWithMethodAndObject(server, session, opRequest, opResult,
-                                &method->methodNode, &object->objectNode);
-        goto cleanup;
-    }
-
-    /* <-- Async method call --> */
-
-    /* No AsyncResponse allocated so far */
-    if(!*ar) {
-        opResult->statusCode =
-            UA_AsyncManager_createAsyncResponse(&server->asyncManager, server,
-                            &session->sessionId, requestId, requestHandle,
-                            UA_ASYNCOPERATIONTYPE_CALL, ar);
-        if(opResult->statusCode != UA_STATUSCODE_GOOD)
-            goto cleanup;
-    }
-
-    /* Create the Async Request to be taken by workers */
-    opResult->statusCode =
-        UA_AsyncManager_createAsyncOp(&server->asyncManager,
-                                      server, *ar, opIndex, opRequest);
-
- cleanup:
-    /* Release the method and object node */
-    UA_NODESTORE_RELEASE(server, method);
-    UA_NODESTORE_RELEASE(server, object);
-}
-
-void
-Service_CallAsync(UA_Server *server, UA_Session *session, UA_UInt32 requestId,
-                  const UA_CallRequest *request, UA_CallResponse *response,
-                  UA_Boolean *finished) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Processing CallRequestAsync");
-    if(server->config.maxNodesPerMethodCall != 0 &&
-        request->methodsToCallSize > server->config.maxNodesPerMethodCall) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADTOOMANYOPERATIONS;
-        return;
-    }
-
-    UA_AsyncResponse *ar = NULL;
-    response->responseHeader.serviceResult =
-        UA_Server_processServiceOperationsAsync(server, session, requestId,
-                  request->requestHeader.requestHandle,
-                  (UA_AsyncServiceOperation)Operation_CallMethodAsync,
-                  &request->methodsToCallSize, &UA_TYPES[UA_TYPES_CALLMETHODREQUEST],
-                  &response->resultsSize, &UA_TYPES[UA_TYPES_CALLMETHODRESULT], &ar);
-
-    if(ar) {
-        if(ar->opCountdown > 0) {
-            /* Move all results to the AsyncResponse. The async operation
-             * results will be overwritten when the workers return results. */
-            ar->response.callResponse = *response;
-            UA_CallResponse_init(response);
-            *finished = false;
-        } else {
-            /* If there is a new AsyncResponse, ensure it has at least one
-             * pending operation */
-            UA_AsyncManager_removeAsyncResponse(&server->asyncManager, ar);
-        }
-    }
-}
 #endif
 
-static void
-Operation_CallMethod(UA_Server *server, UA_Session *session, void *context,
-                     const UA_CallMethodRequest *request, UA_CallMethodResult *result) {
-    /* Get the method node */
-    const UA_Node *method = UA_NODESTORE_GET(server, &request->methodId);
-    if(!method) {
-        result->statusCode = UA_STATUSCODE_BADNODEIDUNKNOWN;
-        return;
+    return res;
+}
+
+static UA_StatusCode
+callWithMethodAndObject(UA_Server *server, UA_Session *session,
+                        const UA_CallMethodRequest *request,
+                        UA_CallMethodResult *result,
+                        const UA_Node *callMethod,
+                        const UA_Node *callObject) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    /* Verify the context object's NodeClass */
+    if(callObject->head.nodeClass != UA_NODECLASS_OBJECT &&
+       callObject->head.nodeClass != UA_NODECLASS_OBJECTTYPE)
+        return UA_STATUSCODE_BADNODECLASSINVALID;
+
+    /* Verify the method's NodeClass */
+    if(callMethod->head.nodeClass != UA_NODECLASS_METHOD)
+        return UA_STATUSCODE_BADNODECLASSINVALID;
+
+    /* For object types the given method must be directly referenced!
+     * OPC UA 1.05.06 will state in Part 4 - Call Service Parameters
+     * the following for parameter "objectId":
+     * "In case of an ObjectType the ObjectType shall be the source of a
+     *  HasComponent Reference (or subtype of HasComponent Reference) to the
+     *  Method specified in methodId" */
+
+    /* Find the matching Method of the same BrowseName referenced directly by
+     * the calling object */
+    UA_NodeId resolvedMethodId;
+    UA_StatusCode res =
+        findChildByBrowsename(server, session, callObject->head.nodeId,
+                              UA_NODECLASS_METHOD, UA_REFERENCETYPEINDEX_HASCOMPONENT,
+                              UA_NS0ID(HASCOMPONENT), &callMethod->head.browseName,
+                              &resolvedMethodId);
+    if(res != UA_STATUSCODE_GOOD)
+        return (res == UA_STATUSCODE_BADNOTFOUND) ?
+            UA_STATUSCODE_BADMETHODINVALID : res;
+
+    /* The resolved methodId is different */
+    const UA_MethodNode *resolvedMethod = (const UA_MethodNode*)callMethod;
+    if(!UA_NodeId_equal(&resolvedMethodId, &callMethod->head.nodeId)) {
+        /* Check whether the original MethodId comes from an ObjectType that is
+         * upwards in the type hierarchy. Downwards in the type hierarchy (or
+         * even completely unrelated) is not allowed. */
+        res = checkMethodInTypeHierarchy(server, session,
+                                         &callObject->head.nodeId,
+                                         &callMethod->head.nodeId,
+                                         &callMethod->head.browseName);
+        if(res != UA_STATUSCODE_GOOD) {
+            if(res == UA_STATUSCODE_BADNOTFOUND)
+                res = UA_STATUSCODE_BADMETHODINVALID;
+            goto errout;
+        }
+
+        /* Get the resolved method node */
+        resolvedMethod = (const UA_MethodNode*)
+            UA_NODESTORE_GET_SELECTIVE(server, &resolvedMethodId,
+                                       UA_NODEATTRIBUTESMASK_NODECLASS |
+                                       UA_NODEATTRIBUTESMASK_EXECUTABLE,
+                                       UA_REFERENCETYPESET_NONE,
+                                       UA_BROWSEDIRECTION_INVALID);
+        if(!resolvedMethod) {
+            res = UA_STATUSCODE_BADINTERNALERROR;
+            goto errout;
+        }
     }
 
-    /* Get the object node */
-    const UA_Node *object = UA_NODESTORE_GET(server, &request->objectId);
+    /* Run the main call logic */
+    res = callWithResolvedMethodAndObject(server, session, request, result,
+                                          resolvedMethod, callObject);
+
+ errout:
+    /* Release the resolved method node if it is different */
+    if(resolvedMethod && (const UA_Node*)resolvedMethod != callMethod)
+        UA_NODESTORE_RELEASE(server, (const UA_Node*)resolvedMethod);
+    UA_NodeId_clear(&resolvedMethodId);
+    return res;
+}
+
+UA_Boolean
+Operation_CallMethod(UA_Server *server, UA_Session *session,
+                     const UA_CallMethodRequest *request,
+                     UA_CallMethodResult *result) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    /* Get the method node. We only need the nodeClass and browseName
+     * attribute. */
+    const UA_Node *method =
+        UA_NODESTORE_GET_SELECTIVE(server, &request->methodId,
+                                   UA_NODEATTRIBUTESMASK_NODECLASS |
+                                   UA_NODEATTRIBUTESMASK_BROWSENAME,
+                                   UA_REFERENCETYPESET_NONE,
+                                   UA_BROWSEDIRECTION_INVALID);
+    if(!method) {
+        result->statusCode = UA_STATUSCODE_BADMETHODINVALID;
+        return true;
+    }
+
+    /* Get the object node. We only need the NodeClass attribute. But take all
+     * references for now.
+     *
+     * TODO: Which references do we need actually? */
+    const UA_Node *object =
+        UA_NODESTORE_GET_SELECTIVE(server, &request->objectId,
+                                   UA_NODEATTRIBUTESMASK_NODECLASS,
+                                   UA_REFERENCETYPESET_ALL,
+                                   UA_BROWSEDIRECTION_BOTH);
     if(!object) {
         result->statusCode = UA_STATUSCODE_BADNODEIDUNKNOWN;
         UA_NODESTORE_RELEASE(server, method);
-        return;
+        return true;
     }
 
-    /* Continue with method and object as context */
-    callWithMethodAndObject(server, session, request, result,
-                            &method->methodNode, &object->objectNode);
+    /* Continue with method and object (which can be an ObjectType) as
+     * context */
+    result->statusCode =
+        callWithMethodAndObject(server, session, request,
+                                result, method, object);
+    clearCallOutputIfBad(result);
 
     /* Release the method and object node */
     UA_NODESTORE_RELEASE(server, method);
     UA_NODESTORE_RELEASE(server, object);
-}
 
-void Service_Call(UA_Server *server, UA_Session *session,
-                  const UA_CallRequest *request, UA_CallResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Processing CallRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
-
-    if(server->config.maxNodesPerMethodCall != 0 &&
-       request->methodsToCallSize > server->config.maxNodesPerMethodCall) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADTOOMANYOPERATIONS;
-        return;
-    }
-
-    response->responseHeader.serviceResult =
-        UA_Server_processServiceOperations(server, session,
-                  (UA_ServiceOperation)Operation_CallMethod, NULL,
-                  &request->methodsToCallSize, &UA_TYPES[UA_TYPES_CALLMETHODREQUEST],
-                  &response->resultsSize, &UA_TYPES[UA_TYPES_CALLMETHODRESULT]);
+    return (result->statusCode != UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY);
 }
 
 UA_CallMethodResult
 UA_Server_call(UA_Server *server, const UA_CallMethodRequest *request) {
     UA_CallMethodResult result;
     UA_CallMethodResult_init(&result);
-    UA_LOCK(&server->serviceMutex);
-    Operation_CallMethod(server, &server->adminSession, NULL, request, &result);
-    UA_UNLOCK(&server->serviceMutex);
+    lockServer(server);
+    callNoAsync(server, &server->adminSession, request, &result);
+    unlockServer(server);
     return result;
 }
-
-#endif /* UA_ENABLE_METHODCALLS */

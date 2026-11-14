@@ -1,43 +1,60 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. 
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
  *    Copyright 2019 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
  *    Copyright 2019 (c) HMS Industrial Networks AB (Author: Jonas Green)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
  */
 
 #include <open62541/server.h>
 
+#include "ua_server_internal.h"
+
 void
-UA_ServerConfig_clean(UA_ServerConfig *config) {
+UA_ServerConfig_clear(UA_ServerConfig *config) {
     if(!config)
         return;
 
     /* Server Description */
     UA_BuildInfo_clear(&config->buildInfo);
     UA_ApplicationDescription_clear(&config->applicationDescription);
-#ifdef UA_ENABLE_DISCOVERY_MULTICAST
-    UA_MdnsDiscoveryConfiguration_clear(&config->mdnsConfig);
-    UA_String_clear(&config->mdnsInterfaceIP);
-# if !defined(UA_HAS_GETIFADDR)
-    if (config->mdnsIpAddressListSize) {
-        UA_free(config->mdnsIpAddressList);
-    }
-# endif
-#endif
+    /* Also allow cleanup after rejecting a nonzero count with no array. */
+    if((uintptr_t)config->serverProfileArray > (uintptr_t)UA_EMPTY_ARRAY_SENTINEL)
+        UA_Array_delete(config->serverProfileArray, config->serverProfileArraySize,
+                        &UA_TYPES[UA_TYPES_STRING]);
+    config->serverProfileArray = NULL;
+    config->serverProfileArraySize = 0;
 
-    /* Custom DataTypes */
-    /* nothing to do */
+    /* Stop and delete the EventLoop */
+    UA_EventLoop *el = config->eventLoop;
+    if(el && !config->externalEventLoop) {
+        if(el->state != UA_EVENTLOOPSTATE_FRESH &&
+           el->state != UA_EVENTLOOPSTATE_STOPPED) {
+            el->stop(el);
+            while(el->state != UA_EVENTLOOPSTATE_STOPPED) {
+                el->run(el, 100);
+            }
+        }
+        el->free(el);
+        config->eventLoop = NULL;
+    }
 
     /* Networking */
-    for(size_t i = 0; i < config->networkLayersSize; ++i)
-        config->networkLayers[i].clear(&config->networkLayers[i]);
-    UA_free(config->networkLayers);
-    config->networkLayers = NULL;
-    config->networkLayersSize = 0;
-    UA_String_clear(&config->customHostname);
-    config->customHostname = UA_STRING_NULL;
+    UA_Array_delete(config->serverUrls, config->serverUrlsSize,
+                    &UA_TYPES[UA_TYPES_STRING]);
+    config->serverUrls = NULL;
+    config->serverUrlsSize = 0;
 
+    UA_ByteString_clear(&config->webSocketCertificate);
+    UA_ByteString_clear(&config->webSocketPrivateKey);
+    UA_String_clear(&config->webSocketPrivateKeyPassword);
+    UA_ByteString_clear(&config->httpCertificate);
+    UA_ByteString_clear(&config->httpPrivateKey);
+    UA_String_clear(&config->httpListenAddress);
+    UA_String_clear(&config->httpPrivateKeyPassword);
+
+    /* Security Policies */
     for(size_t i = 0; i < config->securityPoliciesSize; ++i) {
         UA_SecurityPolicy *policy = &config->securityPolicies[i];
         policy->clear(policy);
@@ -54,14 +71,16 @@ UA_ServerConfig_clean(UA_ServerConfig *config) {
     config->endpointsSize = 0;
 
     /* Nodestore */
-    if(config->nodestore.context && config->nodestore.clear) {
-        config->nodestore.clear(config->nodestore.context);
-        config->nodestore.context = NULL;
+    if(config->nodestore) {
+        config->nodestore->free(config->nodestore);
+        config->nodestore = NULL;
     }
 
     /* Certificate Validation */
-    if(config->certificateVerification.clear)
-        config->certificateVerification.clear(&config->certificateVerification);
+    if(config->secureChannelPKI.clear)
+        config->secureChannelPKI.clear(&config->secureChannelPKI);
+    if(config->sessionPKI.clear)
+        config->sessionPKI.clear(&config->sessionPKI);
 
     /* Access Control */
     if(config->accessControl.clear)
@@ -73,14 +92,7 @@ UA_ServerConfig_clean(UA_ServerConfig *config) {
         config->historyDatabase.clear(&config->historyDatabase);
 #endif
 
-    /* Logger */
-    if(config->logger.clear)
-        config->logger.clear(config->logger.context);
-    config->logger.log = NULL;
-    config->logger.clear = NULL;
-
 #ifdef UA_ENABLE_PUBSUB
-#ifdef UA_ENABLE_PUBSUB_ENCRYPTION
     if(config->pubSubConfig.securityPolicies != NULL) {
         for(size_t i = 0; i < config->pubSubConfig.securityPoliciesSize; i++) {
             config->pubSubConfig.securityPolicies[i].clear(&config->pubSubConfig.securityPolicies[i]);
@@ -89,26 +101,34 @@ UA_ServerConfig_clean(UA_ServerConfig *config) {
         config->pubSubConfig.securityPolicies = NULL;
         config->pubSubConfig.securityPoliciesSize = 0;
     }
+#endif /* UA_ENABLE_PUBSUB */
+
+    /* Logger */
+    if(config->logging != NULL && config->logging->clear != NULL)
+        config->logging->clear(config->logging);
+    config->logging = NULL;
+
+    /* Custom Data Types */
+    UA_cleanupDataTypeWithCustom(config->customDataTypes);
+    config->customDataTypes = NULL;
+
+#ifdef UA_ENABLE_RBAC
+    /* RBAC Presets */
+    if(config->rolePermissionPresets) {
+        for(size_t i = 0; i < config->rolePermissionPresetsSize; i++)
+            UA_RolePermissionSet_clear(&config->rolePermissionPresets[i]);
+        UA_free(config->rolePermissionPresets);
+        config->rolePermissionPresets = NULL;
+        config->rolePermissionPresetsSize = 0;
+    }
+
+    /* RBAC Roles */
+    if(config->roles) {
+        for(size_t i = 0; i < config->rolesSize; i++)
+            UA_Role_clear(&config->roles[i]);
+        UA_free(config->roles);
+        config->roles = NULL;
+        config->rolesSize = 0;
+    }
 #endif
-#endif /* UA_ENABLE_PUBSUB */
 }
-
-#ifdef UA_ENABLE_PUBSUB
-/* Add a pubsubTransportLayer to the configuration. Memory is reallocated on
- * demand. */
-UA_StatusCode
-UA_ServerConfig_addPubSubTransportLayer(UA_ServerConfig *config,
-                                        UA_PubSubTransportLayer pubsubTransportLayer) {
-    UA_PubSubTransportLayer *tmpLayers = (UA_PubSubTransportLayer*)
-        UA_realloc(config->pubSubConfig.transportLayers,
-                   sizeof(UA_PubSubTransportLayer) *
-                   (config->pubSubConfig.transportLayersSize + 1));
-    if(tmpLayers == NULL)
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-
-    config->pubSubConfig.transportLayers = tmpLayers;
-    config->pubSubConfig.transportLayers[config->pubSubConfig.transportLayersSize] = pubsubTransportLayer;
-    config->pubSubConfig.transportLayersSize++;
-    return UA_STATUSCODE_GOOD;
-}
-#endif /* UA_ENABLE_PUBSUB */

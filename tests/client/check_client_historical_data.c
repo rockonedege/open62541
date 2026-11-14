@@ -16,30 +16,37 @@
 #include <open62541/server_config_default.h>
 
 #include "client/ua_client_internal.h"
+#include "server/ua_server_internal.h"
 
 #include <check.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdio.h>
 
+#include "test_helpers.h"
 #include "testing_clock.h"
 #include "testing_networklayers.h"
 #include "thread_wrapper.h"
-#ifdef UA_ENABLE_HISTORIZING
 #include "historical_read_test_data.h"
-#endif
-#include <stddef.h>
 
 static UA_Server *server;
-#ifdef UA_ENABLE_HISTORIZING
 static UA_HistoryDataGathering *gathering;
-#endif
-static UA_Boolean running;
+static UA_atomic(uintptr_t) running;
 static THREAD_HANDLE server_thread;
 
 static UA_Client *client;
 static UA_NodeId parentNodeId;
 static UA_NodeId parentReferenceNodeId;
 static UA_NodeId outNodeId;
-#ifdef UA_ENABLE_HISTORIZING
 static UA_HistoryDataBackend serverBackend;
+
+static UA_Byte
+denyHistoryAccess(UA_Server *server, UA_AccessControl *ac,
+                  const UA_NodeId *sessionId, void *sessionContext,
+                  const UA_NodeId *nodeId, void *nodeContext) {
+    return (UA_Byte)(0xff & ~(UA_ACCESSLEVELMASK_HISTORYREAD |
+                             UA_ACCESSLEVELMASK_HISTORYWRITE));
+}
 
 // to receive data after we inserted data, we need in datavalue more space
 struct ReceiveTupel {
@@ -50,15 +57,13 @@ struct ReceiveTupel {
 static const size_t receivedDataSize = (sizeof(testData) / sizeof(testData[0])) + 10;
 static struct ReceiveTupel receivedTestData[(sizeof(testData) / sizeof(testData[0])) + 10];
 static size_t receivedTestDataPos;
-#endif
 
 THREAD_CALLBACK(serverloop) {
-    while(running)
+    while(UA_atomic_load(&running))
         UA_Server_run_iterate(server, true);
     return 0;
 }
 
-#ifdef UA_ENABLE_HISTORIZING
 static UA_Boolean
 fillHistoricalDataBackend(UA_HistoryDataBackend backend);
 static void resetReceiveBuffer(void) {
@@ -79,18 +84,17 @@ static void fillInt64DataValue(UA_DateTime timestamp, UA_Int64 value,
     dataValue->hasStatus = true;
     dataValue->status = UA_STATUSCODE_GOOD;
 }
-#endif
 
 static void setup(void) {
-    running = true;
-    server = UA_Server_new();
-    UA_ServerConfig *config = UA_Server_getConfig(server);
-    UA_ServerConfig_setDefault(config);
+    UA_atomic_store(&running, true);
+    server = UA_Server_newForUnitTest();
+    ck_assert(server != NULL);
 
 #ifdef UA_ENABLE_HISTORIZING
     resetReceiveBuffer();
     gathering = (UA_HistoryDataGathering*)UA_calloc(1, sizeof(UA_HistoryDataGathering));
     *gathering = UA_HistoryDataGathering_Default(1);
+    UA_ServerConfig *config = UA_Server_getConfig(server);
     config->historyDatabase = UA_HistoryDatabase_default(*gathering);
 #endif
 
@@ -124,7 +128,6 @@ static void setup(void) {
                                                 &outNodeId)
                       , UA_STATUSCODE_GOOD);
 
-#ifdef UA_ENABLE_HISTORIZING
     UA_HistorizingNodeIdSettings setting;
     serverBackend = UA_HistoryDataBackend_Memory(1, 100);
     setting.historizingBackend = serverBackend;
@@ -132,54 +135,38 @@ static void setup(void) {
     setting.historizingUpdateStrategy = UA_HISTORIZINGUPDATESTRATEGY_USER;
     retval = gathering->registerNodeId(server, gathering->context, &outNodeId, setting);
     ck_assert_str_eq(UA_StatusCode_name(retval), UA_StatusCode_name(UA_STATUSCODE_GOOD));
-
     ck_assert(fillHistoricalDataBackend(setting.historizingBackend));
-#endif
 
-    client = UA_Client_new();
-    UA_ClientConfig_setDefault(UA_Client_getConfig(client));
+    client = UA_Client_newForUnitTest();
     retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
     ck_assert_str_eq(UA_StatusCode_name(retval), UA_StatusCode_name(UA_STATUSCODE_GOOD));
-
-    UA_Client_recv = client->connection.recv;
-    client->connection.recv = UA_Client_recvTesting;
 }
 
 static void
-teardown(void)
-{
+teardown(void) {
     /* cleanup */
-#ifdef UA_ENABLE_HISTORIZING
     UA_HistoryDataBackend_Memory_clear(&serverBackend);
-#endif
     UA_Client_disconnect(client);
     UA_Client_delete(client);
     UA_NodeId_clear(&parentNodeId);
     UA_NodeId_clear(&parentReferenceNodeId);
     UA_NodeId_clear(&outNodeId);
-    running = false;
+    UA_atomic_store(&running, false);
     THREAD_JOIN(server_thread);
     UA_Server_run_shutdown(server);
     UA_Server_delete(server);
-#ifdef UA_ENABLE_HISTORIZING
     UA_free(gathering);
-#endif
 }
 
-#ifdef UA_ENABLE_HISTORIZING
-
-#include <stdio.h>
-#include "ua_session.h"
-
 static UA_Boolean
-fillHistoricalDataBackend(UA_HistoryDataBackend backend)
-{
+fillHistoricalDataBackend(UA_HistoryDataBackend backend) {
     fprintf(stderr, "Adding to historical data backend: ");
     for (size_t i = 0; i < testDataSize; ++i) {
         fprintf(stderr, "%lld, ", (long long)testData[i]);
         UA_DataValue value;
         fillInt64DataValue(testData[i], testData[i], &value);
-        if (backend.serverSetHistoryData(server, backend.context, NULL, NULL, &outNodeId, UA_FALSE, &value) != UA_STATUSCODE_GOOD) {
+        if (backend.serverSetHistoryData(server, backend.context, NULL, NULL,
+                                         &outNodeId, UA_FALSE, &value) != UA_STATUSCODE_GOOD) {
             fprintf(stderr, "\n");
             UA_DataValue_clear(&value);
             return false;
@@ -190,7 +177,9 @@ fillHistoricalDataBackend(UA_HistoryDataBackend backend)
     return true;
 }
 
-static UA_Boolean checkTestData(UA_Boolean inverse, UA_DateTime *dataA, struct ReceiveTupel *dataB, size_t dataSize) {
+static UA_Boolean
+checkTestData(UA_Boolean inverse, UA_DateTime *dataA,
+              struct ReceiveTupel *dataB, size_t dataSize) {
     for (size_t i = 0; i < dataSize; ++i) {
         if (!inverse && dataA[i] != dataB[i].timestamp)
             return false;
@@ -200,7 +189,9 @@ static UA_Boolean checkTestData(UA_Boolean inverse, UA_DateTime *dataA, struct R
     return true;
 }
 
-static UA_Boolean checkModifiedData(UA_DateTime *dataA, size_t dataASize, struct ReceiveTupel *dataB, size_t dataBSize) {
+static UA_Boolean
+checkModifiedData(UA_DateTime *dataA, size_t dataASize,
+                  struct ReceiveTupel *dataB, size_t dataBSize) {
     for (size_t i = 0; i < dataBSize; ++i) {
         UA_Boolean found = UA_FALSE;
         for (size_t j = 0; j < dataASize; ++j) {
@@ -239,8 +230,7 @@ receiveCallback(UA_Client *clt,
     return true;
 }
 
-START_TEST(Client_HistorizingReadRawAll)
-{
+START_TEST(Client_HistorizingReadRawAll) {
     UA_StatusCode ret = UA_Client_HistoryRead_raw(client,
                                                   &outNodeId,
                                                   receiveCallback,
@@ -258,8 +248,57 @@ START_TEST(Client_HistorizingReadRawAll)
 }
 END_TEST
 
-START_TEST(Client_HistorizingReadRawOne)
-{
+START_TEST(Client_HistorizingDeniedByUserAccessLevel) {
+    lockServer(server);
+    UA_Server_getConfig(server)->accessControl.getUserAccessLevel = denyHistoryAccess;
+    unlockServer(server);
+
+    UA_StatusCode ret = UA_Client_HistoryRead_raw(client, &outNodeId,
+                                                  receiveCallback,
+                                                  TESTDATA_START_TIME,
+                                                  TESTDATA_STOP_TIME,
+                                                  UA_STRING_NULL, false, 100,
+                                                  UA_TIMESTAMPSTORETURN_BOTH,
+                                                  NULL);
+    ck_assert_uint_eq(ret, UA_STATUSCODE_BADUSERACCESSDENIED);
+    ck_assert_uint_eq(receivedTestDataPos, 0);
+
+    UA_DataValue value;
+    fillInt64DataValue(TESTDATA_STOP_TIME + 1, 600, &value);
+
+    UA_UpdateDataDetails details;
+    UA_UpdateDataDetails_init(&details);
+    details.nodeId = outNodeId;
+    details.performInsertReplace = UA_PERFORMUPDATETYPE_INSERT;
+    details.updateValuesSize = 1;
+    details.updateValues = &value;
+
+    UA_ExtensionObject updateDetails;
+    UA_ExtensionObject_init(&updateDetails);
+    UA_ExtensionObject_setValueNoDelete(&updateDetails, &details,
+                                        &UA_TYPES[UA_TYPES_UPDATEDATADETAILS]);
+    UA_HistoryUpdateRequest request;
+    UA_HistoryUpdateRequest_init(&request);
+    request.historyUpdateDetailsSize = 1;
+    request.historyUpdateDetails = &updateDetails;
+
+    UA_HistoryUpdateResponse response =
+        UA_Client_Service_historyUpdate(client, request);
+    UA_DataValue_clear(&value);
+    ck_assert_uint_eq(response.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(response.resultsSize, 1);
+    ck_assert_uint_eq(response.results[0].statusCode,
+                      UA_STATUSCODE_BADUSERACCESSDENIED);
+    UA_HistoryUpdateResponse_clear(&response);
+
+    ret = UA_Client_HistoryUpdate_deleteRaw(client, &outNodeId,
+                                            TESTDATA_START_TIME,
+                                            TESTDATA_STOP_TIME);
+    ck_assert_uint_eq(ret, UA_STATUSCODE_BADUSERACCESSDENIED);
+}
+END_TEST
+
+START_TEST(Client_HistorizingReadRawOne) {
     UA_StatusCode ret = UA_Client_HistoryRead_raw(client,
                                                   &outNodeId,
                                                   receiveCallback,
@@ -634,14 +673,11 @@ START_TEST(Client_HistorizingReplaceRawFail)
 }
 END_TEST
 
-#endif /*UA_ENABLE_HISTORIZING*/
-
-static Suite* testSuite_Client(void)
-{
+static Suite *
+testSuite_Client(void) {
     Suite *s = suite_create("Client Historical Data");
     TCase *tc_client = tcase_create("Client Historical Data read_raw");
     tcase_add_checked_fixture(tc_client, setup, teardown);
-#ifdef UA_ENABLE_HISTORIZING
     tcase_add_test(tc_client, Client_HistorizingReadRawAll);
     tcase_add_test(tc_client, Client_HistorizingReadRawOne);
     tcase_add_test(tc_client, Client_HistorizingReadRawTwo);
@@ -654,14 +690,16 @@ static Suite* testSuite_Client(void)
     tcase_add_test(tc_client, Client_HistorizingDeleteRaw);
     tcase_add_test(tc_client, Client_HistorizingInsertRawFail);
     tcase_add_test(tc_client, Client_HistorizingReplaceRawFail);
-#endif /* UA_ENABLE_HISTORIZING */
     suite_add_tcase(s, tc_client);
 
+    TCase *tc_access = tcase_create("Client Historical Data access control");
+    tcase_add_checked_fixture(tc_access, setup, teardown);
+    tcase_add_test(tc_access, Client_HistorizingDeniedByUserAccessLevel);
+    suite_add_tcase(s, tc_access);
     return s;
 }
 
-int main(void)
-{
+int main(void) {
     Suite *s = testSuite_Client();
     SRunner *sr = srunner_create(s);
     srunner_set_fork_status(sr, CK_NOFORK);

@@ -9,35 +9,39 @@
  *    Copyright 2016-2017 (c) Stefan Profanter, fortiss GmbH
  *    Copyright 2017 (c) frax2222
  *    Copyright 2017 (c) Mark Giraud, Fraunhofer IOSB
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Andreas Ebner)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
  */
 
 #include "ua_server_internal.h"
-#include "ua_services.h"
 
-#ifdef UA_ENABLE_DISCOVERY
 
-#include "ua_client_internal.h"
+/***************/
+/* FindServers */
+/***************/
 
 static UA_StatusCode
-setApplicationDescriptionFromRegisteredServer(const UA_FindServersRequest *request,
+setApplicationDescriptionFromRegisteredServer(size_t localeIdsSize,
+                                              UA_String *localeIds,
                                               UA_ApplicationDescription *target,
-                                              const UA_RegisteredServer *registeredServer) {
-    UA_ApplicationDescription_init(target);
-    UA_StatusCode retval = UA_String_copy(&registeredServer->serverUri, &target->applicationUri);
+                                              const UA_RegisteredServer *rs) {
+    UA_StatusCode retval =  UA_STATUSCODE_GOOD;
+    target->applicationType = rs->serverType;
+    retval |= UA_String_copy(&rs->serverUri, &target->applicationUri);
+    retval |= UA_String_copy(&rs->productUri, &target->productUri);
+    retval |= UA_String_copy(&rs->gatewayServerUri, &target->gatewayServerUri);
     if(retval != UA_STATUSCODE_GOOD)
         return retval;
 
-    retval = UA_String_copy(&registeredServer->productUri, &target->productUri);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-
-    // if the client requests a specific locale, select the corresponding server name
-    if(request->localeIdsSize) {
+    /* If the client requests a specific locale, select the corresponding server
+     * name */
+    if(localeIdsSize) {
         UA_Boolean appNameFound = false;
-        for(size_t i =0; i<request->localeIdsSize && !appNameFound; i++) {
-            for(size_t j =0; j<registeredServer->serverNamesSize; j++) {
-                if(UA_String_equal(&request->localeIds[i], &registeredServer->serverNames[j].locale)) {
-                    retval = UA_LocalizedText_copy(&registeredServer->serverNames[j],
+        for(size_t i = 0; i < localeIdsSize && !appNameFound; i++) {
+            for(size_t j =0; j < rs->serverNamesSize; j++) {
+                if(UA_String_equal(&localeIds[i],
+                                   &rs->serverNames[j].locale)) {
+                    retval = UA_LocalizedText_copy(&rs->serverNames[j],
                                                    &target->applicationName);
                     if(retval != UA_STATUSCODE_GOOD)
                         return retval;
@@ -47,83 +51,56 @@ setApplicationDescriptionFromRegisteredServer(const UA_FindServersRequest *reque
             }
         }
 
-        // server does not have the requested local, therefore we can select the
-        // most suitable one
-        if(!appNameFound && registeredServer->serverNamesSize) {
-            retval = UA_LocalizedText_copy(&registeredServer->serverNames[0],
+        /* Server does not have the requested local, therefore we can select the
+         * most suitable one */
+        if(!appNameFound && rs->serverNamesSize) {
+            retval = UA_LocalizedText_copy(&rs->serverNames[0],
                                            &target->applicationName);
             if(retval != UA_STATUSCODE_GOOD)
                 return retval;
         }
-    } else if(registeredServer->serverNamesSize) {
-        // just take the first name
-        retval = UA_LocalizedText_copy(&registeredServer->serverNames[0], &target->applicationName);
+    } else if(rs->serverNamesSize) {
+        /* Just take the first name */
+        retval = UA_LocalizedText_copy(&rs->serverNames[0],
+                                       &target->applicationName);
         if(retval != UA_STATUSCODE_GOOD)
             return retval;
     }
 
-    target->applicationType = registeredServer->serverType;
-    retval = UA_String_copy(&registeredServer->gatewayServerUri, &target->gatewayServerUri);
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
-    // TODO where do we get the discoveryProfileUri for application data?
+    /* TODO: Where do we get the discoveryProfileUri for application data? */
 
-    target->discoveryUrlsSize = registeredServer->discoveryUrlsSize;
-    if(registeredServer->discoveryUrlsSize) {
-        size_t duSize = sizeof(UA_String) * registeredServer->discoveryUrlsSize;
-        target->discoveryUrls = (UA_String *)UA_malloc(duSize);
+    if(rs->discoveryUrlsSize > 0) {
+        target->discoveryUrls = (UA_String *)
+            UA_calloc(rs->discoveryUrlsSize, sizeof(UA_String));
         if(!target->discoveryUrls)
             return UA_STATUSCODE_BADOUTOFMEMORY;
-        for(size_t i = 0; i < registeredServer->discoveryUrlsSize; i++) {
-            retval = UA_String_copy(&registeredServer->discoveryUrls[i], &target->discoveryUrls[i]);
-            if(retval != UA_STATUSCODE_GOOD)
-                return retval;
-        }
+        target->discoveryUrlsSize = rs->discoveryUrlsSize;
+        for(size_t i = 0; i < rs->discoveryUrlsSize; i++)
+            retval |= UA_String_copy(&rs->discoveryUrls[i],
+                                     &target->discoveryUrls[i]);
     }
 
     return retval;
 }
-#endif
+
 
 static UA_StatusCode
-setApplicationDescriptionFromServer(UA_ApplicationDescription *target, const UA_Server *server) {
-    /* Copy ApplicationDescription from the config */
-    UA_StatusCode result = UA_ApplicationDescription_copy(&server->config.applicationDescription, target);
-    if(result != UA_STATUSCODE_GOOD)
-        return result;
-
-    /* Add the discoveryUrls from the networklayers only if discoveryUrl
-     * not already present and to avoid redundancy */
-    if(!target->discoveryUrlsSize) {
-        size_t discSize = sizeof(UA_String) * (target->discoveryUrlsSize + server->config.networkLayersSize);
-        UA_String* disc = (UA_String *)UA_realloc(target->discoveryUrls, discSize);
-        if(!disc)
-            return UA_STATUSCODE_BADOUTOFMEMORY;
-        size_t existing = target->discoveryUrlsSize;
-        target->discoveryUrls = disc;
-        target->discoveryUrlsSize += server->config.networkLayersSize;
-
-        for(size_t i = 0; i < server->config.networkLayersSize; i++) {
-            UA_ServerNetworkLayer* nl = &server->config.networkLayers[i];
-            UA_String_copy(&nl->discoveryUrl, &target->discoveryUrls[existing + i]);
-        }
-    }
-
-    return UA_STATUSCODE_GOOD;
-}
-
-void Service_FindServers(UA_Server *server, UA_Session *session,
-                         const UA_FindServersRequest *request,
-                         UA_FindServersResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Processing FindServersRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+process_FindServers(UA_Server *server, UA_Session *session, UA_String endpointUrl,
+                    size_t localeIdsSize, UA_String *localeIds,
+                    size_t serverUrisSize, UA_String *serverUris,
+                    size_t *outServersSize,
+                    UA_ApplicationDescription **outServers) {
+    UA_ServerConfig *sc = &server->config;
+    UA_LOG_DEBUG_SESSION(sc->logging, session, "Processing FindServersRequest");
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* Return the server itself? */
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
     UA_Boolean foundSelf = false;
-    if(request->serverUrisSize) {
-        for(size_t i = 0; i < request->serverUrisSize; i++) {
-            if(UA_String_equal(&request->serverUris[i],
-                               &server->config.applicationDescription.applicationUri)) {
+    if(serverUrisSize) {
+        for(size_t i = 0; i < serverUrisSize; i++) {
+            if(UA_String_equal(&serverUris[i],
+                               &sc->applicationDescription.applicationUri)) {
                 foundSelf = true;
                 break;
             }
@@ -132,583 +109,1376 @@ void Service_FindServers(UA_Server *server, UA_Session *session,
         foundSelf = true;
     }
 
-#ifndef UA_ENABLE_DISCOVERY
-    if(!foundSelf)
-        return;
-
-    UA_ApplicationDescription *ad = UA_ApplicationDescription_new();
-    if(!ad) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-        return;
-    }
-
-    UA_StatusCode retval = setApplicationDescriptionFromServer(ad, server);
-    if(retval != UA_STATUSCODE_GOOD) {
-        UA_ApplicationDescription_delete(ad);
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-        return;
-    }
-
-    response->servers = ad;
-    response->serversSize = 1;
-    return;
-
-#else
+    /* Direct access to the out-variables */
+    UA_ApplicationDescription *servers;
 
     /* Allocate enough memory, including memory for the "self" response */
-    size_t maxResults = server->discoveryManager.registeredServersSize + 1;
-    response->servers = (UA_ApplicationDescription*)UA_Array_new(maxResults, &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION]);
-    if(!response->servers) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-        return;
+    size_t maxResults = server->registeredServersSize + 1;
+    *outServers = (UA_ApplicationDescription*)
+        UA_Array_new(maxResults, &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION]);
+    if(!*outServers)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+
+    servers = *outServers;
+
+    size_t pos = 0;
+    RegisteredServerRecord *current;
+
+    /* Copy "self" ApplicationDescriptions into the response */
+    if(foundSelf) {
+        res = UA_ApplicationDescription_copy(&sc->applicationDescription,
+                                             &servers[pos]);
+        pos++;
+        if(res != UA_STATUSCODE_GOOD)
+            goto cleanup;
     }
 
-    /* Copy into the response. TODO: Evaluate return codes */
-    size_t pos = 0;
-    if(foundSelf)
-        setApplicationDescriptionFromServer(&response->servers[pos++], server);
-
-    registeredServer_list_entry* current;
-    LIST_FOREACH(current, &server->discoveryManager.registeredServers, pointers) {
-        UA_Boolean usable = (request->serverUrisSize == 0);
+    /* Copy registered ApplicationDescriptions into the response */
+    LIST_FOREACH(current, &server->registeredServers, pointers) {
+        if(!sc->registeredServersEnabled)
+            break;
+        UA_Boolean usable = (serverUrisSize == 0);
         if(!usable) {
             /* If client only requested a specific set of servers */
-            for(size_t i = 0; i < request->serverUrisSize; i++) {
-                if(UA_String_equal(&current->registeredServer.serverUri, &request->serverUris[i])) {
+            for(size_t i = 0; i < serverUrisSize; i++) {
+                if(UA_String_equal(&current->registeredServer.serverUri,
+                                   &serverUris[i])) {
                     usable = true;
                     break;
                 }
             }
         }
 
-        if(usable)
-            setApplicationDescriptionFromRegisteredServer(request, &response->servers[pos++],
-                                                          &current->registeredServer);
-    }
-
-    /* Set the final size */
-    if(pos > 0) {
-        response->serversSize = pos;
-    } else {
-        UA_free(response->servers);
-        response->servers = NULL;
-    }
-#endif
-}
-
-void
-Service_GetEndpoints(UA_Server *server, UA_Session *session,
-                     const UA_GetEndpointsRequest *request,
-                     UA_GetEndpointsResponse *response) {
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
-
-    /* If the client expects to see a specific endpointurl, mirror it back. If
-     * not, clone the endpoints with the discovery url of all networklayers. */
-    const UA_String *endpointUrl = &request->endpointUrl;
-    if(endpointUrl->length > 0) {
-        UA_LOG_DEBUG_SESSION(&server->config.logger, session,
-                             "Processing GetEndpointsRequest with endpointUrl "
-                             UA_PRINTF_STRING_FORMAT, UA_PRINTF_STRING_DATA(*endpointUrl));
-    } else {
-        UA_LOG_DEBUG_SESSION(&server->config.logger, session,
-                             "Processing GetEndpointsRequest with an empty endpointUrl");
-    }
-
-    /* Clone the endpoint for each networklayer? */
-    size_t clone_times = 1;
-    UA_Boolean nl_endpointurl = false;
-    if(endpointUrl->length == 0) {
-        clone_times = server->config.networkLayersSize;
-        nl_endpointurl = true;
-    }
-
-    /* Allocate enough memory */
-    response->endpoints = (UA_EndpointDescription*)
-        UA_Array_new(server->config.endpointsSize * clone_times,
-                     &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
-    if(!response->endpoints) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-        return;
-    }
-
-    size_t pos = 0;
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    for(size_t j = 0; j < server->config.endpointsSize; ++j) {
-        /* Test if the supported binary profile shall be returned */
-        UA_Boolean usable = (request->profileUrisSize == 0);
-        if(!usable) {
-            for(size_t i = 0; i < request->profileUrisSize; ++i) {
-                if(!UA_String_equal(&request->profileUris[i],
-                                    &server->config.endpoints[j].transportProfileUri))
-                    continue;
-                usable = true;
-                break;
-            }
-        }
         if(!usable)
             continue;
 
-        /* Copy into the results */
-        for(size_t i = 0; i < clone_times; ++i) {
-            retval |= UA_EndpointDescription_copy(&server->config.endpoints[j],
-                                                  &response->endpoints[pos]);
-            if(nl_endpointurl)
-                endpointUrl = &server->config.networkLayers[i].discoveryUrl;
-            retval |= UA_String_copy(endpointUrl, &response->endpoints[pos].endpointUrl);
-            retval |= UA_Array_copy(endpointUrl, 1,
-                                    (void**)&response->endpoints[pos].server.discoveryUrls,
-                                    &UA_TYPES[UA_TYPES_STRING]);
-            if(retval != UA_STATUSCODE_GOOD)
-                goto error;
-            response->endpoints[pos].server.discoveryUrlsSize = 1;
-            pos++;
-        }
+        res |=
+            setApplicationDescriptionFromRegisteredServer(localeIdsSize, localeIds,
+                                                          &servers[pos],
+                                                          &current->registeredServer);
+        pos++;
     }
 
-    UA_assert(pos <= server->config.endpointsSize * clone_times);
-    response->endpointsSize = pos;
+ cleanup:
 
-    /* Clean up the memory of there are no usable results */
-    if(pos > 0)
-        return;
+    /* Set the final size. This can be less than the initially allocated memory.
+     * But if the size is zero, then we need to free. */
+    if(res != UA_STATUSCODE_GOOD || pos == 0) {
+        UA_Array_delete(*outServers, pos, &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION]);
+        *outServers = NULL;
+        *outServersSize = 0;
+        return res;
+    }
 
-error:
-    response->responseHeader.serviceResult = retval;
-    UA_Array_delete(response->endpoints, response->endpointsSize,
-                    &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
-    response->endpoints = NULL;
-    response->endpointsSize = 0;
+    *outServersSize = pos;
+
+    /* Mirror back the expected EndpointUrl for the local server only.
+     * Registered servers retain the DiscoveryUrls they registered with. */
+    if(endpointUrl.length > 0 && foundSelf) {
+        UA_ApplicationDescription *ad = &servers[0];
+        UA_Array_delete(ad->discoveryUrls, ad->discoveryUrlsSize,
+                        &UA_TYPES[UA_TYPES_STRING]);
+        ad->discoveryUrls = NULL;
+        ad->discoveryUrlsSize = 0;
+        res = UA_Array_copy(&endpointUrl, 1, (void**)&ad->discoveryUrls,
+                            &UA_TYPES[UA_TYPES_STRING]);
+        if(res == UA_STATUSCODE_GOOD)
+            ad->discoveryUrlsSize = 1;
+    }
+
+    return res;
 }
 
-#ifdef UA_ENABLE_DISCOVERY
+UA_Boolean
+Service_FindServers(UA_Server *server, UA_Session *session,
+                    const void *request_, void *response_) {
+    const UA_FindServersRequest *request = (const UA_FindServersRequest*)request_;
+    UA_FindServersResponse *response = (UA_FindServersResponse*)response_;
+    response->responseHeader.serviceResult =
+        process_FindServers(server, session, request->endpointUrl,
+                            request->localeIdsSize, request->localeIds,
+                            request->serverUrisSize, request->serverUris,
+                            &response->serversSize, &response->servers);
+    return true;
+}
+
+UA_StatusCode
+UA_Server_findServers(UA_Server *server, UA_String endpointUrl,
+                      size_t localeIdsSize, UA_LocaleId *localeIds,
+                      size_t serverUrisSize, UA_String *serverUris,
+                      size_t *outServersSize,
+                      UA_ApplicationDescription **outServers) {
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    lockServer(server);
+    res = process_FindServers(server, &server->adminSession, endpointUrl,
+                              localeIdsSize, localeIds,
+                              serverUrisSize, serverUris,
+                              outServersSize, outServers);
+    unlockServer(server);
+    return res;
+}
+
+/************************/
+/* FindServersOnNetwork */
+/************************/
+
 
 static void
-process_RegisterServer(UA_Server *server, UA_Session *session,
-                       const UA_RequestHeader* requestHeader,
-                       const UA_RegisteredServer *requestServer,
-                       const size_t requestDiscoveryConfigurationSize,
-                       const UA_ExtensionObject *requestDiscoveryConfiguration,
-                       UA_ResponseHeader* responseHeader,
-                       size_t *responseConfigurationResultsSize,
-                       UA_StatusCode **responseConfigurationResults,
-                       size_t *responseDiagnosticInfosSize,
-                       UA_DiagnosticInfo *responseDiagnosticInfos) {
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+notifyServerOnNetwork(UA_Server *server,
+                      const UA_ServerOnNetwork *son,
+                      const UA_KeyValueMap params, UA_Boolean announce,
+                      UA_Boolean added, UA_Boolean updated,
+                      UA_Boolean removed) {
+    UA_STATIC_THREAD_LOCAL UA_KeyValuePair kvp[7] = {
+        {{0, UA_STRING_STATIC("server-on-network")}, {0}},
+        {{0, UA_STRING_STATIC("remote-address")}, {0}},
+        {{0, UA_STRING_STATIC("ttl")}, {0}},
+        {{0, UA_STRING_STATIC("announce")}, {0}},
+        {{0, UA_STRING_STATIC("server-added")}, {0}},
+        {{0, UA_STRING_STATIC("server-updated")}, {0}},
+        {{0, UA_STRING_STATIC("server-removed")}, {0}},
+    };
 
-    /* Find the server from the request in the registered list */
-    registeredServer_list_entry* current;
-    registeredServer_list_entry *registeredServer_entry = NULL;
-    LIST_FOREACH(current, &server->discoveryManager.registeredServers, pointers) {
-        if(UA_String_equal(&current->registeredServer.serverUri, &requestServer->serverUri)) {
-            registeredServer_entry = current;
-            break;
+    UA_String remote = UA_STRING_NULL;
+    UA_UInt32 ttl = 0;
+
+    const UA_String *params_remote = (const UA_String*)
+        UA_KeyValueMap_getScalar(&params,
+                                 UA_QUALIFIEDNAME(0, "remote-address"),
+                                 &UA_TYPES[UA_TYPES_STRING]);
+    if(params_remote)
+        remote = *params_remote;
+
+    const UA_UInt32 *ttl_remote = (const UA_UInt32*)
+        UA_KeyValueMap_getScalar(&params, UA_QUALIFIEDNAME(0, "ttl"),
+                                 &UA_TYPES[UA_TYPES_UINT32]);
+    if(ttl_remote)
+        ttl= *ttl_remote;
+
+    UA_Variant_setScalar(&kvp[0].value, (void*)(uintptr_t)son,
+                         &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+    UA_Variant_setScalar(&kvp[1].value, &remote, &UA_TYPES[UA_TYPES_STRING]);
+    UA_Variant_setScalar(&kvp[2].value, &ttl, &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setScalar(&kvp[3].value, &announce, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_Variant_setScalar(&kvp[4].value, &added, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_Variant_setScalar(&kvp[5].value, &updated, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_Variant_setScalar(&kvp[6].value, &removed, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_KeyValueMap kvm = {7, kvp};
+
+    notifyApplication(server,
+                      UA_APPLICATIONNOTIFICATIONTYPE_DISCOVERY_SERVERONNETWORK,
+                      kvm);
+
+    /* Specialized application callback for discovery notifications. Called
+     * directly (not via notifyApplication) to avoid recursion: the driver's
+     * own notification callback may itself trigger a register/deregister
+     * that flows back into notifyServerOnetwork. */
+    UA_ServerConfig *config = &server->config;
+    if(config->discoveryNotificationCallback)
+        config->discoveryNotificationCallback(server,
+                                              UA_APPLICATIONNOTIFICATIONTYPE_DISCOVERY_SERVERONNETWORK,
+                                              kvm);
+}
+
+static void
+resetDiscoveryResetIds(UA_Server *server) {
+    /* Update the reset time */
+    UA_EventLoop *el = server->config.eventLoop;
+    server->lastCounterResetTime = el->dateTime_now(el);
+
+    /* Give a new record id to all entries */
+    for(size_t i = 0; i < server->serversOnNetworkSize; i++) {
+        UA_ServerOnNetwork *son = &server->serversOnNetwork[i];
+        son->recordId = ++server->serversOnNetworkRecordCounter;
+    }
+}
+
+/* All filter criteria must be fulfilled in the list entry. The comparison is
+ * case insensitive. Returns true if the entry matches the filter. */
+static UA_Boolean
+entryMatchesCapabilityFilter(size_t serverCapabilityFilterSize,
+                             const UA_String *serverCapabilityFilter,
+                             UA_ServerOnNetwork *current) {
+    /* If the entry has less capabilities defined than the filter, there's no
+     * match */
+    if(serverCapabilityFilterSize > current->serverCapabilitiesSize)
+        return false;
+    for(size_t i = 0; i < serverCapabilityFilterSize; i++) {
+        UA_Boolean capabilityFound = false;
+        for(size_t j = 0; j < current->serverCapabilitiesSize; j++) {
+            if(UA_String_equal_ignorecase(&serverCapabilityFilter[i],
+                               &current->serverCapabilities[j])) {
+                capabilityFound = true;
+                break;
+            }
         }
+        if(!capabilityFound)
+            return false;
+    }
+    return true;
+}
+
+static UA_StatusCode
+process_FindServersOnNetwork(UA_Server *server, UA_Session *session,
+                             UA_UInt32 startingRecordId,
+                             UA_UInt32 maxRecordsToReturn,
+                             size_t serverCapabilityFilterSize,
+                             const UA_String *serverCapabilityFilter,
+                             UA_DateTime *outLastCounterResetTime,
+                             size_t *outServersSize,
+                             UA_ServerOnNetwork **outServers) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    if(!server->config.serversOnNetworkEnabled)
+        return UA_STATUSCODE_BADNOTIMPLEMENTED;
+
+    /* Set LastCounterResetTime */
+    *outLastCounterResetTime = server->lastCounterResetTime;
+
+    /* Skip records under the threshold */
+    size_t recordOffset = 0;
+    for(; recordOffset < server->serversOnNetworkSize; recordOffset++) {
+        if(server->serversOnNetwork[recordOffset].recordId > startingRecordId)
+            break;
     }
 
-    UA_MdnsDiscoveryConfiguration *mdnsConfig = NULL;
+    /* Compute the number of candidate records after the record id cutoff */
+    size_t recordCount = server->serversOnNetworkSize - recordOffset;
+    UA_assert(recordCount <= server->serversOnNetworkSize);
 
-    const UA_String* mdnsServerName = NULL;
-    if(requestDiscoveryConfigurationSize) {
-        *responseConfigurationResults =
-            (UA_StatusCode *)UA_Array_new(requestDiscoveryConfigurationSize,
-                                          &UA_TYPES[UA_TYPES_STATUSCODE]);
-        if(!(*responseConfigurationResults)) {
-            responseHeader->serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-            return;
+    /* Nothing to do */
+    if(recordCount == 0)
+        return UA_STATUSCODE_GOOD;
+
+    /* Count matching records first. This avoids a temporary stack array sized
+     * from the unbounded discovery cache. The service mutex keeps the array
+     * stable between this pass and the copy pass below. */
+    size_t filteredCount = 0;
+    for(size_t i = 0; i < recordCount; i++) {
+        UA_ServerOnNetwork *son = &server->serversOnNetwork[i + recordOffset];
+        if(!entryMatchesCapabilityFilter(serverCapabilityFilterSize,
+                                         serverCapabilityFilter, son))
+            continue;
+        filteredCount++;
+        if(maxRecordsToReturn > 0 && filteredCount >= maxRecordsToReturn)
+            break;
+    }
+
+    /* Nothing to do */
+    if(filteredCount == 0)
+        return UA_STATUSCODE_GOOD;
+
+    /* Allocate the array for the response */
+    *outServers = (UA_ServerOnNetwork*)
+        UA_calloc(filteredCount, sizeof(UA_ServerOnNetwork));
+    if(!*outServers)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+    *outServersSize = filteredCount;
+
+    /* Copy the matching entries in their original order */
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    size_t pos = 0;
+    for(size_t i = 0; i < recordCount && pos < filteredCount; i++) {
+        UA_ServerOnNetwork *son = &server->serversOnNetwork[i + recordOffset];
+        if(!entryMatchesCapabilityFilter(serverCapabilityFilterSize,
+                                         serverCapabilityFilter, son))
+            continue;
+        res = UA_ServerOnNetwork_copy(son, &(*outServers)[pos++]);
+        if(res != UA_STATUSCODE_GOOD)
+            break;
+    }
+
+    /* Clean up the array if copying failed */
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_Array_delete(*outServers, *outServersSize,
+                        &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+        *outServers = NULL;
+        *outServersSize = 0;
+    }
+
+    return res;
+}
+
+UA_Boolean
+Service_FindServersOnNetwork(UA_Server *server, UA_Session *session,
+                             const void *request_, void *response_) {
+    const UA_FindServersOnNetworkRequest *request = (const UA_FindServersOnNetworkRequest*)request_;
+    UA_FindServersOnNetworkResponse *response = (UA_FindServersOnNetworkResponse*)response_;
+    UA_LOCK_ASSERT(&server->serviceMutex);
+    response->responseHeader.serviceResult =
+        process_FindServersOnNetwork(server, session,
+                                     request->startingRecordId,
+                                     request->maxRecordsToReturn,
+                                     request->serverCapabilityFilterSize,
+                                     request->serverCapabilityFilter,
+                                     &response->lastCounterResetTime,
+                                     &response->serversSize,
+                                     &response->servers);
+    return true;
+}
+
+UA_StatusCode
+UA_Server_findServersOnNetwork(UA_Server *server, UA_String endpointUrl,
+                               UA_UInt32 startingRecordId,
+                               UA_UInt32 maxRecordsToReturn,
+                               size_t serverCapabilityFilterSize,
+                               const UA_String *serverCapabilityFilter,
+                               UA_DateTime *outLastCounterResetTime,
+                               size_t *outServersSize,
+                               UA_ServerOnNetwork **outServers) {
+    lockServer(server);
+    UA_StatusCode res =
+        process_FindServersOnNetwork(server, &server->adminSession, startingRecordId,
+                                     maxRecordsToReturn, serverCapabilityFilterSize,
+                                     serverCapabilityFilter, outLastCounterResetTime,
+                                     outServersSize, outServers);
+    unlockServer(server);
+    return res;
+}
+
+static UA_ServerOnNetwork *
+findServerOnNetworkIndex(UA_Server *server,
+                         const UA_String serverName) {
+    for(size_t i = 0; i < server->serversOnNetworkSize; i++) {
+        /* Check matching record */
+        UA_ServerOnNetwork *son = &server->serversOnNetwork[i];
+        if(!UA_String_equal(&son->serverName, &serverName))
+            continue;
+        return son;
+    }
+    return NULL;
+}
+
+static UA_StatusCode
+addServerOnNetwork(UA_Server *server, const UA_ServerOnNetwork *newSon,
+                   const UA_KeyValueMap params, UA_Boolean announce) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    if(!newSon)
+        return UA_STATUSCODE_BADINTERNALERROR;
+
+    if(!server->config.serversOnNetworkEnabled)
+        return UA_STATUSCODE_BADNOTIMPLEMENTED;
+
+    /* Search a matching entry */
+    UA_StatusCode res;
+    UA_ServerOnNetwork *son =
+        findServerOnNetworkIndex(server, newSon->serverName);
+
+    /* Update existing */
+    if(son) {
+        /* Make a copy */
+        UA_ServerOnNetwork tmp;
+        res = UA_ServerOnNetwork_copy(newSon, &tmp);
+        if(res != UA_STATUSCODE_GOOD)
+            return res;
+
+        /* Replace the previous entry */
+        UA_ServerOnNetwork_clear(son);
+        *son = tmp;
+
+        /* Notify the application about an updated entry */
+        notifyServerOnNetwork(server, son, params, announce, false, true, false);
+
+        /* All new RecordIds in increasing order */
+        resetDiscoveryResetIds(server);
+
+        return UA_STATUSCODE_GOOD;
+    }
+
+    /* Append to the list */
+    res = UA_Array_appendCopy((void**)&server->serversOnNetwork,
+                              &server->serversOnNetworkSize, newSon,
+                              &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+    if(res != UA_STATUSCODE_GOOD)
+        return res;
+
+    /* Increase the record id counter and use it */
+    son = &server->serversOnNetwork[server->serversOnNetworkSize-1];
+    son->recordId = ++server->serversOnNetworkRecordCounter;
+
+    /* Notify the application about an added entry */
+    notifyServerOnNetwork(server, son, params, announce, true, false, false);
+
+    return UA_STATUSCODE_GOOD;
+}
+
+static UA_StatusCode
+removeServerOnNetwork(UA_Server *server, const UA_String serverName) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    if(!server->config.serversOnNetworkEnabled)
+        return UA_STATUSCODE_BADNOTIMPLEMENTED;
+
+    /* Find the entry */
+    for(size_t i = 0; i < server->serversOnNetworkSize; i++) {
+        UA_ServerOnNetwork *son = &server->serversOnNetwork[i];
+        if(!UA_String_equal(&serverName, &son->serverName))
+            continue;
+
+        /* Notify the application about removed entry */
+        notifyServerOnNetwork(server, son, UA_KEYVALUEMAP_NULL,
+                              false, false, false, true);
+
+        /* Move the last entry in the current position */
+        UA_ServerOnNetwork_clear(son);
+        server->serversOnNetworkSize--;
+        if(i != server->serversOnNetworkSize) {
+            server->serversOnNetwork[i] =
+                server->serversOnNetwork[server->serversOnNetworkSize];
         }
-        *responseConfigurationResultsSize = requestDiscoveryConfigurationSize;
 
-        for(size_t i = 0; i < requestDiscoveryConfigurationSize; i++) {
-            const UA_ExtensionObject *object = &requestDiscoveryConfiguration[i];
-            if(!mdnsConfig && (object->encoding == UA_EXTENSIONOBJECT_DECODED ||
-                               object->encoding == UA_EXTENSIONOBJECT_DECODED_NODELETE) &&
-               (object->content.decoded.type == &UA_TYPES[UA_TYPES_MDNSDISCOVERYCONFIGURATION])) {
-                mdnsConfig = (UA_MdnsDiscoveryConfiguration *)object->content.decoded.data;
-                mdnsServerName = &mdnsConfig->mdnsServerName;
-                (*responseConfigurationResults)[i] = UA_STATUSCODE_GOOD;
-            } else {
-                (*responseConfigurationResults)[i] = UA_STATUSCODE_BADNOTSUPPORTED;
+        /* Free the array if the last entry was removed */
+        if(server->serversOnNetworkSize == 0) {
+            UA_free(server->serversOnNetwork);
+            server->serversOnNetwork = NULL;
+        }
+
+        /* All new RecordIds in increasing order */
+        resetDiscoveryResetIds(server);
+        break;
+    }
+
+    return UA_STATUSCODE_GOOD;
+}
+
+/* The mDNS drivers announce the ServerOnNetwork entries with the service name
+ * _opcua-tcp. That service name is for opc.tcp DiscoveryUrls only (Part 12,
+ * C.3). Returns the first opc.tcp DiscoveryUrl of the registration or NULL. A
+ * registration has a ServerOnNetwork entry only if it has such a url. */
+static const UA_String *
+getTcpDiscoveryUrl(const UA_RegisteredServer *rs) {
+    const UA_String prefix = UA_STRING_STATIC("opc.tcp://");
+    for(size_t i = 0; i < rs->discoveryUrlsSize; i++) {
+        const UA_String *url = &rs->discoveryUrls[i];
+        if(url->length >= prefix.length &&
+           memcmp(url->data, prefix.data, prefix.length) == 0)
+            return url;
+    }
+    return NULL;
+}
+
+/* The entry belongs to a registered server. Only the registration changes and
+ * removes it. For example, the registered server can also announce itself over
+ * mDNS. Then the received information must not replace the entry and the
+ * expiry of the received information must not remove it. */
+static UA_Boolean
+isRegisteredServerOnNetwork(UA_Server *server, const UA_String serverName) {
+    if(!server->config.serversOnNetworkEnabled)
+        return false;
+    RegisteredServerRecord *rs;
+    LIST_FOREACH(rs, &server->registeredServers, pointers) {
+        if(getTcpDiscoveryUrl(&rs->registeredServer) &&
+           UA_String_equal(&rs->mdnsServerName, &serverName))
+            return true;
+    }
+    return false;
+}
+
+UA_StatusCode
+UA_Server_registerServerOnNetwork(UA_Server *server,
+                                  const UA_ServerOnNetwork *newSon,
+                                  const UA_KeyValueMap params) {
+    const UA_Boolean *announce = (const UA_Boolean*)
+        UA_KeyValueMap_getScalar(&params, UA_QUALIFIEDNAME(0, "announce"),
+                                 &UA_TYPES[UA_TYPES_BOOLEAN]);
+    lockServer(server);
+    UA_StatusCode res;
+    if(newSon && isRegisteredServerOnNetwork(server, newSon->serverName))
+        res = UA_STATUSCODE_BADNOTWRITABLE;
+    else
+        res = addServerOnNetwork(server, newSon, params,
+                                 announce ? *announce : false);
+    unlockServer(server);
+    return res;
+}
+
+UA_StatusCode
+UA_Server_deregisterServerOnNetwork(UA_Server *server,
+                                    const UA_String serverName) {
+    lockServer(server);
+    UA_StatusCode res;
+    if(isRegisteredServerOnNetwork(server, serverName))
+        res = UA_STATUSCODE_BADNODELETERIGHTS;
+    else
+        res = removeServerOnNetwork(server, serverName);
+    unlockServer(server);
+    return res;
+}
+
+/****************/
+/* GetEndpoints */
+/****************/
+
+static UA_String basic256Sha256Uri =
+    UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+
+/* Get an encrypted policy or NULL if no encrypted policy is defined */
+UA_SecurityPolicy *
+getDefaultEncryptedSecurityPolicy(UA_Server *server,
+                                  UA_SecurityPolicyType type) {
+    UA_SecurityPolicy *best = NULL;
+    UA_Byte securityLevel = 0;
+
+    (void)type;
+    for(size_t i = 0; i < server->config.securityPoliciesSize; i++) {
+        UA_SecurityPolicy *sp = &server->config.securityPolicies[i];
+        if(sp->policyType == UA_SECURITYPOLICYTYPE_NONE)
+            continue;
+        /* This SecurityPolicy is used to secure a UserIdentityToken on top of a
+         * #None SecureChannel (the only situation this function is called for).
+         * ECC and RSA-DH policies use ephemeral key agreement that must be
+         * bound to a secured SecureChannel - they must never be used to secure
+         * an auth token over #None. Only the static-RSA encryption policies
+         * (e.g. Basic256Sha256, Aes*_RsaOaep/RsaPss) qualify. */
+        if(UA_SecurityPolicy_isEcc(sp) || UA_SecurityPolicy_isEnhancedSecurity(sp))
+            continue;
+        /* Return early with Basic256Sha256 when available. "Secure enough" and
+         * most clients support it.*/
+        if(UA_String_equal(&basic256Sha256Uri, &sp->policyUri))
+            return sp;
+        if(sp->securityLevel >= securityLevel) {
+            best = sp;
+            securityLevel = sp->securityLevel;
+        }
+    }
+    return best;
+}
+
+const UA_ByteString *
+getUserTokenEncryptionCertificate(UA_Server *server,
+                                  const UA_EndpointDescription *ed) {
+    for(size_t i = 0; i < ed->userIdentityTokensSize; i++) {
+        const UA_UserTokenPolicy *utp = &ed->userIdentityTokens[i];
+        if(utp->tokenType == UA_USERTOKENTYPE_ANONYMOUS ||
+           utp->securityPolicyUri.length == 0)
+            continue;
+        UA_SecurityPolicy *encSP =
+            getSecurityPolicyByUri(server, &utp->securityPolicyUri);
+        if(!encSP || encSP->policyType == UA_SECURITYPOLICYTYPE_NONE ||
+           encSP->localCertificate.length == 0)
+            continue;
+        return &encSP->localCertificate;
+    }
+    return NULL;
+}
+
+static const char *securityModeStrs[4] = {"-invalid", "-none", "-sign", "-sign+encrypt"};
+
+UA_String
+securityPolicyUriPostfix(const UA_String uri) {
+    if(uri.length == 0) return uri;
+    for(UA_Byte *b = uri.data + uri.length - 1; b >= uri.data; b--) {
+        if(*b != '#')
+            continue;
+        UA_String postfix = {uri.length - (size_t)(b - uri.data), b};
+        return postfix;
+    }
+    return uri;
+}
+
+static UA_StatusCode
+updateEndpointUserIdentityToken(UA_Server *server,
+                                UA_SecurityPolicyType policyType,
+                                UA_EndpointDescription *ed) {
+    /* Public endpoint configurations must be checked before indexing by mode. */
+    if((UA_UInt32)ed->securityMode < UA_MESSAGESECURITYMODE_NONE ||
+       (UA_UInt32)ed->securityMode > UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
+        return UA_STATUSCODE_BADSECURITYMODEREJECTED;
+
+    /* Don't modify the UserIdentityTokens if there are manually configured
+     * entries */
+    if(ed->userIdentityTokensSize > 0)
+        return UA_STATUSCODE_GOOD;
+
+    /* Copy the UserTokenPolicies from the AccessControl plugin, but only the
+     * matching ones to the securityPolicyUri.
+     * TODO: Different instances of the AccessControl plugin per Endpoint */
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    UA_ServerConfig *sc = &server->config;
+    for(size_t i = 0; i < sc->accessControl.userTokenPoliciesSize; i++) {
+        UA_UserTokenPolicy *utp = &sc->accessControl.userTokenPolicies[i];
+
+        /* Append the UserTokenPolicy from the AccesssControl plugin */
+        res = UA_Array_appendCopy((void**)&ed->userIdentityTokens,
+                                  &ed->userIdentityTokensSize, utp,
+                                  &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
+        if(res != UA_STATUSCODE_GOOD)
+            return res;
+
+        /* Now we modify the freshly copied last entry and ignore whatever
+         * SecurityPolicy was set in sc->accessControl.userTokenPolicies and
+         * choose something appropriate. If empty, the SecurityPolicy of the
+         * SecureChannel is used. */
+        utp = &ed->userIdentityTokens[ed->userIdentityTokensSize - 1];
+        UA_String_clear(&utp->securityPolicyUri);
+
+        /* Anonymous tokens don't need encryption. All other tokens require
+         * encryption with the exception of Username/Password if also the
+         * allowNonePolicyPassword option has been set. The same logic is used
+         * in selectEndpointAndTokenPolicy (ua_services_session.c), which
+         * rejects the tokens removed here. */
+        if(utp->tokenType != UA_USERTOKENTYPE_ANONYMOUS &&
+           UA_String_equal(&ed->securityPolicyUri, &UA_SECURITY_POLICY_NONE_URI) &&
+           (!sc->allowNonePolicyPassword || utp->tokenType != UA_USERTOKENTYPE_USERNAME)) {
+            /* Use the SecurityPolicy for the SecureChannel also for the
+             * username/password. Otherwise pick the "bëst" SecurityPolicÿ. */
+            UA_SecurityPolicy *encSP;
+            if(ed->securityMode == UA_MESSAGESECURITYMODE_NONE)
+                encSP = getDefaultEncryptedSecurityPolicy(server, policyType);
+            else
+                encSP = getSecurityPolicyByUri(server, &ed->securityPolicyUri);
+            if(!encSP) {
+                /* No encrypted SecurityPolicy available. An x509 token
+                 * carries no secret and is offered by default with a session
+                 * PKI. So it is removed without a warning. */
+                if(utp->tokenType != UA_USERTOKENTYPE_CERTIFICATE)
+                    UA_LOG_WARNING(sc->logging, UA_LOGCATEGORY_CLIENT,
+                                   "Removing a UserTokenPolicy that would allow the "
+                                   "password to be transmitted without encryption "
+                                   "(Can be enabled via config->allowNonePolicyPassword)");
+                UA_StatusCode res2 =
+                    UA_Array_resize((void **)&ed->userIdentityTokens,
+                                    &ed->userIdentityTokensSize,
+                                    ed->userIdentityTokensSize - 1,
+                                    &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
+                (void)res2;
+                continue;
+            }
+            res |= UA_String_copy(&encSP->policyUri, &utp->securityPolicyUri);
+        }
+
+        /* Append the SecurityMode and SecurityPolicy postfix to the PolicyId to
+         * make it unique */
+        UA_String postfix;
+        if(utp->securityPolicyUri.length > 0)
+            postfix = securityPolicyUriPostfix(utp->securityPolicyUri);
+        else
+            postfix = securityPolicyUriPostfix(ed->securityPolicyUri);
+        size_t newLen = utp->policyId.length + postfix.length +
+            strlen(securityModeStrs[ed->securityMode]);
+        UA_Byte *newString = (UA_Byte*)
+            UA_realloc((void*)((uintptr_t)utp->policyId.data &
+                               ~(uintptr_t)UA_EMPTY_ARRAY_SENTINEL), newLen);
+        if(!newString)
+            continue;
+        size_t pos = utp->policyId.length;
+        memcpy(&newString[pos], securityModeStrs[ed->securityMode],
+               strlen(securityModeStrs[ed->securityMode]));
+        pos += strlen(securityModeStrs[ed->securityMode]);
+        memcpy(&newString[pos], postfix.data, postfix.length);
+        utp->policyId.data = newString;
+        utp->policyId.length = newLen;
+    }
+
+    return res;
+}
+
+/* Also reused to create the EndpointDescription array in the
+ * CreateSessionResponse */
+static const UA_String wsBinaryTransportProfile = UA_STRING_STATIC(
+    "http://opcfoundation.org/UA-Profile/Transport/ws-uasc-uabinary");
+static const UA_String wssBinaryTransportProfile = UA_STRING_STATIC(
+    "http://opcfoundation.org/UA-Profile/Transport/wss-uasc-uabinary");
+#ifdef UA_ENABLE_JSON_ENCODING
+static UA_Boolean
+isHttpJsonTransportProfile(const UA_String *profileUri) {
+    return UA_String_equal(profileUri, &UA_HTTP_PROFILE_HTTPS_JSON) ||
+        UA_String_equal(profileUri, &UA_HTTP_PROFILE_HTTP_JSON);
+}
+
+/* Binary and JSON HTTP transports use distinct endpoint URLs. The configured
+ * URL is the Binary endpoint. JSON is pinned to its /json child endpoint. */
+static UA_StatusCode
+httpProfileEndpointUrl(const UA_String *url, const UA_String *profileUri,
+                       UA_String *profileUrl) {
+    static const UA_String suffix = UA_STRING_STATIC("/json");
+    UA_Boolean hasSuffix =
+        url->length >= suffix.length &&
+        memcmp(&url->data[url->length - suffix.length], suffix.data,
+               suffix.length) == 0;
+    UA_Boolean json = isHttpJsonTransportProfile(profileUri);
+    if(json == hasSuffix)
+        return UA_String_copy(url, profileUrl);
+    if(json) {
+        if(url->length > 0 && url->data[url->length - 1] == '/')
+            return UA_String_format(profileUrl, "%Sjson", *url);
+        return UA_String_format(profileUrl, "%S/json", *url);
+    }
+    UA_String binaryUrl = {url->length - suffix.length, url->data};
+    UA_String hostname = UA_STRING_NULL;
+    UA_String path = UA_STRING_NULL;
+    UA_UInt16 port = 0;
+    if(UA_parseEndpointUrl(&binaryUrl, &hostname, &port, &path) ==
+           UA_STATUSCODE_GOOD &&
+       path.length == 0)
+        return UA_String_format(profileUrl, "%S/", binaryUrl);
+    return UA_String_copy(&binaryUrl, profileUrl);
+}
+#endif
+
+static UA_Boolean
+isSecureWebSocketEndpointUrl(const UA_String *url) {
+    const UA_String prefix = UA_STRING_STATIC("opc.wss://");
+    return url->length >= prefix.length &&
+        memcmp(url->data, prefix.data, prefix.length) == 0;
+}
+
+static UA_Boolean
+isInsecureWebSocketEndpointUrl(const UA_String *url) {
+    const UA_String prefix = UA_STRING_STATIC("opc.ws://");
+    return url->length >= prefix.length &&
+        memcmp(url->data, prefix.data, prefix.length) == 0;
+}
+
+static UA_StatusCode
+setCurrentEndpoint(UA_Server *server, const UA_EndpointDescription *source,
+                   UA_SecurityPolicy *sp, const UA_String endpointUrl,
+                   const UA_String *currentEndpointUrl,
+                   const UA_String *transportProfileUri,
+                   UA_EndpointDescription *ed) {
+    UA_StatusCode res = UA_EndpointDescription_copy(source, ed);
+    UA_String_clear(&ed->transportProfileUri);
+    res |= UA_String_copy(transportProfileUri, &ed->transportProfileUri);
+    UA_ApplicationDescription_clear(&ed->server);
+    res |= UA_ApplicationDescription_copy(
+        &server->config.applicationDescription, &ed->server);
+
+    /* Set the local certificate configured for the SecurityPolicy */
+    UA_ByteString_clear(&ed->serverCertificate);
+    res |= UA_ByteString_copy(&sp->localCertificate, &ed->serverCertificate);
+
+    /* Set the User Identity Token list from the AccessControl plugin. This
+     * also selects an appropriate SecurityPolicy for the AuthenticationToken. */
+    res |= updateEndpointUserIdentityToken(server, sp->policyType, ed);
+
+    /* OPC UA Part 4 §5.4.2: A client needs a certificate to encrypt credentials
+     * if the endpoint uses None but a token policy requires encryption. */
+    if(ed->serverCertificate.length == 0) {
+        const UA_ByteString *encCert = getUserTokenEncryptionCertificate(server, ed);
+        if(encCert)
+            res |= UA_ByteString_copy(encCert, &ed->serverCertificate);
+    }
+
+    UA_String_clear(&ed->endpointUrl);
+    if(endpointUrl.length == 0)
+        return res | UA_String_copy(currentEndpointUrl, &ed->endpointUrl);
+
+    /* Mirror the requested URL and include it in the discovery URLs. */
+    res |= UA_String_copy(&endpointUrl, &ed->endpointUrl);
+    size_t i = 0;
+    for(; i < ed->server.discoveryUrlsSize; i++) {
+        if(UA_String_equal(&ed->endpointUrl, &ed->server.discoveryUrls[i]))
+            break;
+    }
+    if(i == ed->server.discoveryUrlsSize)
+        res |= UA_Array_appendCopy((void **)&ed->server.discoveryUrls,
+                                   &ed->server.discoveryUrlsSize, &endpointUrl,
+                                   &UA_TYPES[UA_TYPES_STRING]);
+    return res;
+}
+
+UA_StatusCode
+setCurrentEndpointsArray(UA_Server *server, const UA_String endpointUrl,
+                         UA_String *profileUris, size_t profileUrisSize,
+                         UA_EndpointDescription **arr, size_t *arrSize) {
+    UA_ServerConfig *sc = &server->config;
+
+    /* Clone the endpoint for each discoveryURL? */
+    size_t clone_times = 1;
+    if(endpointUrl.length == 0)
+        clone_times = sc->applicationDescription.discoveryUrlsSize;
+
+    /* Allocate the array */
+    size_t maxTransportProfiles = 1;
+#ifdef UA_ENABLE_JSON_ENCODING
+    maxTransportProfiles = 2;
+#endif
+    if(clone_times > 0 &&
+       sc->endpointsSize > SIZE_MAX / clone_times / maxTransportProfiles)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+    size_t allocationSize =
+        sc->endpointsSize * clone_times * maxTransportProfiles;
+    *arr = (UA_EndpointDescription*)
+        UA_Array_new(allocationSize,
+                     &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    if(!*arr)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+
+    size_t pos = 0;
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    for(size_t j = 0; j < sc->endpointsSize; ++j) {
+        const UA_EndpointDescription *ep = &sc->endpoints[j];
+
+        /* Get the SecurityPolicy */
+        UA_SecurityPolicy *sp =
+            getSecurityPolicyByUri(server, &ep->securityPolicyUri);
+        if(!sp) {
+            UA_LOG_WARNING(server->config.logging, UA_LOGCATEGORY_SERVER,
+                           "GetEndpoints: Endpoint defines SecurityPolicy "
+                           "%S which is not available", ep->securityPolicyUri);
+            continue;
+        }
+
+        /* Copy into the results */
+        for(size_t i = 0; i < clone_times; ++i) {
+            const UA_String *currentEndpointUrl = &endpointUrl;
+            if(endpointUrl.length == 0)
+                currentEndpointUrl = &sc->applicationDescription.discoveryUrls[i];
+            UA_Boolean secureHttp = false;
+            UA_Boolean httpEndpoint =
+                getHttpUrlSecurity(currentEndpointUrl, &secureHttp);
+
+            /* Plain HTTP provides no transport security and therefore exposes
+             * only SecurityPolicy None endpoints. For HTTPS, represent TLS
+             * confidentiality as SignAndEncrypt so shared Session and identity
+             * token handling does not require redundant token encryption. */
+            if(httpEndpoint && !secureHttp &&
+               sp->policyType != UA_SECURITYPOLICYTYPE_NONE)
+                continue;
+
+            const UA_String *transportProfileUris[2] = {
+                &ep->transportProfileUri, NULL};
+            size_t transportProfileUrisSize = 1;
+            if(isSecureWebSocketEndpointUrl(currentEndpointUrl))
+                transportProfileUris[0] = &wssBinaryTransportProfile;
+            else if(isInsecureWebSocketEndpointUrl(currentEndpointUrl))
+                transportProfileUris[0] = &wsBinaryTransportProfile;
+            else if(httpEndpoint && secureHttp) {
+                transportProfileUris[0] = &UA_HTTP_PROFILE_HTTPS_BINARY;
+#ifdef UA_ENABLE_JSON_ENCODING
+                transportProfileUris[1] = &UA_HTTP_PROFILE_HTTPS_JSON;
+                transportProfileUrisSize = 2;
+#endif
+            } else if(httpEndpoint) {
+                transportProfileUris[0] = &UA_HTTP_PROFILE_HTTP_BINARY;
+#ifdef UA_ENABLE_JSON_ENCODING
+                transportProfileUris[1] = &UA_HTTP_PROFILE_HTTP_JSON;
+                transportProfileUrisSize = 2;
+#endif
+            }
+
+            for(size_t tp = 0; tp < transportProfileUrisSize; tp++) {
+                const UA_String *transportProfileUri = transportProfileUris[tp];
+
+                /* Test if the effective transport profile shall be returned */
+                UA_Boolean usable = (profileUrisSize == 0);
+                if(!usable) {
+                    for(size_t p = 0; p < profileUrisSize; ++p) {
+                        if(!UA_String_equal(&profileUris[p],
+                                            transportProfileUri))
+                            continue;
+                        usable = true;
+                        break;
+                    }
+                }
+                if(!usable)
+                    continue;
+
+                UA_String profileEndpointUrl = UA_STRING_NULL;
+#ifdef UA_ENABLE_JSON_ENCODING
+                if(httpEndpoint)
+                    retval |= httpProfileEndpointUrl(
+                        currentEndpointUrl, transportProfileUri,
+                        &profileEndpointUrl);
+#endif
+                const UA_String *effectiveUrl = currentEndpointUrl;
+                if(profileEndpointUrl.length > 0)
+                    effectiveUrl = &profileEndpointUrl;
+                UA_EndpointDescription effectiveEndpoint = *ep;
+                if(httpEndpoint)
+                    effectiveEndpoint.securityMode =
+                        UA_SecureChannel_httpSecurityMode(secureHttp);
+                retval |= setCurrentEndpoint(
+                    server, &effectiveEndpoint, sp, *effectiveUrl, effectiveUrl,
+                    transportProfileUri, &(*arr)[pos]);
+                UA_String_clear(&profileEndpointUrl);
+                if(retval != UA_STATUSCODE_GOOD)
+                    goto error;
+
+                pos++;
             }
         }
     }
 
-    if(!mdnsServerName && requestServer->serverNamesSize)
-        mdnsServerName = &requestServer->serverNames[0].text;
+    *arrSize = pos;
+    return UA_STATUSCODE_GOOD;
 
-    if(!mdnsServerName) {
-        responseHeader->serviceResult = UA_STATUSCODE_BADSERVERNAMEMISSING;
-        return;
+ error:
+    UA_Array_delete(*arr, allocationSize,
+                    &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    *arr = NULL;
+    return retval;
+}
+
+UA_Boolean
+Service_GetEndpoints(UA_Server *server, UA_Session *session,
+                     const void *request_, void *response_) {
+    const UA_GetEndpointsRequest *request = (const UA_GetEndpointsRequest*)request_;
+    UA_GetEndpointsResponse *response = (UA_GetEndpointsResponse*)response_;
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                         "Processing GetEndpointsRequest with endpointUrl %S",
+                         request->endpointUrl);
+
+    /* If the client expects to see a specific endpointurl, mirror it back. If
+     * not, clone the endpoints with the discovery url of all networklayers. */
+    response->responseHeader.serviceResult =
+        setCurrentEndpointsArray(server, request->endpointUrl,
+                                 request->profileUris, request->profileUrisSize,
+                                 &response->endpoints, &response->endpointsSize);
+    return true;
+}
+
+/******************/
+/* RegisterServer */
+/******************/
+
+
+static void
+notifyRegisteredServer(UA_Server *server, UA_Session *session,
+                       UA_SecureChannel *channel,
+                       const UA_RegisteredServer *requestServer,
+                       size_t discoveryConfigSize,
+                       const UA_ExtensionObject *discoveryConfig,
+                       UA_Boolean added, UA_Boolean updated,
+                       UA_Boolean removed) {
+    UA_STATIC_THREAD_LOCAL UA_KeyValuePair kvp[7] = {
+        {{0, UA_STRING_STATIC("registered-server")}, {0}},
+        {{0, UA_STRING_STATIC("discovery-configuration")}, {0}},
+        {{0, UA_STRING_STATIC("server-added")}, {0}},
+        {{0, UA_STRING_STATIC("server-updated")}, {0}},
+        {{0, UA_STRING_STATIC("server-removed")}, {0}},
+        {{0, UA_STRING_STATIC("securechannel-id")}, {0}},
+        {{0, UA_STRING_STATIC("session-id")}, {0}},
+    };
+
+    UA_NodeId sessionId = (session) ? session->sessionId : UA_NODEID_NULL;
+    UA_UInt32 channelId = (channel) ? channel->securityToken.channelId : 0;
+
+    UA_Variant_setScalar(&kvp[0].value, (void*)(uintptr_t)requestServer,
+                         &UA_TYPES[UA_TYPES_REGISTEREDSERVER]);
+    UA_Variant_setArray(&kvp[1].value, (void*)(uintptr_t)discoveryConfig,
+                        discoveryConfigSize, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT]);
+    UA_Variant_setScalar(&kvp[2].value, &added, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_Variant_setScalar(&kvp[3].value, &updated, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_Variant_setScalar(&kvp[4].value, &removed, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_Variant_setScalar(&kvp[5].value, &channelId, &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setScalar(&kvp[6].value, &sessionId, &UA_TYPES[UA_TYPES_NODEID]);
+    UA_KeyValueMap kvm = {7, kvp};
+
+    notifyApplication(server,
+                      UA_APPLICATIONNOTIFICATIONTYPE_DISCOVERY_REGISTERSERVER,
+                      kvm);
+}
+
+/* Match the server name and at least one discovery uri */
+static RegisteredServerRecord *
+findRegisteredServer(UA_Server *server, const UA_String serverUri,
+                     size_t discoveryUrlsSize, const UA_String *discoveryUrls) {
+    RegisteredServerRecord *rs = NULL;
+    LIST_FOREACH(rs, &server->registeredServers, pointers) {
+        if(!UA_String_equal(&rs->registeredServer.serverUri, &serverUri))
+            continue;
+
+        for(size_t i = 0; i < rs->registeredServer.discoveryUrlsSize; i++) {
+            const UA_String *du1 = &rs->registeredServer.discoveryUrls[i];
+            for(size_t j = 0; j < discoveryUrlsSize; j++) {
+                const UA_String *du2 = &discoveryUrls[j];
+                if(UA_String_equal(du1, du2))
+                    return rs;
+            }
+        }
     }
+    return NULL;
+}
 
-    if(requestServer->discoveryUrlsSize == 0) {
-        responseHeader->serviceResult = UA_STATUSCODE_BADDISCOVERYURLMISSING;
-        return;
-    }
+/* Removes the record and its ServerOnNetwork entry. The caller notifies the
+ * application about the removed registration. */
+static void
+removeRegisteredServerRecord(UA_Server *server, RegisteredServerRecord *rs) {
+    if(server->config.serversOnNetworkEnabled &&
+       getTcpDiscoveryUrl(&rs->registeredServer))
+        removeServerOnNetwork(server, rs->mdnsServerName);
 
+    LIST_REMOVE(rs, pointers);
+    UA_RegisteredServer_clear(&rs->registeredServer);
+    UA_String_clear(&rs->mdnsServerName);
+    UA_free(rs);
+    server->registeredServersSize--;
+}
+
+static UA_StatusCode
+process_RegisterServer(UA_Server *server, UA_Session *session,
+                       const UA_RegisteredServer *requestServer,
+                       const size_t requestDiscoveryConfigurationSize,
+                       const UA_ExtensionObject *requestDiscoveryConfiguration,
+                       size_t *responseConfigurationResultsSize,
+                       UA_StatusCode **responseConfigurationResults,
+                       UA_Boolean allocateResponseConfigResults) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    /* Registration management is enabled explicitly in the server config. */
+    UA_ServerConfig *sc = &server->config;
+    if(!sc->registeredServersEnabled)
+        return UA_STATUSCODE_BADSERVICEUNSUPPORTED;
+
+    /* No Session backs RegisterServer(2), so only the channel can
+     * authenticate the caller. A local call without a channel is exempt. */
+    UA_SecureChannel *rsChannel = session->channel;
+    if(rsChannel && rsChannel->remoteCertificate.length == 0)
+        return UA_STATUSCODE_BADSECURITYMODEINSUFFICIENT;
+
+    /* The certificate must also match the claimed serverUri, otherwise a
+     * differently-identified peer could still overwrite another entry. */
+    if(rsChannel && rsChannel->remoteCertificate.length > 0 &&
+       UA_CertificateUtils_verifyApplicationUri(&rsChannel->remoteCertificate,
+                                                &requestServer->serverUri) != UA_STATUSCODE_GOOD)
+        return UA_STATUSCODE_BADCERTIFICATEURIINVALID;
+
+    /* Check the presence of at least one ServerName */
+    if(requestServer->serverNamesSize == 0)
+        return UA_STATUSCODE_BADSERVERNAMEMISSING;
+
+    /* Check the presence of at least one DiscoveryUrl */
+    if(requestServer->discoveryUrlsSize == 0)
+        return UA_STATUSCODE_BADDISCOVERYURLMISSING;
+
+    /* Bound the records queued for mDNS probing by one registration. */
+    if(requestServer->discoveryUrlsSize > 16)
+        return UA_STATUSCODE_BADTOOMANYOPERATIONS;
+
+    /* If a semaphore file path is defined, check that the file exists */
     if(requestServer->semaphoreFilePath.length) {
 #ifdef UA_ENABLE_DISCOVERY_SEMAPHORE
-        char* filePath = (char*)
-            UA_malloc(sizeof(char)*requestServer->semaphoreFilePath.length+1);
-        if(!filePath) {
-            UA_LOG_ERROR_SESSION(&server->config.logger, session,
-                                 "Cannot allocate memory for semaphore path. Out of memory.");
-            responseHeader->serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-            return;
-        }
-        memcpy(filePath, requestServer->semaphoreFilePath.data, requestServer->semaphoreFilePath.length );
+        char filePath[256];
+        if(requestServer->semaphoreFilePath.length >= 255)
+            return UA_STATUSCODE_BADINTERNALERROR;
+        memcpy(filePath, requestServer->semaphoreFilePath.data,
+               requestServer->semaphoreFilePath.length );
         filePath[requestServer->semaphoreFilePath.length] = '\0';
-        if(!UA_fileExists( filePath )) {
-            responseHeader->serviceResult = UA_STATUSCODE_BADSEMPAHOREFILEMISSING;
-            UA_free(filePath);
-            return;
-        }
-        UA_free(filePath);
+        if(!UA_fileExists(filePath))
+            return UA_STATUSCODE_BADSEMAPHOREFILEMISSING;
 #else
-        UA_LOG_WARNING(&server->config.logger, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_WARNING(sc->logging, UA_LOGCATEGORY_CLIENT,
                        "Ignoring semaphore file path. open62541 not compiled "
                        "with UA_ENABLE_DISCOVERY_SEMAPHORE=ON");
 #endif
     }
 
-#ifdef UA_ENABLE_DISCOVERY_MULTICAST
-    if(server->config.mdnsEnabled) {
-        for(size_t i = 0; i < requestServer->discoveryUrlsSize; i++) {
-            /* create TXT if is online and first index, delete TXT if is offline and last index */
-            UA_Boolean updateTxt = (requestServer->isOnline && i==0) ||
-                (!requestServer->isOnline && i==requestServer->discoveryUrlsSize);
-            UA_Server_updateMdnsForDiscoveryUrl(server, mdnsServerName, mdnsConfig,
-                                                &requestServer->discoveryUrls[i],
-                                                requestServer->isOnline, updateTxt);
+    /* Process the requestDiscoveryConfiguration to get the mDNS config and
+     * server name */
+    const UA_String *mdnsServerName = NULL;
+    static const UA_DataType *mdnsConfigType =
+        &UA_TYPES[UA_TYPES_MDNSDISCOVERYCONFIGURATION];
+    UA_MdnsDiscoveryConfiguration *mdnsConfig = NULL;
+    if(requestDiscoveryConfigurationSize > 0) {
+        if(allocateResponseConfigResults) {
+            *responseConfigurationResults = (UA_StatusCode *)
+                UA_Array_new(requestDiscoveryConfigurationSize,
+                             &UA_TYPES[UA_TYPES_STATUSCODE]);
+            if(!*responseConfigurationResults)
+                return UA_STATUSCODE_BADOUTOFMEMORY;
+            *responseConfigurationResultsSize = requestDiscoveryConfigurationSize;
+        }
+        for(size_t i = 0; i < requestDiscoveryConfigurationSize; i++) {
+            const UA_ExtensionObject *eo = &requestDiscoveryConfiguration[i];
+            if(!UA_ExtensionObject_hasDecodedType(eo, mdnsConfigType)) {
+                if(*responseConfigurationResults)
+                    (*responseConfigurationResults)[i] = UA_STATUSCODE_BADNOTSUPPORTED;
+                continue;
+            }
+            if(*responseConfigurationResults)
+                (*responseConfigurationResults)[i] = UA_STATUSCODE_GOOD;
+            mdnsConfig = (UA_MdnsDiscoveryConfiguration *)eo->content.decoded.data;
+            /* mDNS names must not be empty */
+            if(!mdnsServerName && mdnsConfig->mdnsServerName.length > 0)
+                mdnsServerName = &mdnsConfig->mdnsServerName;
         }
     }
-#endif
 
+    /* Without an mDNS name, use the first ServerName */
+    if(!mdnsServerName)
+        mdnsServerName = &requestServer->serverNames[0].text;
+    if(mdnsServerName->length == 0)
+        return UA_STATUSCODE_BADSERVERNAMEMISSING;
+
+    /* Find the server from the request in the record list */
+    RegisteredServerRecord *rs =
+        findRegisteredServer(server, requestServer->serverUri,
+                             requestServer->discoveryUrlsSize,
+                             requestServer->discoveryUrls);
+
+    /* Allow updates and removals even when the registration table is full. */
+    if(requestServer->isOnline && !rs &&
+       server->registeredServersSize >= server->maxRegisteredServers)
+        return UA_STATUSCODE_BADTOOMANYOPERATIONS;
+
+    /* Server is shutting down. Remove it from the registered servers list */
     if(!requestServer->isOnline) {
-        // server is shutting down. Remove it from the registered servers list
-        if(!registeredServer_entry) {
-            // server not found, show warning
-            UA_LOG_WARNING_SESSION(&server->config.logger, session,
-                                   "Could not unregister server %.*s. Not registered.",
-                                   (int)requestServer->serverUri.length, requestServer->serverUri.data);
-            responseHeader->serviceResult = UA_STATUSCODE_BADNOTHINGTODO;
-            return;
+        if(!rs) {
+            UA_LOG_WARNING_SESSION(sc->logging, session,
+                                   "Could not unregister unknown server %S",
+                                   requestServer->serverUri);
+            return UA_STATUSCODE_BADNOTHINGTODO;
         }
 
-        if(server->discoveryManager.registerServerCallback) {
-            UA_UNLOCK(&server->serviceMutex);
-            server->discoveryManager.
-                    registerServerCallback(requestServer,
-                                           server->discoveryManager.registerServerCallbackData);
-            UA_LOCK(&server->serviceMutex);
-        }
+        /* Notify the application */
+        notifyRegisteredServer(server, session, session->channel, requestServer, 
+                               requestDiscoveryConfigurationSize,
+                               requestDiscoveryConfiguration,
+                               false, false, true);
 
-        // server found, remove from list
-        LIST_REMOVE(registeredServer_entry, pointers);
-        UA_RegisteredServer_clear(&registeredServer_entry->registeredServer);
-        UA_free(registeredServer_entry);
-        server->discoveryManager.registeredServersSize--;
-        responseHeader->serviceResult = UA_STATUSCODE_GOOD;
-        return;
+        /* Remove server record */
+        removeRegisteredServerRecord(server, rs);
+        return UA_STATUSCODE_GOOD;
     }
 
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    if(!registeredServer_entry) {
-        // server not yet registered, register it by adding it to the list
-        UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Registering new server: %.*s",
-                             (int)requestServer->serverUri.length, requestServer->serverUri.data);
+    /* Make a copy of the RegisteredServer structure and the mDNS name */
+    UA_RegisteredServer tmpServer;
+    UA_StatusCode res =
+        UA_RegisteredServer_copy(requestServer, &tmpServer);
+    if(res != UA_STATUSCODE_GOOD)
+        return res;
+    UA_String tmpMdnsServerName;
+    res = UA_String_copy(mdnsServerName, &tmpMdnsServerName);
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_RegisteredServer_clear(&tmpServer);
+        return res;
+    }
 
-        registeredServer_entry =
-            (registeredServer_list_entry *)UA_malloc(sizeof(registeredServer_list_entry));
-        if(!registeredServer_entry) {
-            responseHeader->serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-            return;
+    /* The url for the ServerOnNetwork entry. Points into the request. */
+    const UA_String *tcpDiscoveryUrl = getTcpDiscoveryUrl(requestServer);
+
+    /* The previous registration has an entry under the same name. Else an
+     * entry with that name is a received or local one. */
+    UA_Boolean ownEntry = false;
+
+    if(!rs) {
+        UA_LOG_DEBUG_SESSION(sc->logging, session,
+                             "Registering new server: %S",
+                             requestServer->serverUri);
+
+        /* Allocate memory for the record */
+        rs = (RegisteredServerRecord*)
+            UA_calloc(1, sizeof(RegisteredServerRecord));
+        if(!rs) {
+            UA_RegisteredServer_clear(&tmpServer);
+            UA_String_clear(&tmpMdnsServerName);
+            return UA_STATUSCODE_BADOUTOFMEMORY;
         }
 
-        LIST_INSERT_HEAD(&server->discoveryManager.registeredServers, registeredServer_entry, pointers);
-        UA_atomic_addSize(&server->discoveryManager.registeredServersSize, 1);
+        /* Notify the application */
+        notifyRegisteredServer(server, session, session->channel, &tmpServer,
+                               requestDiscoveryConfigurationSize,
+                               requestDiscoveryConfiguration,
+                               true, false, false);
+
+        /* Add new server to the list */
+        LIST_INSERT_HEAD(&server->registeredServers, rs, pointers);
+        server->registeredServersSize++;
     } else {
-        UA_RegisteredServer_clear(&registeredServer_entry->registeredServer);
+        /* Remove the ServerOnNetwork entry of the previous registration if
+         * it is not replaced below. That is if the mDNS name changed or if
+         * there is no opc.tcp DiscoveryUrl anymore. */
+        if(sc->serversOnNetworkEnabled &&
+           getTcpDiscoveryUrl(&rs->registeredServer) &&
+           (!tcpDiscoveryUrl ||
+            !UA_String_equal(&rs->mdnsServerName, &tmpMdnsServerName)))
+            removeServerOnNetwork(server, rs->mdnsServerName);
+        ownEntry = sc->serversOnNetworkEnabled &&
+            getTcpDiscoveryUrl(&rs->registeredServer) &&
+            UA_String_equal(&rs->mdnsServerName, &tmpMdnsServerName);
+        UA_String_clear(&rs->mdnsServerName);
+
+        /* Clear the data of the previous record */
+        UA_RegisteredServer_clear(&rs->registeredServer);
+
+        /* Notify the application about the update */
+        notifyRegisteredServer(server, session, session->channel, &tmpServer,
+                               requestDiscoveryConfigurationSize,
+                               requestDiscoveryConfiguration,
+                               false, true, false);
     }
 
-    // Always call the callback, if it is set.
-    // Previously we only called it if it was a new register call. It may be the case that this endpoint
-    // registered before, then crashed, restarts and registeres again. In that case the entry is not deleted
-    // and the callback would not be called.
-    if(server->discoveryManager.registerServerCallback) {
-        UA_UNLOCK(&server->serviceMutex);
-        server->discoveryManager.
-                registerServerCallback(requestServer,
-                                       server->discoveryManager.registerServerCallbackData);
-        UA_LOCK(&server->serviceMutex);
-    }
+    /* Prepare / Update the server record */
+    UA_EventLoop *el = sc->eventLoop;
+    UA_DateTime nowMonotonic = el->dateTime_nowMonotonic(el);
+    rs->lastSeen = nowMonotonic;
+    rs->registeredServer = tmpServer;
+    rs->mdnsServerName = tmpMdnsServerName;
 
-    // copy the data from the request into the list
-    UA_RegisteredServer_copy(requestServer, &registeredServer_entry->registeredServer);
-    registeredServer_entry->lastSeen = UA_DateTime_nowMonotonic();
-    responseHeader->serviceResult = retval;
-}
+    /* Add or update the ServerOnNetwork entry. The registration succeeds also
+     * if this fails. */
+    if(sc->serversOnNetworkEnabled && tcpDiscoveryUrl) {
+        UA_ServerOnNetwork son;
+        UA_ServerOnNetwork_init(&son);
+        son.serverName = rs->mdnsServerName;
+        son.discoveryUrl = *tcpDiscoveryUrl;
 
-void Service_RegisterServer(UA_Server *server, UA_Session *session,
-                            const UA_RegisterServerRequest *request,
-                            UA_RegisterServerResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session,
-                         "Processing RegisterServerRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
-    process_RegisterServer(server, session, &request->requestHeader, &request->server, 0,
-                           NULL, &response->responseHeader, 0, NULL, 0, NULL);
-}
-
-void Service_RegisterServer2(UA_Server *server, UA_Session *session,
-                            const UA_RegisterServer2Request *request,
-                             UA_RegisterServer2Response *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session,
-                         "Processing RegisterServer2Request");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
-    process_RegisterServer(server, session, &request->requestHeader, &request->server,
-                           request->discoveryConfigurationSize, request->discoveryConfiguration,
-                           &response->responseHeader, &response->configurationResultsSize,
-                           &response->configurationResults, &response->diagnosticInfosSize,
-                           response->diagnosticInfos);
-}
-
-/* Cleanup server registration: If the semaphore file path is set, then it just
- * checks the existence of the file. When it is deleted, the registration is
- * removed. If there is no semaphore file, then the registration will be removed
- * if it is older than 60 minutes. */
-void UA_Discovery_cleanupTimedOut(UA_Server *server, UA_DateTime nowMonotonic) {
-    UA_DateTime timedOut = nowMonotonic;
-    // registration is timed out if lastSeen is older than 60 minutes (default
-    // value, can be modified by user).
-    if(server->config.discoveryCleanupTimeout)
-        timedOut -= server->config.discoveryCleanupTimeout * UA_DATETIME_SEC;
-
-    registeredServer_list_entry* current, *temp;
-    LIST_FOREACH_SAFE(current, &server->discoveryManager.registeredServers, pointers, temp) {
-        UA_Boolean semaphoreDeleted = false;
-
-#ifdef UA_ENABLE_DISCOVERY_SEMAPHORE
-        if(current->registeredServer.semaphoreFilePath.length) {
-            size_t fpSize = sizeof(char)*current->registeredServer.semaphoreFilePath.length+1;
-            // todo: malloc may fail: return a statuscode
-            char* filePath = (char *)UA_malloc(fpSize);
-            if(filePath) {
-                memcpy(filePath, current->registeredServer.semaphoreFilePath.data,
-                       current->registeredServer.semaphoreFilePath.length );
-                filePath[current->registeredServer.semaphoreFilePath.length] = '\0';
-                semaphoreDeleted = UA_fileExists(filePath) == false;
-                UA_free(filePath);
-            } else {
-                UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                             "Cannot check registration semaphore. Out of memory");
-            }
+        /* Without capabilities, use "NA" (no capability information is
+         * available) as the mDNS drivers do */
+        UA_String na = UA_STRING("NA");
+        if(mdnsConfig && mdnsConfig->serverCapabilitiesSize > 0) {
+            son.serverCapabilitiesSize = mdnsConfig->serverCapabilitiesSize;
+            son.serverCapabilities = mdnsConfig->serverCapabilities;
+        } else {
+            son.serverCapabilitiesSize = 1;
+            son.serverCapabilities = &na;
         }
-#endif
 
-        if(semaphoreDeleted || (server->config.discoveryCleanupTimeout &&
-                                current->lastSeen < timedOut)) {
-            if(semaphoreDeleted) {
-                UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                            "Registration of server with URI %.*s is removed because "
-                            "the semaphore file '%.*s' was deleted.",
-                            (int)current->registeredServer.serverUri.length,
-                            current->registeredServer.serverUri.data,
-                            (int)current->registeredServer.semaphoreFilePath.length,
-                            current->registeredServer.semaphoreFilePath.data);
-            } else {
-                // cppcheck-suppress unreadVariable
-                UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                            "Registration of server with URI %.*s has timed out and is removed.",
-                            (int)current->registeredServer.serverUri.length,
-                            current->registeredServer.serverUri.data);
-            }
-            LIST_REMOVE(current, pointers);
-            UA_RegisteredServer_clear(&current->registeredServer);
-            UA_free(current);
-            server->discoveryManager.registeredServersSize--;
+        /* Servers register again periodically. Updating an unchanged entry
+         * would give new RecordIds to all entries. An identical received or
+         * local entry is replaced, so that the announce flag gets applied. */
+        const UA_ServerOnNetwork *current =
+            findServerOnNetworkIndex(server, son.serverName);
+        if(current && ownEntry && rs->announce == sc->announceRegisteredServers) {
+            son.recordId = current->recordId; /* Not part of the comparison */
+            if(UA_order(&son, current,
+                        &UA_TYPES[UA_TYPES_SERVERONNETWORK]) == UA_ORDER_EQ)
+                return UA_STATUSCODE_GOOD;
         }
-    }
-}
 
-/* Called by the UA_Server callback. The OPC UA specification says:
- *
- * > If an error occurs during registration (e.g. the Discovery Server is not running) then the Server
- * > must periodically re-attempt registration. The frequency of these attempts should start at 1 second
- * > but gradually increase until the registration frequency is the same as what it would be if not
- * > errors occurred. The recommended approach would double the period each attempt until reaching the maximum.
- *
- * We will do so by using the additional data parameter which holds information
- * if the next interval is default or if it is a repeated call. */
-static void
-periodicServerRegister(UA_Server *server, void *data) {
-    UA_assert(data != NULL);
-    UA_LOCK(&server->serviceMutex);
-
-    struct PeriodicServerRegisterCallback *cb = (struct PeriodicServerRegisterCallback *)data;
-
-    UA_StatusCode retval = UA_Client_connectSecureChannel(cb->client, cb->discovery_server_url);
-    if (retval == UA_STATUSCODE_GOOD) {
-        /* Register
-           You can also use a semaphore file. That file must exist. When the file is
-           deleted, the server is automatically unregistered. The semaphore file has
-           to be accessible by the discovery server
-
-           UA_StatusCode retval = UA_Server_register_discovery(server,
-           "opc.tcp://localhost:4840", "/path/to/some/file");
-        */
-        retval = register_server_with_discovery_server(server, cb->client, false, NULL);
-        if (retval == UA_STATUSCODE_BADCONNECTIONCLOSED) {
-            /* If the periodic interval is higher than the maximum lifetime of
-             * the session, the server will close the connection. In this case
-             * we should try to reconnect */
-            UA_Client_disconnect(cb->client);
-            retval = UA_Client_connectSecureChannel(cb->client, cb->discovery_server_url);
-            if (retval == UA_STATUSCODE_GOOD) {
-                retval = register_server_with_discovery_server(server, cb->client, false, NULL);
-            }
-        }
-    }
-    /* Registering failed */
-    if(retval != UA_STATUSCODE_GOOD) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "Could not register server with discovery server. "
-                     "Is the discovery server started? StatusCode %s",
-                     UA_StatusCode_name(retval));
-
-        /* If the server was previously registered, retry in one second,
-         * else, double the previous interval */
-        UA_Double nextInterval = 1000.0;
-        if(!cb->registered)
-            nextInterval = cb->this_interval * 2;
-
-        /* The interval should be smaller than the default interval */
-        if(nextInterval > cb->default_interval)
-            nextInterval = cb->default_interval;
-
-        cb->this_interval = nextInterval;
-        changeRepeatedCallbackInterval(server, cb->id, nextInterval);
-        UA_UNLOCK(&server->serviceMutex);
-        return;
-    }
-
-    /* Registering succeeded */
-    UA_LOG_DEBUG(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                 "Server successfully registered. Next periodical register will be in %d seconds",
-                 (int)(cb->default_interval/1000));
-
-    if(!cb->registered) {
-        retval = changeRepeatedCallbackInterval(server, cb->id, cb->default_interval);
-        /* If changing the interval fails, try again after the next registering */
-        if(retval == UA_STATUSCODE_GOOD)
-            cb->registered = true;
-    }
-    UA_UNLOCK(&server->serviceMutex);
-}
-
-UA_StatusCode
-UA_Server_addPeriodicServerRegisterCallback(UA_Server *server,
-                                            struct UA_Client *client,
-                                            const char* discoveryServerUrl,
-                                            UA_Double intervalMs,
-                                            UA_Double delayFirstRegisterMs,
-                                            UA_UInt64 *periodicCallbackId) {
-    UA_LOCK(&server->serviceMutex);
-    /* No valid server URL */
-    if(!discoveryServerUrl) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "No discovery server URL provided");
-        UA_UNLOCK(&server->serviceMutex);
-        return UA_STATUSCODE_BADINTERNALERROR;
-    }
-
-
-    if (client->connection.state != UA_CONNECTIONSTATE_CLOSED) {
-        UA_UNLOCK(&server->serviceMutex);
-        return UA_STATUSCODE_BADINVALIDSTATE;
-    }
-
-    /* Check if we are already registering with the given discovery url and
-     * remove the old periodic call */
-    periodicServerRegisterCallback_entry *rs, *rs_tmp;
-    LIST_FOREACH_SAFE(rs, &server->discoveryManager.
-                      periodicServerRegisterCallbacks, pointers, rs_tmp) {
-        if(strcmp(rs->callback->discovery_server_url, discoveryServerUrl) == 0) {
-            UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                        "There is already a register callback for '%s' in place. "
-                        "Removing the older one.", discoveryServerUrl);
-            removeCallback(server, rs->callback->id);
-            LIST_REMOVE(rs, pointers);
-            UA_free(rs->callback->discovery_server_url);
-            UA_free(rs->callback);
-            UA_free(rs);
-            break;
+        res = addServerOnNetwork(server, &son, UA_KEYVALUEMAP_NULL,
+                                 sc->announceRegisteredServers);
+        if(res != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING_SESSION(sc->logging, session,
+                                   "Could not add the ServerOnNetwork entry "
+                                   "for the registered server %S (%s)",
+                                   requestServer->serverUri,
+                                   UA_StatusCode_name(res));
+        } else {
+            rs->announce = sc->announceRegisteredServers;
         }
     }
 
-    /* Allocate and initialize */
-    struct PeriodicServerRegisterCallback* cb = (struct PeriodicServerRegisterCallback*)
-        UA_malloc(sizeof(struct PeriodicServerRegisterCallback));
-    if(!cb) {
-        UA_UNLOCK(&server->serviceMutex);
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    }
-
-    /* Start repeating a failed register after 1s, then increase the delay. Set
-     * to 500ms, as the delay is doubled before changing the callback
-     * interval.*/
-    cb->this_interval = 500.0;
-    cb->default_interval = intervalMs;
-    cb->registered = false;
-    cb->client = client;
-    size_t len = strlen(discoveryServerUrl);
-    cb->discovery_server_url = (char*)UA_malloc(len+1);
-    if (!cb->discovery_server_url) {
-        UA_free(cb);
-        UA_UNLOCK(&server->serviceMutex);
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    }
-    memcpy(cb->discovery_server_url, discoveryServerUrl, len+1);
-
-    /* Add the callback */
-    UA_StatusCode retval =
-        addRepeatedCallback(server, periodicServerRegister,
-                            cb, delayFirstRegisterMs, &cb->id);
-    if(retval != UA_STATUSCODE_GOOD) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "Could not create periodic job for server register. "
-                     "StatusCode %s", UA_StatusCode_name(retval));
-        UA_free(cb);
-        UA_UNLOCK(&server->serviceMutex);
-        return retval;
-    }
-
-#ifndef __clang_analyzer__
-    // the analyzer reports on LIST_INSERT_HEAD a use after free false positive
-    periodicServerRegisterCallback_entry *newEntry = (periodicServerRegisterCallback_entry*)
-        UA_malloc(sizeof(periodicServerRegisterCallback_entry));
-    if(!newEntry) {
-        removeCallback(server, cb->id);
-        UA_free(cb);
-        UA_UNLOCK(&server->serviceMutex);
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    }
-    newEntry->callback = cb;
-    LIST_INSERT_HEAD(&server->discoveryManager.periodicServerRegisterCallbacks, newEntry, pointers);
-#endif
-
-    if(periodicCallbackId)
-        *periodicCallbackId = cb->id;
-    UA_UNLOCK(&server->serviceMutex);
     return UA_STATUSCODE_GOOD;
 }
 
-void
-UA_Server_setRegisterServerCallback(UA_Server *server,
-                                    UA_Server_registerServerCallback cb,
-                                    void* data) {
-    UA_LOCK(&server->serviceMutex);
-    server->discoveryManager.registerServerCallback = cb;
-    server->discoveryManager.registerServerCallbackData = data;
-    UA_UNLOCK(&server->serviceMutex);
+UA_Boolean
+Service_RegisterServer(UA_Server *server, UA_Session *session,
+                       const void *request_, void *response_) {
+    const UA_RegisterServerRequest *request = (const UA_RegisterServerRequest*)request_;
+    UA_RegisterServerResponse *response = (UA_RegisterServerResponse*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                         "Processing RegisterServerRequest");
+    UA_LOCK_ASSERT(&server->serviceMutex);
+    response->responseHeader.serviceResult =
+        process_RegisterServer(server, session, &request->server,
+                               0, NULL, 0, NULL, true);
+    return true;
 }
 
-#endif /* UA_ENABLE_DISCOVERY */
+UA_Boolean
+Service_RegisterServer2(UA_Server *server, UA_Session *session,
+                        const void *request_, void *response_) {
+    const UA_RegisterServer2Request *request = (const UA_RegisterServer2Request*)request_;
+    UA_RegisterServer2Response *response = (UA_RegisterServer2Response*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                         "Processing RegisterServer2Request");
+    UA_LOCK_ASSERT(&server->serviceMutex);
+    response->responseHeader.serviceResult =
+        process_RegisterServer(server, session, &request->server,
+                               request->discoveryConfigurationSize,
+                               request->discoveryConfiguration,
+                               &response->configurationResultsSize,
+                               &response->configurationResults, true);
+    return true;
+}
+
+UA_StatusCode
+UA_Server_registerServer(UA_Server *server,
+                         const UA_RegisteredServer *registeredServer,
+                         const size_t discoveryConfigurationSize,
+                         const UA_ExtensionObject *discoveryConfiguration,
+                         UA_StatusCode *configurationResults) {
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    lockServer(server);
+    res = process_RegisterServer(server, &server->adminSession,
+                                 registeredServer,
+                                 discoveryConfigurationSize,
+                                 discoveryConfiguration,
+                                 NULL, &configurationResults, false);
+    unlockServer(server);
+    return res;
+}
+
+UA_StatusCode
+UA_Server_deregisterServer(UA_Server *server, const UA_String serverUri,
+                           size_t discoveryUrlsSize,
+                           const UA_String *discoveryUrls) {
+    lockServer(server);
+
+    /* Find the server from the request in the record list */
+    RegisteredServerRecord *rs =
+        findRegisteredServer(server, serverUri, discoveryUrlsSize, discoveryUrls);
+    if(!rs) {
+        unlockServer(server);
+        return UA_STATUSCODE_BADNOTFOUND;
+    }
+
+    /* Notify the application */
+    notifyRegisteredServer(server,  &server->adminSession, NULL,
+                           &rs->registeredServer, 0, NULL,
+                           false, false, true);
+
+    /* Remove server record */
+    removeRegisteredServerRecord(server, rs);
+
+    unlockServer(server);
+    return UA_STATUSCODE_GOOD;
+}
+
+/* If the semaphore file path is set, then it just checks the existence of the
+ * file. When the file is deleted, the registration is removed. If no semaphore
+ * file is defined, then the registration will be removed if it is older than
+ * the cleanup timeout. */
+void
+cleanupRegisteredServers(UA_Server *server) {
+    /* TimedOut gives the last DateTime at which we must have seen the
+     * registered server. Otherwise it is timed out. */
+    UA_EventLoop *el = server->config.eventLoop;
+    UA_DateTime timedOut = el->dateTime_nowMonotonic(el);
+    if(server->config.registeredServerCleanupTimeout)
+        timedOut -= server->config.registeredServerCleanupTimeout * UA_DATETIME_SEC;
+
+    RegisteredServerRecord *current, *temp;
+    LIST_FOREACH_SAFE(current, &server->registeredServers, pointers, temp) {
+        UA_RegisteredServer *rs = &current->registeredServer;
+
+#ifdef UA_ENABLE_DISCOVERY_SEMAPHORE
+        if(rs->semaphoreFilePath.length) {
+            /* Check the semaphore file */
+            char filePath[256];
+            UA_assert(rs->semaphoreFilePath.length < 255);
+            memcpy(filePath, rs->semaphoreFilePath.data,
+                   rs->semaphoreFilePath.length);
+            filePath[rs->semaphoreFilePath.length] = '\0';
+            if(UA_fileExists(filePath))
+                continue; /* Semaphore file still exists */
+            UA_LOG_INFO(server->config.logging, UA_LOGCATEGORY_SERVER,
+                        "Registration of server with Uri %S is removed because "
+                        "the semaphore file '%S' was deleted",
+                        rs->serverUri, rs->semaphoreFilePath);
+        } else
+#endif
+        {
+            /* Check the timeout */
+            if(server->config.registeredServerCleanupTimeout == 0)
+                continue; /* No cleanup timeout configured */
+            if(current->lastSeen > timedOut)
+                continue; /* Server was recently seen */
+            UA_LOG_INFO(server->config.logging, UA_LOGCATEGORY_SERVER,
+                        "Registration of server with Uri %S has timed out "
+                        "and is removed", rs->serverUri);
+        }
+
+        /* Notify the application */
+        notifyRegisteredServer(server, &server->adminSession, NULL, rs,
+                               0, NULL, false, false, true);
+
+        /* Remove the record */
+        removeRegisteredServerRecord(server, current);
+    }
+}

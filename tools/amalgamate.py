@@ -1,15 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # coding: UTF-8
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this 
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-from __future__ import print_function
 import argparse
+import datetime
 import os.path
 import re
-import io
 
 parser = argparse.ArgumentParser()
 parser.add_argument('version', help='file version')
@@ -24,19 +23,30 @@ if outname[-2:] == ".c":
 pos = outname.find(".")
 if pos > 0:
     outname = outname[:pos]
-include_re = re.compile("^#[\s]*include (\".*\").*$|^#[\s]*include (<open62541/.*>).*$")
-guard_re = re.compile("^#(?:(?:ifndef|define)\s*[A-Z_]+_H_|endif /\* [A-Z_]+_H_ \*/|endif // [A-Z_]+_H_|endif\s*/\*\s*!?[A-Z_]+_H[_]+\s*\*/)")
+include_re = re.compile("^#[\\s]*include (\".*\").*$|^#[\\s]*include (<open62541/.*>).*$")
+guard_re = re.compile(r"^#(?:(?:ifndef|define)\s*[A-Z_]+_H_|endif /\* [A-Z_]+_H_ \*/|endif // [A-Z_]+_H_|endif\s*/\*\s*!?[A-Z_]+_H[_]+\s*\*/)")
+
+# End year of the copyright range. Honor SOURCE_DATE_EPOCH so that
+# reproducible builds get a stable header
+# (https://reproducible-builds.org/specs/source-date-epoch/).
+source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+if source_date_epoch:
+    copyright_year = datetime.datetime.fromtimestamp(
+        int(source_date_epoch), datetime.timezone.utc).year
+else:
+    copyright_year = datetime.date.today().year
 
 print ("Starting amalgamating file "+ args.outfile)
 
-file = io.open(args.outfile, 'wt', encoding='utf8', errors='replace')
-file.write(u"""/* THIS IS A SINGLE-FILE DISTRIBUTION CONCATENATED FROM THE OPEN62541 SOURCES
+file = open(args.outfile, 'w', encoding='utf8', errors='replace')
+file.write("""/* THIS IS A SINGLE-FILE DISTRIBUTION CONCATENATED FROM THE OPEN62541 SOURCES
  * visit http://open62541.org/ for information about this software
  * Git-Revision: %s
  */
 
 /*
- * Copyright (C) 2014-2018 the contributors as stated in the AUTHORS file
+ * Copyright (C) 2014-%d the open62541 contributors, as named in the
+ * per-file copyright headers reproduced below
  *
  * This file is part of open62541. open62541 is free software: you can
  * redistribute it and/or modify it under the terms of the Mozilla Public
@@ -45,30 +55,42 @@ file.write(u"""/* THIS IS A SINGLE-FILE DISTRIBUTION CONCATENATED FROM THE OPEN6
  * open62541 is distributed in the hope that it will be useful, but WITHOUT ANY
  * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
  * A PARTICULAR PURPOSE.
- */\n\n""" % args.version)
+ */\n\n""" % (args.version, copyright_year))
 
 if is_c:
-    file.write(u'''#ifndef UA_DYNAMIC_LINKING_EXPORT
+    file.write('''#ifndef UA_DYNAMIC_LINKING_EXPORT
 # define UA_DYNAMIC_LINKING_EXPORT
 # define MDNSD_DYNAMIC_LINKING
 #endif
 
+#define UA_INLINABLE_IMPL 1
+
 /* Disable security warnings for BSD sockets on MSVC */
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 # define _CRT_SECURE_NO_WARNINGS
 #endif
 
 #include "%s.h"
 ''' % outname)
 else:
-    file.write(u'''#ifndef %s
-#define %s
-''' % (outname.upper() + u"_H_", outname.upper() + u"_H_"))
+    file.write('''#ifndef {}
+#define {}
+'''.format(outname.upper() + "_H_", outname.upper() + "_H_"))
+
+# Remove the filesystem folder prefix
+initial = 999
+for fname in args.inputs:
+    pos = fname.find("include")
+    if pos < 0:
+        pos = fname.find("src")
+    if pos < 0:
+        continue
+    initial = min(initial, pos - 1)
 
 for fname in args.inputs:
-    with io.open(fname, encoding='utf8', errors='replace') as infile:
-        file.write(u"\n/*********************************** amalgamated original file \"" + fname + u"\" ***********************************/\n\n")
-        print ("Integrating file '" + fname + "'...", end=""),
+    with open(fname, encoding='utf8', errors='replace') as infile:
+        file.write("\n/**** amalgamated original file \"" + fname[initial:] + "\" ****/\n\n")
+        print ("Integrating file '" + fname + "' ... ", end="")
         for line in infile:
             inc_res = include_re.match(line)
             guard_res = guard_re.match(line)
@@ -77,10 +99,10 @@ for fname in args.inputs:
         # Ensure file is written to disk.
         file.flush()
         os.fsync(file.fileno())
-        print ("done."),
+        print ("done.")
 
 if not is_c:
-    file.write(u"#endif /* %s */\n" % (outname.upper() + u"_H_"))
+    file.write("#endif /* %s */\n" % (outname.upper() + "_H_"))
 
 # Ensure file is written to disk.
 # See https://stackoverflow.com/questions/13761961/large-file-not-flushed-to-disk-immediately-after-calling-close

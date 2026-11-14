@@ -3,45 +3,61 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
  * Copyright (c) 2017 - 2018 Fraunhofer IOSB (Author: Andreas Ebner)
+ * Copyright (c) 2020-2021 Kalycito Infotech Private Limited
+ * Copyright 2025 (c) o6 Automation GmbH (Author: Andreas Ebner)
+ * Copyright 2025 (c) o6 Automation GmbH (Author: Julius Pfrommer)
  */
 
-#include <open62541/plugin/pubsub_udp.h>
 #include <open62541/server_config_default.h>
 #include <open62541/server_pubsub.h>
-#include <open62541/types_generated_encoding_binary.h>
+
+#include "pubsub_test_helpers.h"
+#include "ua_pubsub_internal.h"
 #include <open62541/client.h>
 #include <open62541/client_config_default.h>
+#include <open62541/client_highlevel.h>
+
+#include "test_helpers.h"
 #include "check.h"
 #include "thread_wrapper.h"
 
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 UA_Server *server = NULL;
-UA_Boolean running;
+UA_atomic(uintptr_t) running;
 THREAD_HANDLE server_thread;
 
 THREAD_CALLBACK(serverloop) {
-        while (running)
-        UA_Server_run_iterate(server, true);
-        return 0;
+    while(UA_atomic_load(&running)) {
+        UA_Server_run_iterate(server, false);
+    }
+    return 0;
 }
 
 static void setup(void) {
-    running = true;
-    server = UA_Server_new();
-    UA_ServerConfig *config = UA_Server_getConfig(server);
-    UA_ServerConfig_setDefault(config);
-    UA_ServerConfig_addPubSubTransportLayer(config, UA_PubSubTransportLayerUDPMP());
+    UA_atomic_store(&running, true);
+    server = UA_Server_newForUnitTest();
+    ck_assert(server != NULL);
     UA_Server_run_startup(server);
     THREAD_CREATE(server_thread, serverloop);
 }
 
 static void teardown(void) {
-    running = false;
+    UA_atomic_store(&running, false);
     THREAD_JOIN(server_thread);
     UA_Server_run_shutdown(server);
     UA_Server_delete(server);
+}
+
+static size_t
+getPubSubConnectionsSize(void) {
+    lockServer(server);
+    UA_PubSubManager *psm = getPSM(server);
+    size_t connectionsSize = psm ? psm->connectionsSize : 0;
+    unlockServer(server);
+    return connectionsSize;
 }
 
 static UA_NodeId
@@ -81,13 +97,11 @@ static UA_NodeId addPubSubConnection(void){
     UA_PubSubConnectionDataType pubSubConnection;
     UA_PubSubConnectionDataType_init(&pubSubConnection);
     pubSubConnection.name = UA_STRING("Model Connection 1");
-    pubSubConnection.enabled = UA_TRUE;
     pubSubConnection.publisherId = publisherId;
     pubSubConnection.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
 
-
     UA_ExtensionObject eo;
-    UA_NetworkAddressUrlDataType networkAddressDataType = {UA_STRING(""), UA_STRING("opc.udp://224.0.0.22:4840/")};
+    UA_NetworkAddressUrlDataType networkAddressDataType = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
     UA_NetworkAddressUrlDataType* identityToken = UA_NetworkAddressUrlDataType_new();
     UA_NetworkAddressUrlDataType_init(identityToken);
     UA_NetworkAddressUrlDataType_copy(&networkAddressDataType, identityToken);
@@ -103,7 +117,7 @@ static UA_NodeId addPubSubConnection(void){
     UA_Variant_setScalar(&connectionOptions[0].value, &ttl, &UA_TYPES[UA_TYPES_UINT32]);
     connectionOptions[1].key = UA_QUALIFIEDNAME(0, "loopback");
     UA_Boolean loopback = UA_FALSE;
-    UA_Variant_setScalar(&connectionOptions[1].value, &loopback, &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setScalar(&connectionOptions[1].value, &loopback, &UA_TYPES[UA_TYPES_BOOLEAN]);
     pubSubConnection.connectionProperties = connectionOptions;
 
     UA_Variant inputArguments;
@@ -121,7 +135,7 @@ static UA_NodeId addPubSubConnection(void){
     UA_CallMethodResult result;
     UA_CallMethodResult_init(&result);
     result = UA_Server_call(server, &callMethodRequest);
-    ck_assert_int_eq(1, result.outputArgumentsSize);
+    ck_assert_uint_eq(1, result.outputArgumentsSize);
     ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
     if(result.outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
         connectionId =  *((UA_NodeId *) result.outputArguments->data);
@@ -133,43 +147,551 @@ static UA_NodeId addPubSubConnection(void){
     return connectionId;
 }
 
-START_TEST(AddNewPubSubConnectionUsingTheInformationModelMethod){
-    UA_StatusCode retVal;
-    UA_Client *client = UA_Client_new();
-    UA_ClientConfig_setDefault(UA_Client_getConfig(client));
-    retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
-    if(retVal != UA_STATUSCODE_GOOD) {
-        UA_Client_delete(client);
-    }
-    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+START_TEST(AddConnectionValidatesScalarInput) {
+    /* Keep all backing storage valid: these checks exercise the callback's
+     * input contract directly, without a network request or invalid memory. */
+    UA_Server *localServer = UA_Server_newForUnitTest();
+    ck_assert_ptr_ne(localServer, NULL);
+    UA_PubSubConnectionDataType connection;
+    UA_PubSubConnectionDataType_init(&connection);
+    connection.name = UA_STRING("Input validation");
+    connection.transportProfileUri =
+        UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+    UA_UInt32 publisherId = 100;
+    UA_Variant_setScalar(&connection.publisherId, &publisherId, &UA_TYPES[UA_TYPES_UINT32]);
+    UA_NetworkAddressUrlDataType address =
+        UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+    UA_ExtensionObject_setValueNoDelete(&connection.address, &address,
+                                       &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
 
-    UA_NodeId createdConnection = addPubSubConnection();
-    UA_LocalizedText connectionDisplayName;
-    UA_LocalizedText_init(&connectionDisplayName);
-    retVal = UA_Server_readDisplayName(server, createdConnection, &connectionDisplayName);
-    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
-    UA_String compareText = UA_STRING("Model Connection 1");
-    ck_assert(UA_String_equal(&connectionDisplayName.text, &compareText) == UA_TRUE);
-    //todo browse and check childs
+    UA_Variant input, output;
+    UA_Variant_init(&input);
+    UA_Variant_init(&output);
+    UA_Variant_setScalar(&input, &connection, &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+    size_t inputSize = 1;
+    if(_i == 0)
+        input.type = &UA_TYPES[UA_TYPES_STRING];
+    else if(_i == 1)
+        input.arrayLength = 1;
+    else
+        inputSize = 0;
 
-    UA_Variant serverPubSubConnectionValues;
-    UA_Variant_init(&serverPubSubConnectionValues);
-    UA_NodeId connectionPublisherId = findSingleChildNode(UA_QUALIFIEDNAME(0, "PublisherId"),
-                                                      UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
-                                                      createdConnection);
-    ck_assert_int_eq(UA_Server_readValue(server, connectionPublisherId, &serverPubSubConnectionValues),
-                     UA_STATUSCODE_GOOD);
-    ck_assert_uint_eq(*((UA_UInt32 *) serverPubSubConnectionValues.data), 13245);
-    UA_Variant_clear(&serverPubSubConnectionValues);
-    UA_Client_disconnect(client);
-    UA_Client_delete(client);
-    UA_LocalizedText_clear(&connectionDisplayName);
-    } END_TEST
+    UA_NodeId methodId = UA_NS0ID(PUBLISHSUBSCRIBE_ADDCONNECTION);
+    UA_NodeId objectId = UA_NS0ID(PUBLISHSUBSCRIBE);
+    lockServer(localServer);
+    const UA_Node *method = UA_NODESTORE_GET(localServer, &methodId);
+    ck_assert_ptr_ne(method, NULL);
+    ck_assert_int_eq(method->head.nodeClass, UA_NODECLASS_METHOD);
+    ck_assert(method->methodNode.method != NULL);
+    UA_StatusCode res = method->methodNode.method(localServer,
+        &localServer->adminSession.sessionId, NULL, &methodId, NULL,
+        &objectId, NULL, inputSize, &input, 1, &output);
+    UA_NODESTORE_RELEASE(localServer, method);
+    ck_assert_uint_eq(res, inputSize == 0 ? UA_STATUSCODE_BADARGUMENTSMISSING :
+                                          UA_STATUSCODE_BADTYPEMISMATCH);
+    ck_assert_uint_eq(getPSM(localServer)->connectionsSize, 0);
+    ck_assert(UA_Variant_isEmpty(&output));
+    unlockServer(localServer);
+    UA_Variant_clear(&output);
+    ck_assert_uint_eq(UA_Server_delete(localServer), UA_STATUSCODE_GOOD);
+} END_TEST
 
-START_TEST(AddAndRemovePublishedDataSetFolders){
+START_TEST(AddConnectionRollsBackOnChildFailure) {
+    UA_Variant publisherId;
+    UA_UInt32 publisherIdValue = 100;
+    UA_Variant_init(&publisherId);
+    UA_Variant_setScalar(&publisherId, &publisherIdValue,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+
+    UA_NetworkAddressUrlDataType networkAddress =
+        UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+    UA_PubSubConnectionDataType connection;
+    UA_PubSubConnectionDataType_init(&connection);
+    connection.name = UA_STRING("Connection with invalid child");
+    connection.publisherId = publisherId;
+    connection.transportProfileUri =
+        UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+    connection.address.encoding = UA_EXTENSIONOBJECT_DECODED;
+    connection.address.content.decoded.type =
+        &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE];
+    connection.address.content.decoded.data = &networkAddress;
+
+    UA_UadpWriterGroupMessageDataType messageSettings;
+    UA_UadpWriterGroupMessageDataType_init(&messageSettings);
+    UA_DataSetWriterDataType dataSetWriter;
+    UA_DataSetWriterDataType_init(&dataSetWriter);
+    dataSetWriter.name = UA_STRING("DataSetWriter with missing DataSet");
+    dataSetWriter.dataSetName = UA_STRING("Missing DataSet");
+
+    UA_WriterGroupDataType writerGroup;
+    UA_WriterGroupDataType_init(&writerGroup);
+    writerGroup.name = UA_STRING("WriterGroup");
+    writerGroup.messageSettings.encoding = UA_EXTENSIONOBJECT_DECODED;
+    writerGroup.messageSettings.content.decoded.type =
+        &UA_TYPES[UA_TYPES_UADPWRITERGROUPMESSAGEDATATYPE];
+    writerGroup.messageSettings.content.decoded.data = &messageSettings;
+    writerGroup.dataSetWritersSize = 1;
+    writerGroup.dataSetWriters = &dataSetWriter;
+    connection.writerGroupsSize = 1;
+    connection.writerGroups = &writerGroup;
+
+    UA_Variant input;
+    UA_Variant_init(&input);
+    UA_Variant_setScalar(&input, &connection,
+                         &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+    UA_CallMethodRequest request;
+    UA_CallMethodRequest_init(&request);
+    request.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+    request.methodId =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION);
+    request.inputArgumentsSize = 1;
+    request.inputArguments = &input;
+
+    ck_assert_uint_eq(getPubSubConnectionsSize(), 0);
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    ck_assert_int_eq(result.statusCode, UA_STATUSCODE_BADPARENTNODEIDINVALID);
+    ck_assert_uint_eq(getPubSubConnectionsSize(), 0);
+
+    UA_CallMethodResult_clear(&result);
+} END_TEST
+
+START_TEST(AddConnectionRejectsInvalidPublisherIdWithoutSideEffects) {
+    UA_Boolean publisherIdValue = false;
+    UA_Variant publisherId;
+    UA_Variant_init(&publisherId);
+    UA_Variant_setScalar(&publisherId, &publisherIdValue,
+                         &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+    UA_NetworkAddressUrlDataType networkAddress =
+        UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+    UA_PubSubConnectionDataType connection;
+    UA_PubSubConnectionDataType_init(&connection);
+    connection.name = UA_STRING("Connection with invalid PublisherId");
+    connection.publisherId = publisherId;
+    connection.transportProfileUri =
+        UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+    connection.address.encoding = UA_EXTENSIONOBJECT_DECODED;
+    connection.address.content.decoded.type =
+        &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE];
+    connection.address.content.decoded.data = &networkAddress;
+
+    UA_Variant input;
+    UA_Variant_init(&input);
+    UA_Variant_setScalar(&input, &connection,
+                         &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+    UA_CallMethodRequest request;
+    UA_CallMethodRequest_init(&request);
+    request.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+    request.methodId =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION);
+    request.inputArgumentsSize = 1;
+    request.inputArguments = &input;
+
+    ck_assert_uint_eq(getPubSubConnectionsSize(), 0);
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    ck_assert_int_eq(result.statusCode, UA_STATUSCODE_BADINTERNALERROR);
+    ck_assert_uint_eq(getPubSubConnectionsSize(), 0);
+
+    UA_CallMethodResult_clear(&result);
+} END_TEST
+
+static void addPublishedDataSets(void){
+    UA_Variant *inputArguments = (UA_Variant *) UA_calloc(4, (sizeof(UA_Variant)));
+
+    UA_String pdsName = UA_STRING("Test PDS");
+    UA_Variant_setScalar(&inputArguments[0], &pdsName, &UA_TYPES[UA_TYPES_STRING]);
+
+    UA_String *fieldNameAliases = (UA_String *) UA_calloc(2, sizeof(UA_String));
+    fieldNameAliases[0] = UA_STRING("field1");
+    fieldNameAliases[1] = UA_STRING("field2");
+    UA_Variant_setArray(&inputArguments[1], fieldNameAliases, 2, &UA_TYPES[UA_TYPES_STRING]);
+
+    UA_DataSetFieldFlags *dataSetFieldFlags = (UA_DataSetFieldFlags *) UA_calloc(2, sizeof(UA_DataSetFieldFlags));
+    dataSetFieldFlags[0] = UA_DATASETFIELDFLAGS_PROMOTEDFIELD;
+    dataSetFieldFlags[1] = UA_DATASETFIELDFLAGS_PROMOTEDFIELD;
+    UA_Variant_setArray(&inputArguments[2], dataSetFieldFlags, 2, &UA_TYPES[UA_TYPES_DATASETFIELDFLAGS]);
+
+    UA_PublishedVariableDataType *variablesToAdd = (UA_PublishedVariableDataType *) UA_calloc(2, sizeof(UA_PublishedVariableDataType));
+    variablesToAdd[0].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
+    variablesToAdd[0].attributeId = UA_ATTRIBUTEID_VALUE;
+    variablesToAdd[1].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE);
+    variablesToAdd[1].attributeId = UA_ATTRIBUTEID_VALUE;
+    UA_Variant_setArray(&inputArguments[3], variablesToAdd, 2, &UA_TYPES[UA_TYPES_PUBLISHEDVARIABLEDATATYPE]);
+
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+    callMethodRequest.inputArgumentsSize = 4;
+    callMethodRequest.inputArguments = inputArguments;
+    callMethodRequest.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_ADDPUBLISHEDDATAITEMS);
+
+    UA_CallMethodResult result;
+    UA_CallMethodResult_init(&result);
+    result = UA_Server_call(server, &callMethodRequest);
+    ck_assert_uint_eq(3, result.outputArgumentsSize);
+    ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
+    ck_assert(UA_Variant_hasScalarType(&result.outputArguments[0],
+                                       &UA_TYPES[UA_TYPES_NODEID]));
+    ck_assert(UA_Variant_hasScalarType(
+        &result.outputArguments[1],
+        &UA_TYPES[UA_TYPES_CONFIGURATIONVERSIONDATATYPE]));
+    ck_assert(UA_Variant_hasArrayType(&result.outputArguments[2],
+                                      &UA_TYPES[UA_TYPES_STATUSCODE]));
+    ck_assert_uint_eq(result.outputArguments[2].arrayLength, 2);
+    UA_StatusCode *addResults =
+        (UA_StatusCode*)result.outputArguments[2].data;
+    ck_assert_uint_eq(addResults[0], UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(addResults[1], UA_STATUSCODE_GOOD);
+    UA_CallMethodResult_clear(&result);
+    UA_free(inputArguments);
+    UA_free(fieldNameAliases);
+    UA_free(dataSetFieldFlags);
+    UA_free(variablesToAdd);
+}
+
+START_TEST(AddAndRemoveVariablesMethods) {
+    addPublishedDataSets();
+    lockServer(server);
+    UA_PublishedDataSet *pds = UA_PublishedDataSet_findByName(
+        getPSM(server), UA_STRING("Test PDS"));
+    ck_assert_ptr_nonnull(pds);
+    UA_NodeId pdsId;
+    UA_NodeId_copy(&pds->head.identifier, &pdsId);
+    UA_ConfigurationVersionDataType version =
+        pds->dataSetMetaData.configurationVersion;
+    unlockServer(server);
+
+    UA_String alias = UA_STRING("field3");
+    UA_Boolean promoted = false;
+    UA_PublishedVariableDataType variable;
+    UA_PublishedVariableDataType_init(&variable);
+    variable.publishedVariable =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_BUILDINFO);
+    variable.attributeId = UA_ATTRIBUTEID_VALUE;
+    UA_Variant input[4];
+    memset(input, 0, sizeof(input));
+    UA_Variant_setScalar(&input[0], &version,
+        &UA_TYPES[UA_TYPES_CONFIGURATIONVERSIONDATATYPE]);
+    UA_Variant_setArray(&input[1], &alias, 1, &UA_TYPES[UA_TYPES_STRING]);
+    UA_Variant_setArray(&input[2], &promoted, 1, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_Variant_setArray(&input[3], &variable, 1,
+                        &UA_TYPES[UA_TYPES_PUBLISHEDVARIABLEDATATYPE]);
+    UA_CallMethodRequest request;
+    UA_CallMethodRequest_init(&request);
+    request.objectId = pdsId;
+    request.methodId = UA_NODEID_NUMERIC(
+        0, UA_NS0ID_PUBLISHEDDATAITEMSTYPE_ADDVARIABLES);
+    request.inputArgumentsSize = 4;
+    request.inputArguments = input;
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    ck_assert_uint_eq(result.statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(result.outputArgumentsSize, 2);
+    ck_assert_uint_eq(result.outputArguments[1].arrayLength, 1);
+    ck_assert_uint_eq(*(UA_StatusCode*)result.outputArguments[1].data,
+                      UA_STATUSCODE_GOOD);
+    version = *(UA_ConfigurationVersionDataType*)result.outputArguments[0].data;
+    UA_CallMethodResult_clear(&result);
+
+    UA_UInt32 index = 2;
+    memset(input, 0, 2 * sizeof(UA_Variant));
+    UA_Variant_setScalar(&input[0], &version,
+        &UA_TYPES[UA_TYPES_CONFIGURATIONVERSIONDATATYPE]);
+    UA_Variant_setArray(&input[1], &index, 1, &UA_TYPES[UA_TYPES_UINT32]);
+    request.methodId = UA_NODEID_NUMERIC(
+        0, UA_NS0ID_PUBLISHEDDATAITEMSTYPE_REMOVEVARIABLES);
+    request.inputArgumentsSize = 2;
+    result = UA_Server_call(server, &request);
+    ck_assert_uint_eq(result.statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(result.outputArgumentsSize, 2);
+    ck_assert_uint_eq(*(UA_StatusCode*)result.outputArguments[1].data,
+                      UA_STATUSCODE_GOOD);
+    UA_CallMethodResult_clear(&result);
+    UA_NodeId_clear(&pdsId);
+} END_TEST
+
+static UA_StatusCode CallReserveIds(UA_Client *client, UA_String *transportProfileUri,
+    UA_UInt16 numRegWriterGroupIds, UA_UInt16 numRegDataSetWriterIds,
+    UA_Variant* defaultPublisherId, UA_Variant* regWriterGroupIds, UA_Variant *regDataSetWriterIds)
+{
+    UA_StatusCode ret = UA_STATUSCODE_GOOD;
+
+    UA_Variant *inputArguments = (UA_Variant *) UA_calloc(3, (sizeof(UA_Variant)));
+    UA_Variant_setScalar(&inputArguments[0], transportProfileUri, &UA_TYPES[UA_TYPES_STRING]);
+    UA_Variant_setScalar(&inputArguments[1], &numRegWriterGroupIds, &UA_TYPES[UA_TYPES_UINT16]);
+    UA_Variant_setScalar(&inputArguments[2], &numRegDataSetWriterIds, &UA_TYPES[UA_TYPES_UINT16]);
+
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+    callMethodRequest.inputArgumentsSize = 3;
+    callMethodRequest.inputArguments = inputArguments;
+    callMethodRequest.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBSUBCONFIGURATION);
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBSUBCONFIGURATION_RESERVEIDS);
+
+    UA_CallRequest callReserveIds;
+    UA_CallRequest_init(&callReserveIds);
+    callReserveIds.methodsToCallSize = 1;
+    callReserveIds.methodsToCall = &callMethodRequest;
+
+    UA_CallResponse response = UA_Client_Service_call(client, callReserveIds);
+    ck_assert_uint_eq(1, response.resultsSize);
+    ck_assert_int_eq(response.results[0].statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(3, response.results[0].outputArgumentsSize);
+    ret = response.results->statusCode;
+
+    UA_Variant_copy(&response.results[0].outputArguments[0], defaultPublisherId);
+    UA_Variant_copy(&response.results[0].outputArguments[1], regWriterGroupIds);
+    UA_Variant_copy(&response.results[0].outputArguments[2], regDataSetWriterIds);
+
+    UA_free(inputArguments);
+    UA_CallResponse_clear(&response);
+
+    return ret;
+}
+
+START_TEST(AddandRemoveNewPubSubConnectionWithWriterGroup){
         UA_StatusCode retVal;
-        UA_Client *client = UA_Client_new();
-        UA_ClientConfig_setDefault(UA_Client_getConfig(client));
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_Variant publisherId;
+        UA_Variant_init(&publisherId);
+        UA_UInt32 publisherIdValue = 100;
+        UA_Variant_setScalar(&publisherId, &publisherIdValue , &UA_TYPES[UA_TYPES_UINT32]);
+
+        UA_PubSubConnectionDataType pubSubConnection;
+        UA_PubSubConnectionDataType_init(&pubSubConnection);
+        pubSubConnection.name = UA_STRING("Model Connection 2");
+        pubSubConnection.publisherId = publisherId;
+        pubSubConnection.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+
+        UA_ExtensionObject eo;
+        UA_NetworkAddressUrlDataType networkAddressDataType = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+        UA_NetworkAddressUrlDataType* identityToken = UA_NetworkAddressUrlDataType_new();
+        UA_NetworkAddressUrlDataType_init(identityToken);
+        UA_NetworkAddressUrlDataType_copy(&networkAddressDataType, identityToken);
+        eo.encoding = UA_EXTENSIONOBJECT_DECODED;
+        eo.content.decoded.type = &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE];
+        eo.content.decoded.data = identityToken;
+        pubSubConnection.address = eo;
+        pubSubConnection.connectionPropertiesSize = 2;
+        UA_KeyValuePair connectionOptions[2];
+        memset(connectionOptions, 0, sizeof(UA_KeyValuePair)* 2);
+        connectionOptions[0].key = UA_QUALIFIEDNAME(0, "ttl");
+        UA_UInt32 ttl = 10;
+        UA_Variant_setScalar(&connectionOptions[0].value, &ttl, &UA_TYPES[UA_TYPES_UINT32]);
+        connectionOptions[1].key = UA_QUALIFIEDNAME(0, "loopback");
+        UA_Boolean loopback = UA_FALSE;
+        UA_Variant_setScalar(&connectionOptions[1].value, &loopback, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        pubSubConnection.connectionProperties = connectionOptions;
+
+        pubSubConnection.writerGroupsSize = 1;
+        pubSubConnection.writerGroups = (UA_WriterGroupDataType *)UA_calloc(pubSubConnection.writerGroupsSize, sizeof(UA_WriterGroupDataType));
+        UA_UadpWriterGroupMessageDataType *writerGroupMessage = \
+            (UA_UadpWriterGroupMessageDataType *)UA_calloc(pubSubConnection.writerGroupsSize, sizeof(UA_UadpWriterGroupMessageDataType));
+        UA_ExtensionObject extensionObjectWG;
+        pubSubConnection.writerGroups->name = UA_STRING("WriterGroup 1");
+        pubSubConnection.writerGroups->publishingInterval = 5;
+        pubSubConnection.writerGroups->writerGroupId = 150;
+        /* Change message settings of writerGroup to send PublisherId,
+        * WriterGroupId in GroupHeader and DataSetWriterId in PayloadHeader
+        * of NetworkMessage */
+        writerGroupMessage->networkMessageContentMask = (UA_UadpNetworkMessageContentMask)(UA_UADPNETWORKMESSAGECONTENTMASK_PUBLISHERID |
+                                                        (UA_UadpNetworkMessageContentMask)UA_UADPNETWORKMESSAGECONTENTMASK_GROUPHEADER |
+                                                        (UA_UadpNetworkMessageContentMask)UA_UADPNETWORKMESSAGECONTENTMASK_WRITERGROUPID |
+                                                        (UA_UadpNetworkMessageContentMask)UA_UADPNETWORKMESSAGECONTENTMASK_PAYLOADHEADER);
+        extensionObjectWG.encoding = UA_EXTENSIONOBJECT_DECODED;
+        extensionObjectWG.content.decoded.type = &UA_TYPES[UA_TYPES_UADPWRITERGROUPMESSAGEDATATYPE];
+        extensionObjectWG.content.decoded.data = writerGroupMessage;
+        pubSubConnection.writerGroups->messageSettings = extensionObjectWG;
+
+        UA_Variant inputArguments;
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &pubSubConnection, &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        UA_NodeId connectionId = UA_NODEID_NULL;
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+        if(response.results->outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
+            connectionId =  *((UA_NodeId *) response.results->outputArguments->data);
+        UA_CallResponse_clear(&response);
+
+        //Remove the connection
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &connectionId, &UA_TYPES[UA_TYPES_NODEID]);
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest_init(&item);
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_REMOVECONNECTION);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(0, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        UA_ExtensionObject_clear(&eo);
+        UA_free(writerGroupMessage);
+        UA_free(pubSubConnection.writerGroups);
+        UA_CallResponse_clear(&response);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+}END_TEST
+
+START_TEST(AddNewPubSubConnectionWithWriterGroupAndDataSetWriter){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        addPublishedDataSets();
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_Variant publisherId;
+        UA_Variant_init(&publisherId);
+        UA_UInt32 publisherIdValue = 100;
+        UA_Variant_setScalar(&publisherId, &publisherIdValue , &UA_TYPES[UA_TYPES_UINT32]);
+
+        UA_PubSubConnectionDataType pubSubConnection;
+        UA_PubSubConnectionDataType_init(&pubSubConnection);
+        pubSubConnection.name = UA_STRING("Model Connection 2");
+        pubSubConnection.publisherId = publisherId;
+        pubSubConnection.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+
+        UA_ExtensionObject eo;
+        UA_NetworkAddressUrlDataType networkAddressDataType = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+        UA_NetworkAddressUrlDataType* identityToken = UA_NetworkAddressUrlDataType_new();
+        UA_NetworkAddressUrlDataType_init(identityToken);
+        UA_NetworkAddressUrlDataType_copy(&networkAddressDataType, identityToken);
+        eo.encoding = UA_EXTENSIONOBJECT_DECODED;
+        eo.content.decoded.type = &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE];
+        eo.content.decoded.data = identityToken;
+        pubSubConnection.address = eo;
+        pubSubConnection.connectionPropertiesSize = 2;
+        UA_KeyValuePair connectionOptions[2];
+        memset(connectionOptions, 0, sizeof(UA_KeyValuePair)* 2);
+        connectionOptions[0].key = UA_QUALIFIEDNAME(0, "ttl");
+        UA_UInt32 ttl = 10;
+        UA_Variant_setScalar(&connectionOptions[0].value, &ttl, &UA_TYPES[UA_TYPES_UINT32]);
+        connectionOptions[1].key = UA_QUALIFIEDNAME(0, "loopback");
+        UA_Boolean loopback = UA_FALSE;
+        UA_Variant_setScalar(&connectionOptions[1].value, &loopback, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        pubSubConnection.connectionProperties = connectionOptions;
+
+        pubSubConnection.writerGroupsSize = 1;
+        pubSubConnection.writerGroups = (UA_WriterGroupDataType *)UA_calloc(pubSubConnection.writerGroupsSize, sizeof(UA_WriterGroupDataType));
+        UA_UadpWriterGroupMessageDataType *writerGroupMessage = \
+            (UA_UadpWriterGroupMessageDataType *)UA_calloc(pubSubConnection.writerGroupsSize, sizeof(UA_UadpWriterGroupMessageDataType));
+        UA_ExtensionObject extensionObjectWG;
+        pubSubConnection.writerGroups->name = UA_STRING("WriterGroup 1");
+        pubSubConnection.writerGroups->publishingInterval = 5;
+        pubSubConnection.writerGroups->writerGroupId = 150;
+        pubSubConnection.writerGroups->dataSetWritersSize = 1;
+        /* Change message settings of writerGroup to send PublisherId,
+        * WriterGroupId in GroupHeader and DataSetWriterId in PayloadHeader
+        * of NetworkMessage */
+        writerGroupMessage->networkMessageContentMask = (UA_UadpNetworkMessageContentMask)(UA_UADPNETWORKMESSAGECONTENTMASK_PUBLISHERID |
+                                                        (UA_UadpNetworkMessageContentMask)UA_UADPNETWORKMESSAGECONTENTMASK_GROUPHEADER |
+                                                        (UA_UadpNetworkMessageContentMask)UA_UADPNETWORKMESSAGECONTENTMASK_WRITERGROUPID |
+                                                        (UA_UadpNetworkMessageContentMask)UA_UADPNETWORKMESSAGECONTENTMASK_PAYLOADHEADER);
+        extensionObjectWG.encoding = UA_EXTENSIONOBJECT_DECODED;
+        extensionObjectWG.content.decoded.type = &UA_TYPES[UA_TYPES_UADPWRITERGROUPMESSAGEDATATYPE];
+        extensionObjectWG.content.decoded.data = writerGroupMessage;
+        pubSubConnection.writerGroups->messageSettings = extensionObjectWG;
+
+        pubSubConnection.writerGroups->dataSetWriters = \
+                (UA_DataSetWriterDataType*)UA_calloc(pubSubConnection.writerGroups->dataSetWritersSize, sizeof(UA_DataSetWriterDataType));
+        pubSubConnection.writerGroups->dataSetWriters->name = UA_STRING("DataSetWriter");
+        pubSubConnection.writerGroups->dataSetWriters->dataSetWriterId = 62541;
+        pubSubConnection.writerGroups->dataSetWriters->keyFrameCount = 10;
+        UA_String pdsName = UA_STRING("Test PDS");
+        pubSubConnection.writerGroups->dataSetWriters->dataSetName = pdsName;
+
+        UA_Variant inputArguments;
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &pubSubConnection, &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+        UA_ExtensionObject_clear(&eo);
+        UA_free(pubSubConnection.writerGroups->dataSetWriters);
+        UA_free(writerGroupMessage);
+        UA_free(pubSubConnection.writerGroups);
+        UA_CallResponse_clear(&response);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+}END_TEST
+
+
+START_TEST(AddNewPubSubConnectionUsingTheInformationModelMethod){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+        UA_NodeId createdConnection = addPubSubConnection();
+        UA_LocalizedText connectionDisplayName;
+        UA_LocalizedText_init(&connectionDisplayName);
+        retVal = UA_Server_readDisplayName(server, createdConnection, &connectionDisplayName);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_String compareText = UA_STRING("Model Connection 1");
+        ck_assert(UA_String_equal(&connectionDisplayName.text, &compareText) == UA_TRUE);
+        //todo browse and check childs
+
+        UA_Variant serverPubSubConnectionValues;
+        UA_Variant_init(&serverPubSubConnectionValues);
+        UA_NodeId connectionPublisherId = findSingleChildNode(UA_QUALIFIEDNAME(0, "PublisherId"),
+                                                        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                                                        createdConnection);
+        ck_assert_int_eq(UA_Server_readValue(server, connectionPublisherId, &serverPubSubConnectionValues),
+                        UA_STATUSCODE_GOOD);
+        ck_assert_uint_eq(*((UA_UInt32 *) serverPubSubConnectionValues.data), 13245);
+        UA_Variant_clear(&serverPubSubConnectionValues);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+        UA_LocalizedText_clear(&connectionDisplayName);
+} END_TEST
+
+START_TEST(AddAndRemovePublishedDataSetFoldersUsingServer){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
         retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
         if(retVal != UA_STATUSCODE_GOOD) {
             UA_Client_delete(client);
@@ -191,7 +713,7 @@ START_TEST(AddAndRemovePublishedDataSetFolders){
         UA_CallMethodResult result;
         UA_CallMethodResult_init(&result);
         result = UA_Server_call(server, &callMethodRequest);
-        ck_assert_int_eq(1, result.outputArgumentsSize);
+        ck_assert_uint_eq(1, result.outputArgumentsSize);
         ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
 
         UA_NodeId createdFolder = UA_NODEID_NULL;
@@ -219,7 +741,7 @@ START_TEST(AddAndRemovePublishedDataSetFolders){
         callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_ADDDATASETFOLDER);
         UA_CallMethodResult_init(&result);
         result = UA_Server_call(server, &callMethodRequest);
-        ck_assert_int_eq(1, result.outputArgumentsSize);
+        ck_assert_uint_eq(1, result.outputArgumentsSize);
         ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
         UA_NodeId createdFolder2 = UA_NODEID_NULL;
         if(result.outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
@@ -233,6 +755,28 @@ START_TEST(AddAndRemovePublishedDataSetFolders){
         ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
         UA_CallMethodResult_clear(&result);
 
+        /* A Remove method may only remove a direct child of the Object on
+         * which it was invoked. The nested folder is not a direct child of
+         * PublishedDataSets. */
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &createdFolder2,
+                             &UA_TYPES[UA_TYPES_NODEID]);
+        UA_CallMethodRequest_init(&callMethodRequest);
+        callMethodRequest.inputArgumentsSize = 1;
+        callMethodRequest.inputArguments = &inputArguments;
+        callMethodRequest.objectId =
+            UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+        callMethodRequest.methodId =
+            UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_REMOVEDATASETFOLDER);
+        result = UA_Server_call(server, &callMethodRequest);
+        ck_assert_int_eq(result.statusCode, UA_STATUSCODE_BADNODEIDUNKNOWN);
+        UA_CallMethodResult_clear(&result);
+        UA_NodeId checkedNodeId;
+        UA_NodeId_init(&checkedNodeId);
+        retVal = UA_Server_readNodeId(server, createdFolder2, &checkedNodeId);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_NodeId_clear(&checkedNodeId);
+
         //delete the folder
         UA_Variant_init(&inputArguments);
         UA_Variant_setScalar(&inputArguments, &createdFolder, &UA_TYPES[UA_TYPES_NODEID]);
@@ -243,7 +787,7 @@ START_TEST(AddAndRemovePublishedDataSetFolders){
         callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_REMOVEDATASETFOLDER);
 
         result = UA_Server_call(server, &callMethodRequest);
-        ck_assert_int_eq(0, result.outputArgumentsSize);
+        ck_assert_uint_eq(0, result.outputArgumentsSize);
         ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
         //check if the node is deleted
         retVal = UA_Server_readNodeId(server, createdFolder, NULL);
@@ -255,10 +799,155 @@ START_TEST(AddAndRemovePublishedDataSetFolders){
         UA_LocalizedText_clear(&connectionDisplayName);
     } END_TEST
 
-START_TEST(AddAndRemovePublishedDataSetItems){
+START_TEST(RemoveDeepPublishedDataSetFolderTree) {
+    UA_NodeId parent = UA_NS0ID(PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+    UA_Boolean parentOwned = false;
+    UA_NodeId root = UA_NODEID_NULL;
+    for(size_t i = 0; i < 64; i++) {
+        UA_ObjectAttributes attr = UA_ObjectAttributes_default;
+        attr.displayName = UA_LOCALIZEDTEXT("", "Nested folder");
+        UA_NodeId child = UA_NODEID_NULL;
+        UA_StatusCode res = UA_Server_addObjectNode(
+            server, UA_NODEID_NULL, parent, UA_NS0ID(ORGANIZES),
+            UA_QUALIFIEDNAME(1, "NestedFolder"), UA_NS0ID(DATASETFOLDERTYPE),
+            attr, NULL, &child);
+        ck_assert_int_eq(res, UA_STATUSCODE_GOOD);
+        if(i == 0)
+            ck_assert_int_eq(UA_NodeId_copy(&child, &root), UA_STATUSCODE_GOOD);
+        if(parentOwned)
+            UA_NodeId_clear(&parent);
+        parent = child;
+        parentOwned = true;
+    }
+    UA_NodeId_clear(&parent);
+
+    UA_Variant input;
+    UA_Variant_init(&input);
+    UA_Variant_setScalar(&input, &root, &UA_TYPES[UA_TYPES_NODEID]);
+    UA_CallMethodRequest request;
+    UA_CallMethodRequest_init(&request);
+    request.objectId = UA_NS0ID(PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+    request.methodId = UA_NS0ID(DATASETFOLDERTYPE_REMOVEDATASETFOLDER);
+    request.inputArgumentsSize = 1;
+    request.inputArguments = &input;
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(UA_Server_readNodeId(server, root, NULL),
+                     UA_STATUSCODE_BADNODEIDUNKNOWN);
+    UA_CallMethodResult_clear(&result);
+    UA_NodeId_clear(&root);
+}
+END_TEST
+
+START_TEST(AddAndRemovePublishedDataSetFoldersUsingClient){
         UA_StatusCode retVal;
-        UA_Client *client = UA_Client_new();
-        UA_ClientConfig_setDefault(UA_Client_getConfig(client));
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+        UA_String folderName = UA_STRING("TestFolder");
+        UA_Variant inputArguments;
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &folderName, &UA_TYPES[UA_TYPES_STRING]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+        item.methodId =  UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_ADDDATASETFOLDER);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        UA_NodeId createdFolder = UA_NODEID_NULL;
+        if(response.results->outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
+            createdFolder = *((UA_NodeId *) response.results->outputArguments->data);
+        UA_LocalizedText connectionDisplayName;
+        UA_LocalizedText_init(&connectionDisplayName);
+        retVal = UA_Server_readDisplayName(server, createdFolder, &connectionDisplayName);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_String compareText = UA_STRING("TestFolder");
+        ck_assert(UA_String_equal(&connectionDisplayName.text, &compareText) == UA_TRUE);
+        retVal = UA_Server_readNodeId(server, createdFolder, &createdFolder);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_CallResponse_clear(&response);
+        UA_LocalizedText_clear(&connectionDisplayName);
+
+        //create folder inside the new folder
+        folderName = UA_STRING("TestFolder2");
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &folderName, &UA_TYPES[UA_TYPES_STRING]);
+        //Call method from client
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = createdFolder;
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_ADDDATASETFOLDER);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        UA_NodeId createdFolder2 = UA_NODEID_NULL;
+        if(response.results->outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
+            createdFolder2 = *((UA_NodeId *) response.results->outputArguments->data);
+        UA_LocalizedText_init(&connectionDisplayName);
+        retVal = UA_Server_readDisplayName(server, createdFolder2, &connectionDisplayName);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        compareText = UA_STRING("TestFolder2");
+        ck_assert(UA_String_equal(&connectionDisplayName.text, &compareText) == UA_TRUE);
+        retVal = UA_Server_readNodeId(server, createdFolder2, &createdFolder2);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_CallResponse_clear(&response);
+
+        //delete the folder
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &createdFolder, &UA_TYPES[UA_TYPES_NODEID]);
+
+        //Call method from client
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_REMOVEDATASETFOLDER);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(0, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        //check if the node is deleted
+        retVal = UA_Server_readNodeId(server, createdFolder, NULL);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_BADNODEIDUNKNOWN);
+
+        UA_CallResponse_clear(&response);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+        UA_LocalizedText_clear(&connectionDisplayName);
+} END_TEST
+
+START_TEST(AddAndRemovePublishedDataSetItemsUsingServer){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
         retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
         if(retVal != UA_STATUSCODE_GOOD) {
             UA_Client_delete(client);
@@ -281,9 +970,9 @@ START_TEST(AddAndRemovePublishedDataSetItems){
         UA_Variant_setArray(&inputArguments[2], dataSetFieldFlags, 2, &UA_TYPES[UA_TYPES_DATASETFIELDFLAGS]);
 
         UA_PublishedVariableDataType *variablesToAdd = (UA_PublishedVariableDataType *) UA_calloc(2, sizeof(UA_PublishedVariableDataType));
-        variablesToAdd[0].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_LOCALTIME);
+        variablesToAdd[0].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
         variablesToAdd[0].attributeId = UA_ATTRIBUTEID_VALUE;
-        variablesToAdd[1].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERREDUNDANCY_CURRENTSERVERID);
+        variablesToAdd[1].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE);
         variablesToAdd[1].attributeId = UA_ATTRIBUTEID_VALUE;
         UA_Variant_setArray(&inputArguments[3], variablesToAdd, 2, &UA_TYPES[UA_TYPES_PUBLISHEDVARIABLEDATATYPE]);
 
@@ -297,7 +986,7 @@ START_TEST(AddAndRemovePublishedDataSetItems){
         UA_CallMethodResult result;
         UA_CallMethodResult_init(&result);
         result = UA_Server_call(server, &callMethodRequest);
-        ck_assert_int_eq(3, result.outputArgumentsSize);
+        ck_assert_uint_eq(3, result.outputArgumentsSize);
         ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
 
         //TODO checked correctness of created items
@@ -310,10 +999,87 @@ START_TEST(AddAndRemovePublishedDataSetItems){
         UA_Client_delete(client);
 } END_TEST
 
-START_TEST(AddAndRemoveWriterGroups){
+START_TEST(AddAndRemovePublishedDataSetItemsUsingClient){
         UA_StatusCode retVal;
-        UA_Client *client = UA_Client_new();
-        UA_ClientConfig_setDefault(UA_Client_getConfig(client));
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+        UA_Variant *inputArguments = (UA_Variant *) UA_calloc(4, (sizeof(UA_Variant)));
+
+        UA_String pdsName = UA_STRING("Test PDS");
+        UA_Variant_setScalar(&inputArguments[0], &pdsName, &UA_TYPES[UA_TYPES_STRING]);
+
+        UA_String *fieldNameAliases = (UA_String *) UA_calloc(2, sizeof(UA_String));
+        fieldNameAliases[0] = UA_STRING("field1");
+        fieldNameAliases[1] = UA_STRING("field2");
+        UA_Variant_setArray(&inputArguments[1], fieldNameAliases, 2, &UA_TYPES[UA_TYPES_STRING]);
+
+        UA_DataSetFieldFlags *dataSetFieldFlags = (UA_DataSetFieldFlags *) UA_calloc(2, sizeof(UA_DataSetFieldFlags));
+        dataSetFieldFlags[0] = UA_DATASETFIELDFLAGS_PROMOTEDFIELD;
+        dataSetFieldFlags[1] = UA_DATASETFIELDFLAGS_PROMOTEDFIELD;
+        UA_Variant_setArray(&inputArguments[2], dataSetFieldFlags, 2, &UA_TYPES[UA_TYPES_DATASETFIELDFLAGS]);
+
+        UA_PublishedVariableDataType *variablesToAdd = (UA_PublishedVariableDataType *) UA_calloc(2, sizeof(UA_PublishedVariableDataType));
+        variablesToAdd[0].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
+        variablesToAdd[0].attributeId = UA_ATTRIBUTEID_VALUE;
+        variablesToAdd[1].publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE);
+        variablesToAdd[1].attributeId = UA_ATTRIBUTEID_VALUE;
+        UA_Variant_setArray(&inputArguments[3], variablesToAdd, 2, &UA_TYPES[UA_TYPES_PUBLISHEDVARIABLEDATATYPE]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+        item.methodId =  UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_ADDPUBLISHEDDATAITEMS);
+        item.inputArguments = (UA_Variant*)inputArguments;
+        item.inputArgumentsSize = 4;
+
+        UA_NodeId dataSetItemsNodeId;
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(3, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+        if(response.results->outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
+            dataSetItemsNodeId = *((UA_NodeId *) response.results->outputArguments->data);
+        UA_CallResponse_clear(&response);
+
+        //Remove the publishedDataItems
+        UA_Variant inputArgument;
+        UA_Variant_init(&inputArgument);
+        UA_Variant_setScalar(&inputArgument, &dataSetItemsNodeId, &UA_TYPES[UA_TYPES_NODEID]);
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest_init(&item);
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBLISHEDDATASETS);
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_DATASETFOLDERTYPE_REMOVEPUBLISHEDDATASET);
+        item.inputArguments = (UA_Variant*)&inputArgument;
+        item.inputArgumentsSize = 1;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(0, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        UA_CallResponse_clear(&response);
+        UA_free(inputArguments);
+        UA_free(fieldNameAliases);
+        UA_free(dataSetFieldFlags);
+        UA_free(variablesToAdd);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+} END_TEST
+
+START_TEST(AddAndRemoveWriterGroupsUsingServer){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
         retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
         if(retVal != UA_STATUSCODE_GOOD) {
             UA_Client_delete(client);
@@ -325,7 +1091,6 @@ START_TEST(AddAndRemoveWriterGroups){
         UA_WriterGroupDataType writerGroupDataType;
         UA_WriterGroupDataType_init(&writerGroupDataType);
         writerGroupDataType.name = UA_STRING("TestWriterGroup");
-        writerGroupDataType.enabled = UA_TRUE;
         writerGroupDataType.publishingInterval = 500;
         writerGroupDataType.writerGroupId = 1234;
         UA_Variant_setScalar(inputArgument, &writerGroupDataType, &UA_TYPES[UA_TYPES_WRITERGROUPDATATYPE]);
@@ -341,7 +1106,7 @@ START_TEST(AddAndRemoveWriterGroups){
         UA_CallMethodResult_init(&result);
         result = UA_Server_call(server, &callMethodRequest);
         ck_assert_int_eq(result.statusCode, UA_STATUSCODE_GOOD);
-        ck_assert_int_eq(1, result.outputArgumentsSize);
+        ck_assert_uint_eq(1, result.outputArgumentsSize);
 
         UA_NodeId createdWriterGroup = UA_NODEID_NULL;
         if(result.outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
@@ -359,16 +1124,1639 @@ START_TEST(AddAndRemoveWriterGroups){
         UA_LocalizedText_clear(&writerGroupDisplayName);
 } END_TEST
 
+START_TEST(AddAndRemoveWriterGroupsUsingClient){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_NodeId createdConnection = addPubSubConnection();
+
+        UA_Variant *inputArgument = (UA_Variant *) UA_calloc(1, (sizeof(UA_Variant)));
+        UA_WriterGroupDataType writerGroupDataType;
+        UA_WriterGroupDataType_init(&writerGroupDataType);
+        writerGroupDataType.name = UA_STRING("TestWriterGroup");
+        writerGroupDataType.publishingInterval = 500;
+        writerGroupDataType.writerGroupId = 1234;
+        UA_Variant_setScalar(inputArgument, &writerGroupDataType, &UA_TYPES[UA_TYPES_WRITERGROUPDATATYPE]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = createdConnection;
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBCONNECTIONTYPE_ADDWRITERGROUP);
+        item.inputArguments = (UA_Variant*)inputArgument;
+        item.inputArgumentsSize = 1;
+
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        UA_NodeId createdWriterGroup = UA_NODEID_NULL;
+        if(response.results->outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
+            createdWriterGroup = *((UA_NodeId *) response.results->outputArguments->data);
+        UA_LocalizedText writerGroupDisplayName;
+        UA_LocalizedText_init(&writerGroupDisplayName);
+        retVal = UA_Server_readDisplayName(server, createdWriterGroup, &writerGroupDisplayName);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_String compareText = UA_STRING("TestWriterGroup");
+        ck_assert(UA_String_equal(&writerGroupDisplayName.text, &compareText) == UA_TRUE);
+        UA_CallResponse_clear(&response);
+
+        //Remove the Writergroup
+        UA_Variant_init(inputArgument);
+        UA_Variant_setScalar(inputArgument, &createdWriterGroup, &UA_TYPES[UA_TYPES_NODEID]);
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest_init(&item);
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = createdConnection;
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBCONNECTIONTYPE_REMOVEGROUP);
+        item.inputArguments = (UA_Variant*)inputArgument;
+        item.inputArgumentsSize = 1;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+        UA_free(inputArgument);
+
+        UA_CallResponse_clear(&response);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+        UA_LocalizedText_clear(&writerGroupDisplayName);
+} END_TEST
+
+START_TEST(AddNewPubSubConnectionWithReaderGroup){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_Variant publisherId;
+        UA_Variant_init(&publisherId);
+        UA_UInt32 publisherIdValue = 100;
+        UA_Variant_setScalar(&publisherId, &publisherIdValue , &UA_TYPES[UA_TYPES_UINT32]);
+
+        UA_PubSubConnectionDataType pubSubConnection;
+        UA_PubSubConnectionDataType_init(&pubSubConnection);
+        pubSubConnection.name = UA_STRING("Model Connection 2");
+        pubSubConnection.publisherId = publisherId;
+        pubSubConnection.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+
+        UA_ExtensionObject eo;
+        UA_NetworkAddressUrlDataType networkAddressDataType = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+        UA_NetworkAddressUrlDataType* identityToken = UA_NetworkAddressUrlDataType_new();
+        UA_NetworkAddressUrlDataType_init(identityToken);
+        UA_NetworkAddressUrlDataType_copy(&networkAddressDataType, identityToken);
+        eo.encoding = UA_EXTENSIONOBJECT_DECODED;
+        eo.content.decoded.type = &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE];
+        eo.content.decoded.data = identityToken;
+        pubSubConnection.address = eo;
+        pubSubConnection.connectionPropertiesSize = 2;
+        UA_KeyValuePair connectionOptions[2];
+        memset(connectionOptions, 0, sizeof(UA_KeyValuePair)* 2);
+        connectionOptions[0].key = UA_QUALIFIEDNAME(0, "ttl");
+        UA_UInt32 ttl = 10;
+        UA_Variant_setScalar(&connectionOptions[0].value, &ttl, &UA_TYPES[UA_TYPES_UINT32]);
+        connectionOptions[1].key = UA_QUALIFIEDNAME(0, "loopback");
+        UA_Boolean loopback = UA_FALSE;
+        UA_Variant_setScalar(&connectionOptions[1].value, &loopback, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        pubSubConnection.connectionProperties = connectionOptions;
+        pubSubConnection.readerGroupsSize = 1;
+        pubSubConnection.readerGroups = \
+            (UA_ReaderGroupDataType *)UA_calloc(pubSubConnection.readerGroupsSize, sizeof(UA_ReaderGroupDataType));
+        pubSubConnection.readerGroups->name = UA_STRING("TestReaderGroup");
+
+        UA_Variant inputArguments;
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &pubSubConnection, &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+        UA_ExtensionObject_clear(&eo);
+        UA_free(pubSubConnection.readerGroups);
+        UA_CallResponse_clear(&response);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+} END_TEST
+
+START_TEST(AddNewPubSubConnectionWithReaderGroupandDataSetReader){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_Variant publisherId;
+        UA_Variant_init(&publisherId);
+        UA_UInt32 publisherIdValue = 100;
+        UA_Variant_setScalar(&publisherId, &publisherIdValue , &UA_TYPES[UA_TYPES_UINT32]);
+
+        UA_PubSubConnectionDataType pubSubConnection;
+        UA_PubSubConnectionDataType_init(&pubSubConnection);
+        pubSubConnection.name = UA_STRING("Model Connection 2");
+        pubSubConnection.publisherId = publisherId;
+        pubSubConnection.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+
+        UA_ExtensionObject eo;
+        UA_NetworkAddressUrlDataType networkAddressDataType = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+        UA_NetworkAddressUrlDataType* identityToken = UA_NetworkAddressUrlDataType_new();
+        UA_NetworkAddressUrlDataType_init(identityToken);
+        UA_NetworkAddressUrlDataType_copy(&networkAddressDataType, identityToken);
+        eo.encoding = UA_EXTENSIONOBJECT_DECODED;
+        eo.content.decoded.type = &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE];
+        eo.content.decoded.data = identityToken;
+        pubSubConnection.address = eo;
+        pubSubConnection.connectionPropertiesSize = 2;
+        UA_KeyValuePair connectionOptions[2];
+        memset(connectionOptions, 0, sizeof(UA_KeyValuePair)* 2);
+        connectionOptions[0].key = UA_QUALIFIEDNAME(0, "ttl");
+        UA_UInt32 ttl = 10;
+        UA_Variant_setScalar(&connectionOptions[0].value, &ttl, &UA_TYPES[UA_TYPES_UINT32]);
+        connectionOptions[1].key = UA_QUALIFIEDNAME(0, "loopback");
+        UA_Boolean loopback = UA_FALSE;
+        UA_Variant_setScalar(&connectionOptions[1].value, &loopback, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        pubSubConnection.connectionProperties = connectionOptions;
+        pubSubConnection.readerGroupsSize = 1;
+        pubSubConnection.readerGroups = \
+            (UA_ReaderGroupDataType *)UA_calloc(pubSubConnection.readerGroupsSize, sizeof(UA_ReaderGroupDataType));
+        UA_TargetVariablesDataType targetVars;
+        pubSubConnection.readerGroups->name = UA_STRING("TestReaderGroup");
+        /* This CRUD fixture does not configure an SKS or group keys. Keep the
+         * ReaderGroup unsecured; security policy validation has dedicated
+         * coverage in the PubSub encryption suites. */
+        pubSubConnection.readerGroups->securityMode = UA_MESSAGESECURITYMODE_NONE;
+        UA_UInt32 groupPropertyValue = 42;
+        UA_KeyValuePair groupProperty;
+        memset(&groupProperty, 0, sizeof(groupProperty));
+        groupProperty.key = UA_QUALIFIEDNAME(0, "group-property");
+        UA_Variant_setScalar(&groupProperty.value, &groupPropertyValue,
+                             &UA_TYPES[UA_TYPES_UINT32]);
+        pubSubConnection.readerGroups->groupPropertiesSize = 1;
+        pubSubConnection.readerGroups->groupProperties = &groupProperty;
+        UA_BrokerDataSetReaderTransportDataType readerTransport;
+        UA_BrokerDataSetReaderTransportDataType_init(&readerTransport);
+        readerTransport.queueName = UA_STRING("reader-topic");
+        pubSubConnection.readerGroups->transportSettings.encoding =
+            UA_EXTENSIONOBJECT_DECODED;
+        pubSubConnection.readerGroups->transportSettings.content.decoded.type =
+            &UA_TYPES[UA_TYPES_BROKERDATASETREADERTRANSPORTDATATYPE];
+        pubSubConnection.readerGroups->transportSettings.content.decoded.data =
+            &readerTransport;
+        pubSubConnection.readerGroups->dataSetReadersSize = 1;
+        pubSubConnection.readerGroups->dataSetReaders = \
+                (UA_DataSetReaderDataType*)UA_calloc(pubSubConnection.readerGroups->dataSetReadersSize, sizeof(UA_DataSetReaderDataType));
+        pubSubConnection.readerGroups->dataSetReaders->name = UA_STRING("DataReader");
+        pubSubConnection.readerGroups->dataSetReaders->publisherId = publisherId;
+        pubSubConnection.readerGroups->dataSetReaders->dataSetWriterId = 62541;
+        pubSubConnection.readerGroups->dataSetReaders->writerGroupId = 150;
+        pubSubConnection.readerGroups->dataSetReaders->dataSetMetaData.name = UA_STRING("DataSet1");
+        UA_DataSetMetaDataType *pMetaData = &pubSubConnection.readerGroups->dataSetReaders->dataSetMetaData;
+        UA_DataSetMetaDataType_init (pMetaData);
+        pMetaData->name = UA_STRING ("DataSet 1");
+        pMetaData->configurationVersion.majorVersion = 7;
+        pMetaData->configurationVersion.minorVersion = 11;
+
+        /* Static definition of number of fields size to 4 to create four different
+        * targetVariables of distinct datatype
+        * Currently the publisher sends only DateTime data type */
+        UA_FieldMetaData fields[4] = {0};
+        pMetaData->fieldsSize = 4;
+        pMetaData->fields = fields;
+
+        /* DateTime DataType */
+        UA_FieldMetaData_init (&pMetaData->fields[0]);
+        UA_NodeId_copy (&UA_TYPES[UA_TYPES_DATETIME].typeId,
+                        &pMetaData->fields[0].dataType);
+        pMetaData->fields[0].builtInType = UA_NS0ID_DATETIME;
+        pMetaData->fields[0].name =  UA_STRING ("DateTime");
+        pMetaData->fields[0].valueRank = -1; /* scalar */
+        UA_UInt32 arrayDimensions[1] = {3};
+        pMetaData->fields[0].arrayDimensionsSize = 1;
+        pMetaData->fields[0].arrayDimensions = arrayDimensions;
+        pMetaData->fields[0].maxStringLength = 64;
+
+        /* Int32 DataType */
+        UA_FieldMetaData_init (&pMetaData->fields[1]);
+        UA_NodeId_copy(&UA_TYPES[UA_TYPES_INT32].typeId,
+                    &pMetaData->fields[1].dataType);
+        pMetaData->fields[1].builtInType = UA_NS0ID_INT32;
+        pMetaData->fields[1].name =  UA_STRING ("Int 32");
+        pMetaData->fields[1].valueRank = -1; /* scalar */
+
+        /* Int64 DataType */
+        UA_FieldMetaData_init (&pMetaData->fields[2]);
+        UA_NodeId_copy(&UA_TYPES[UA_TYPES_INT64].typeId,
+                    &pMetaData->fields[2].dataType);
+        pMetaData->fields[2].builtInType = UA_NS0ID_INT64;
+        pMetaData->fields[2].name =  UA_STRING ("Int64");
+        pMetaData->fields[2].valueRank = -1; /* scalar */
+
+        /* Boolean DataType */
+        UA_FieldMetaData_init (&pMetaData->fields[3]);
+        UA_NodeId_copy (&UA_TYPES[UA_TYPES_BOOLEAN].typeId,
+                        &pMetaData->fields[3].dataType);
+        pMetaData->fields[3].builtInType = UA_NS0ID_BOOLEAN;
+        pMetaData->fields[3].name =  UA_STRING ("BoolToggle");
+        pMetaData->fields[3].valueRank = -1; /* scalar */
+        /* Start with one target more than the metadata describes. This used to
+         * read past the fields array while constructing the target nodes. */
+        targetVars.targetVariablesSize = 5;
+        targetVars.targetVariables = (UA_FieldTargetDataType *)
+            UA_calloc(targetVars.targetVariablesSize, sizeof(UA_FieldTargetDataType));
+        UA_ExtensionObject extensionObjectTargetVars;
+        for(size_t i = 0; i < targetVars.targetVariablesSize; i++) {
+            /* For creating Targetvariables */
+            UA_FieldTargetDataType_init(&targetVars.targetVariables[i]);
+            targetVars.targetVariables[i].attributeId  = UA_ATTRIBUTEID_VALUE;
+            /* Keep the explicit target ids outside the dynamic PubSub node-id
+             * range. The old implementation ignored BadNodeIdExists here and
+             * made this test pass with missing target nodes. */
+            targetVars.targetVariables[i].targetNodeId =
+                UA_NODEID_NUMERIC(1, (UA_UInt32)i + 60000);
+            extensionObjectTargetVars.encoding = UA_EXTENSIONOBJECT_DECODED;
+            extensionObjectTargetVars.content.decoded.type = &UA_TYPES[UA_TYPES_TARGETVARIABLESDATATYPE];
+        }
+        extensionObjectTargetVars.content.decoded.data = &targetVars;
+        UA_DataSetReaderDataType *dataSetReader =
+            pubSubConnection.readerGroups->dataSetReaders;
+        dataSetReader->subscribedDataSet = extensionObjectTargetVars;
+        dataSetReader->dataSetFieldContentMask =
+            UA_DATASETFIELDCONTENTMASK_RAWDATA;
+        dataSetReader->messageReceiveTimeout = 1234.0;
+        UA_UadpDataSetReaderMessageDataType messageSettings;
+        UA_UadpDataSetReaderMessageDataType_init(&messageSettings);
+        messageSettings.networkMessageContentMask =
+            UA_UADPNETWORKMESSAGECONTENTMASK_PUBLISHERID |
+            UA_UADPNETWORKMESSAGECONTENTMASK_GROUPHEADER |
+            UA_UADPNETWORKMESSAGECONTENTMASK_WRITERGROUPID |
+            UA_UADPNETWORKMESSAGECONTENTMASK_PAYLOADHEADER;
+        messageSettings.dataSetMessageContentMask =
+            UA_UADPDATASETMESSAGECONTENTMASK_SEQUENCENUMBER;
+        dataSetReader->messageSettings.encoding = UA_EXTENSIONOBJECT_DECODED;
+        dataSetReader->messageSettings.content.decoded.type =
+            &UA_TYPES[UA_TYPES_UADPDATASETREADERMESSAGEDATATYPE];
+        dataSetReader->messageSettings.content.decoded.data = &messageSettings;
+        UA_Variant inputArguments;
+        UA_Variant_init(&inputArguments);
+        UA_Variant_setScalar(&inputArguments, &pubSubConnection, &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION);
+        item.inputArguments = (UA_Variant*)&inputArguments;
+        item.inputArgumentsSize = 1;
+
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_int_eq(response.results->statusCode,
+                         UA_STATUSCODE_BADINVALIDARGUMENT);
+        UA_CallResponse_clear(&response);
+
+        /* Retrying the same configuration with matching sizes must succeed.
+         * This also verifies that the rejected method call left no partial
+         * connection, group, reader, or target nodes behind. */
+        targetVars.targetVariablesSize = pMetaData->fieldsSize;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        UA_NodeId connectionId =
+            *(UA_NodeId *)response.results->outputArguments->data;
+        UA_NodeId readerGroupId = findSingleChildNode(
+            UA_QUALIFIEDNAME(0, "TestReaderGroup"), UA_NS0ID(HASCOMPONENT),
+            connectionId);
+        ck_assert(!UA_NodeId_isNull(&readerGroupId));
+        UA_NodeId dataSetReaderId = findSingleChildNode(
+            UA_QUALIFIEDNAME(0, "DataReader"), UA_NS0ID(HASDATASETREADER),
+            readerGroupId);
+        ck_assert(!UA_NodeId_isNull(&dataSetReaderId));
+
+        UA_ReaderGroupConfig readerGroupConfig;
+        memset(&readerGroupConfig, 0, sizeof(readerGroupConfig));
+        retVal = UA_Server_getReaderGroupConfig(server, readerGroupId,
+                                                &readerGroupConfig);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        ck_assert(UA_String_equal(&readerGroupConfig.securityGroupId,
+                                  &pubSubConnection.readerGroups->securityGroupId));
+        ck_assert_int_eq(readerGroupConfig.securityMode,
+                         UA_MESSAGESECURITYMODE_NONE);
+        ck_assert_uint_eq(readerGroupConfig.groupProperties.mapSize, 1);
+        ck_assert(readerGroupConfig.transportSettings.encoding ==
+                  UA_EXTENSIONOBJECT_DECODED);
+        ck_assert(readerGroupConfig.transportSettings.content.decoded.type ==
+                  &UA_TYPES[UA_TYPES_BROKERDATASETREADERTRANSPORTDATATYPE]);
+        UA_BrokerDataSetReaderTransportDataType *storedReaderTransport =
+            (UA_BrokerDataSetReaderTransportDataType *)
+                readerGroupConfig.transportSettings.content.decoded.data;
+        ck_assert(UA_String_equal(&storedReaderTransport->queueName,
+                                  &readerTransport.queueName));
+        UA_ReaderGroupConfig_clear(&readerGroupConfig);
+
+        UA_DataSetReaderConfig readerConfig;
+        memset(&readerConfig, 0, sizeof(readerConfig));
+        retVal = UA_Server_getDataSetReaderConfig(server, dataSetReaderId,
+                                                  &readerConfig);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        ck_assert_uint_eq(readerConfig.dataSetFieldContentMask,
+                          UA_DATASETFIELDCONTENTMASK_RAWDATA);
+        ck_assert_double_eq(readerConfig.messageReceiveTimeout, 1234.0);
+        ck_assert_uint_eq(readerConfig.dataSetMetaData.configurationVersion.majorVersion,
+                          7);
+        ck_assert_uint_eq(readerConfig.dataSetMetaData.configurationVersion.minorVersion,
+                          11);
+        ck_assert_uint_eq(readerConfig.dataSetMetaData.fields[0].arrayDimensionsSize,
+                          1);
+        ck_assert_uint_eq(readerConfig.dataSetMetaData.fields[0].arrayDimensions[0],
+                          3);
+        ck_assert_uint_eq(readerConfig.dataSetMetaData.fields[0].maxStringLength,
+                          64);
+        ck_assert(readerConfig.messageSettings.encoding ==
+                  UA_EXTENSIONOBJECT_DECODED);
+        ck_assert(readerConfig.messageSettings.content.decoded.type ==
+                  &UA_TYPES[UA_TYPES_UADPDATASETREADERMESSAGEDATATYPE]);
+        UA_UadpDataSetReaderMessageDataType *storedMessageSettings =
+            (UA_UadpDataSetReaderMessageDataType *)
+                readerConfig.messageSettings.content.decoded.data;
+        ck_assert_uint_eq(storedMessageSettings->dataSetMessageContentMask,
+                          UA_UADPDATASETMESSAGECONTENTMASK_SEQUENCENUMBER);
+        UA_DataSetReaderConfig_clear(&readerConfig);
+        UA_NodeId_clear(&readerGroupId);
+        UA_NodeId_clear(&dataSetReaderId);
+
+        UA_ExtensionObject_clear(&eo);
+        UA_free(targetVars.targetVariables);
+        UA_free(pubSubConnection.readerGroups->dataSetReaders);
+        UA_free(pubSubConnection.readerGroups);
+        UA_CallResponse_clear(&response);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+} END_TEST
+
+START_TEST(AddandRemoveReaderGroup){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_NodeId createdConnection = addPubSubConnection();
+
+        UA_Variant *inputArgument = (UA_Variant *) UA_calloc(1, (sizeof(UA_Variant)));
+        UA_ReaderGroupDataType readerGroupDataType;
+        UA_ReaderGroupDataType_init(&readerGroupDataType);
+        readerGroupDataType.name = UA_STRING("TestReaderGroup");
+        UA_Variant_setScalar(inputArgument, &readerGroupDataType, &UA_TYPES[UA_TYPES_READERGROUPDATATYPE]);
+
+        //Call method from client
+        UA_CallRequest callMethodRequestFromClient;
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest item;
+        UA_CallMethodRequest_init(&item);
+
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = createdConnection;
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBCONNECTIONTYPE_ADDREADERGROUP);
+        item.inputArguments = (UA_Variant*)inputArgument;
+        item.inputArgumentsSize = 1;
+
+        UA_CallResponse response;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_uint_eq(1, response.results->outputArgumentsSize);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+
+        UA_NodeId createdReaderGroup = UA_NODEID_NULL;
+        if(response.results->outputArguments->type == &UA_TYPES[UA_TYPES_NODEID])
+            createdReaderGroup = *((UA_NodeId *) response.results->outputArguments->data);
+        UA_LocalizedText readerGroupDisplayName;
+        UA_LocalizedText_init(&readerGroupDisplayName);
+        retVal = UA_Server_readDisplayName(server, createdReaderGroup, &readerGroupDisplayName);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_String compareText = UA_STRING("TestReaderGroup");
+        ck_assert(UA_String_equal(&readerGroupDisplayName.text, &compareText) == UA_TRUE);
+        UA_CallResponse_clear(&response);
+
+        //Remove the ReaderGroup
+        UA_Variant_init(inputArgument);
+        UA_Variant_setScalar(inputArgument, &createdReaderGroup, &UA_TYPES[UA_TYPES_NODEID]);
+        UA_CallRequest_init(&callMethodRequestFromClient);
+        UA_CallMethodRequest_init(&item);
+        callMethodRequestFromClient.methodsToCall = &item;
+        callMethodRequestFromClient.methodsToCallSize = 1;
+        item.objectId = createdConnection;
+        item.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBCONNECTIONTYPE_REMOVEGROUP);
+        item.inputArguments = (UA_Variant*)inputArgument;
+        item.inputArgumentsSize = 1;
+        response = UA_Client_Service_call(client, callMethodRequestFromClient);
+        ck_assert_int_eq(response.results->statusCode, UA_STATUSCODE_GOOD);
+        UA_free(inputArgument);
+
+        UA_CallResponse_clear(&response);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+        UA_LocalizedText_clear(&readerGroupDisplayName);
+} END_TEST
+
+START_TEST(ReserveIdsMultipleTimes){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+        UA_Variant defaultPublisherId;
+        const UA_UInt16 numRegWriterGroupIds = 3;
+        const UA_UInt16 numRegDataSetWriterIds = 3;
+        const UA_UInt16 firstId = 0x8000;
+        const UA_UInt16 lastId = UA_UINT16_MAX;
+
+        UA_Variant regWriterGroupIds;
+        UA_Variant regDataSetWriterIds;
+        UA_String transportProfileUri =
+            UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+
+        /* Call ReserveIds 1st time - reserve some IDs. */
+        retVal = CallReserveIds(client, &transportProfileUri, numRegWriterGroupIds, numRegDataSetWriterIds,
+            &defaultPublisherId, &regWriterGroupIds, &regDataSetWriterIds);
+        ck_assert(UA_StatusCode_isGood(retVal));
+
+        /* Create PubSubConfiguration using some of the reserved IDs. */
+        UA_PubSubConnectionConfig connectionConfig;
+        memset (&connectionConfig, 0, sizeof(UA_PubSubConnectionConfig));
+        connectionConfig.name = UA_STRING("TestConnection");
+        connectionConfig.transportProfileUri = transportProfileUri;
+        UA_NetworkAddressUrlDataType networkAddressUrl;
+        UA_NetworkAddressUrlDataType_init(&networkAddressUrl);
+        networkAddressUrl.url = UA_STRING("opc.udp://224.0.0.22:4840");
+        UA_Variant_setScalar(&connectionConfig.address, &networkAddressUrl,
+                            &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
+        UA_NodeId connectionNodeId, writerGroupNodeId, dataSetWriterNodeId, publishedDataSetNodeId;
+        retVal |= UA_Server_addPubSubConnection (server, &connectionConfig, &connectionNodeId);
+
+        UA_WriterGroupConfig writerGroupConfig;
+        memset(&writerGroupConfig, 0, sizeof(UA_WriterGroupConfig));
+        writerGroupConfig.name = UA_STRING("TestWriterGroup");
+        writerGroupConfig.writerGroupId = ((UA_UInt16 *)regWriterGroupIds.data)[0]; // Here use the reserved WriterGroupId
+
+        retVal |= UA_Server_addWriterGroup(server, connectionNodeId, &writerGroupConfig, &writerGroupNodeId);
+
+        UA_PublishedDataSetConfig publishedDataSetConfig;
+        memset(&publishedDataSetConfig, 0, sizeof(UA_PublishedDataSetConfig));
+        publishedDataSetConfig.name = UA_STRING("TestPublishedDataSet");
+        retVal |= UA_Server_addPublishedDataSet(server, &publishedDataSetConfig, &publishedDataSetNodeId).addResult;
+
+        UA_DataSetWriterConfig dataSetWriterConfig;
+        memset(&dataSetWriterConfig, 0, sizeof(UA_DataSetWriterConfig));
+        dataSetWriterConfig.name = UA_STRING("TestDataSetWriter");
+        dataSetWriterConfig.dataSetWriterId = ((UA_UInt16 *)regDataSetWriterIds.data)[0]; // Here use the reserved DataSetWriterId
+        retVal |= UA_Server_addDataSetWriter(server, writerGroupNodeId, publishedDataSetNodeId, &dataSetWriterConfig, &dataSetWriterNodeId);
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+        UA_Variant_clear(&defaultPublisherId);
+        UA_Variant_clear(&regWriterGroupIds);
+        UA_Variant_clear(&regDataSetWriterIds);
+
+        /* Call ReserveIds 2nd time within the same session and try to reserve
+         * as many IDs as needed to consume the whole pool (and roll over the ID counter). */
+        retVal = CallReserveIds(client, &transportProfileUri,
+            (UA_UInt16)(lastId - firstId - numRegWriterGroupIds + 1),
+            (UA_UInt16)(lastId - firstId - numRegDataSetWriterIds + 1),
+            &defaultPublisherId, &regWriterGroupIds, &regDataSetWriterIds);
+        ck_assert(UA_StatusCode_isGood(retVal));
+
+        UA_Variant_clear(&defaultPublisherId);
+        UA_Variant_clear(&regWriterGroupIds);
+        UA_Variant_clear(&regDataSetWriterIds);
+
+        /* Call ReserveIds 3rd time within the same session and try to reserve one more ID from each category -
+         * check if the already reserved IDs are blocked. */
+
+        /* Currently the return value is not checked, once the lower assert statement is re-inserted,
+         * the return value can also be saved. Otherwise there will be an error in the Clang static analyzer
+         * (warning: value stored in 'retVal' is never read). */
+        CallReserveIds(client, &transportProfileUri, 1, 1,
+            &defaultPublisherId, &regWriterGroupIds, &regDataSetWriterIds);
+        /* TODO: Currently Part 14 doesn't define what should happen if the ID cannot be reserved.
+         * There is an open Mantis issue #8415. */
+//        ck_assert(UA_StatusCode_isBad(retVal));
+        ck_assert_uint_eq(regWriterGroupIds.arrayLength, 1);
+        ck_assert_uint_eq(((UA_UInt16 *)regWriterGroupIds.data)[0], 0);
+        ck_assert_uint_eq(regDataSetWriterIds.arrayLength, 1);
+        ck_assert_uint_eq(((UA_UInt16 *)regDataSetWriterIds.data)[0], 0);
+
+        UA_Variant_clear(&defaultPublisherId);
+        UA_Variant_clear(&regWriterGroupIds);
+        UA_Variant_clear(&regDataSetWriterIds);
+
+        /* Reconnect client - previous reservations shall be cancelled. */
+        UA_Client_disconnect(client);
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+        /* Call ReserveIds again - check if the new reservation takes into account
+         * the IDs already being used by PubSub configuration. */
+        retVal = CallReserveIds(client, &transportProfileUri, numRegWriterGroupIds, numRegDataSetWriterIds,
+            &defaultPublisherId, &regWriterGroupIds, &regDataSetWriterIds);
+        ck_assert(UA_StatusCode_isGood(retVal));
+
+        /* Check reserved WriterGroupIds */
+        ck_assert_str_eq("UInt16", regWriterGroupIds.type->typeName);
+        ck_assert_uint_eq(numRegWriterGroupIds, regWriterGroupIds.arrayLength);
+        for(size_t i = 0; i < regWriterGroupIds.arrayLength; i++) {
+            ck_assert_uint_eq(firstId + i + 1, ((UA_UInt16 *)regWriterGroupIds.data)[i]); // Here check if the reservations started from 0x8000 + 1
+        }
+
+        /* Check reserved DataSetWriterIds */
+        ck_assert_str_eq("UInt16", regDataSetWriterIds.type->typeName);
+        ck_assert_uint_eq(numRegDataSetWriterIds, regDataSetWriterIds.arrayLength);
+        for(size_t i = 0; i < regDataSetWriterIds.arrayLength; i++) {
+            ck_assert_uint_eq(firstId + i + 1, ((UA_UInt16 *)regDataSetWriterIds.data)[i]); // Here check if the reservations started from 0x8000 + 1
+        }
+
+        UA_Variant_clear(&defaultPublisherId);
+        UA_Variant_clear(&regWriterGroupIds);
+        UA_Variant_clear(&regDataSetWriterIds);
+
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+} END_TEST
+
+START_TEST(ReserveIdsInvalidTransportUri){
+        UA_StatusCode retVal;
+        UA_Client *client = UA_Client_newForUnitTest();
+        retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+        if(retVal != UA_STATUSCODE_GOOD) {
+            UA_Client_delete(client);
+        }
+        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+        UA_Variant *inputArguments = (UA_Variant *) UA_calloc(3, (sizeof(UA_Variant)));
+        UA_String transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/mqtt");
+        UA_Variant_setScalar(&inputArguments[0], &transportProfileUri, &UA_TYPES[UA_TYPES_STRING]);
+        UA_UInt16 numRegWriterGroupIds = 6;
+        UA_Variant_setScalar(&inputArguments[1], &numRegWriterGroupIds, &UA_TYPES[UA_TYPES_UINT16]);
+        UA_UInt16 numRegDataSetWriterIds = 5;
+        UA_Variant_setScalar(&inputArguments[2], &numRegDataSetWriterIds, &UA_TYPES[UA_TYPES_UINT16]);
+
+        UA_CallMethodRequest callMethodRequest;
+        UA_CallMethodRequest_init(&callMethodRequest);
+        callMethodRequest.inputArgumentsSize = 3;
+        callMethodRequest.inputArguments = inputArguments;
+        callMethodRequest.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBSUBCONFIGURATION);
+        callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_PUBSUBCONFIGURATION_RESERVEIDS);
+
+        UA_CallMethodResult result;
+        UA_CallMethodResult_init(&result);
+        result = UA_Server_call(server, &callMethodRequest);
+        ck_assert_int_eq(result.statusCode, UA_STATUSCODE_BADINVALIDARGUMENT);
+
+        UA_free(inputArguments);
+
+        UA_CallMethodResult_clear(&result);
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+    } END_TEST
+
+START_TEST(TestPubSubStatusStateReading){
+    UA_StatusCode retVal;
+    UA_Client *client = UA_Client_newForUnitTest();
+    retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    if(retVal != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+    }
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId connectionId = addPubSubConnection();
+    ck_assert(!UA_NodeId_isNull(&connectionId));
+
+    UA_QualifiedName statusQualifiedName = UA_QUALIFIEDNAME(0, "Status");
+    UA_NodeId statusNodeId = findSingleChildNode(statusQualifiedName, 
+                                                UA_NS0ID(HASCOMPONENT), connectionId);
+    ck_assert(!UA_NodeId_isNull(&statusNodeId));
+
+    UA_QualifiedName stateQualifiedName = UA_QUALIFIEDNAME(0, "State");
+    UA_NodeId stateNodeId = findSingleChildNode(stateQualifiedName, 
+                                               UA_NS0ID(HASCOMPONENT), statusNodeId);
+    ck_assert(!UA_NodeId_isNull(&stateNodeId));
+
+    UA_Variant stateValue;
+    UA_Variant_init(&stateValue);
+    retVal = UA_Client_readValueAttribute(client, stateNodeId, &stateValue);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    ck_assert(stateValue.type == &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert_int_eq(*(UA_Int32*)stateValue.data, UA_PUBSUBSTATE_DISABLED);
+
+    UA_NodeId stateDataType;
+    retVal = UA_Client_readDataTypeAttribute(client, stateNodeId, &stateDataType);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    ck_assert(UA_NodeId_equal(&stateDataType, &UA_TYPES[UA_TYPES_PUBSUBSTATE].typeId));
+
+    UA_Variant_clear(&stateValue);
+    UA_NodeId_clear(&connectionId);
+    UA_NodeId_clear(&statusNodeId);
+    UA_NodeId_clear(&stateNodeId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(TestEnableDisablePubSubConnection){
+    UA_StatusCode retVal;
+    UA_Client *client = UA_Client_newForUnitTest();
+    retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    if(retVal != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+    }
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId connectionId = addPubSubConnection();
+    ck_assert(!UA_NodeId_isNull(&connectionId));
+
+    UA_CallRequest callRequest;
+    UA_CallRequest_init(&callRequest);
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+
+    callRequest.methodsToCall = &callMethodRequest;
+    callRequest.methodsToCallSize = 1;
+    
+    UA_QualifiedName statusQualifiedName = UA_QUALIFIEDNAME(0, "Status");
+    UA_NodeId statusNodeId = findSingleChildNode(statusQualifiedName, 
+                                                UA_NS0ID(HASCOMPONENT), connectionId);
+    ck_assert(!UA_NodeId_isNull(&statusNodeId));
+
+    callMethodRequest.objectId = statusNodeId;
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_ENABLE);
+
+    UA_CallResponse callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+
+    UA_QualifiedName stateQualifiedName = UA_QUALIFIEDNAME(0, "State");
+    UA_NodeId stateNodeId = findSingleChildNode(stateQualifiedName, 
+                                               UA_NS0ID(HASCOMPONENT), statusNodeId);
+    
+    UA_Variant stateValue;
+    UA_Variant_init(&stateValue);
+    retVal = UA_Client_readValueAttribute(client, stateNodeId, &stateValue);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    UA_PubSubState state = *(UA_PubSubState*)stateValue.data;
+    ck_assert(state != UA_PUBSUBSTATE_DISABLED);
+
+    UA_CallResponse_clear(&callResponse);
+
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_DISABLE);
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+
+    UA_Variant_clear(&stateValue);
+    retVal = UA_Client_readValueAttribute(client, stateNodeId, &stateValue);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    state = *(UA_PubSubState*)stateValue.data;
+    ck_assert_int_eq(state, UA_PUBSUBSTATE_DISABLED);
+
+    UA_Variant_clear(&stateValue);
+    UA_CallResponse_clear(&callResponse);
+    UA_NodeId_clear(&connectionId);
+    UA_NodeId_clear(&statusNodeId);
+    UA_NodeId_clear(&stateNodeId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(TestEnableDisableWriterGroup){
+    UA_StatusCode retVal;
+    UA_Client *client = UA_Client_newForUnitTest();
+    retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    if(retVal != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+    }
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId connectionId = addPubSubConnection();
+    ck_assert(!UA_NodeId_isNull(&connectionId));
+    addPublishedDataSets();
+
+    UA_Variant *inputArguments = (UA_Variant*)UA_calloc(1, sizeof(UA_Variant));
+    UA_WriterGroupDataType writerGroupDataType;
+    UA_WriterGroupDataType_init(&writerGroupDataType);
+    writerGroupDataType.name = UA_STRING("TestWriterGroup");
+    writerGroupDataType.publishingInterval = 500;
+    writerGroupDataType.writerGroupId = 1234;
+    UA_Variant_setScalar(&inputArguments[0], &writerGroupDataType, &UA_TYPES[UA_TYPES_WRITERGROUPDATATYPE]);
+
+    UA_CallRequest callRequest;
+    UA_CallRequest_init(&callRequest);
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+
+    callRequest.methodsToCall = &callMethodRequest;
+    callRequest.methodsToCallSize = 1;
+    callMethodRequest.objectId = connectionId;
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBCONNECTIONTYPE_ADDWRITERGROUP);
+    callMethodRequest.inputArguments = inputArguments;
+    callMethodRequest.inputArgumentsSize = 1;
+
+    UA_CallResponse callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(callResponse.results[0].outputArgumentsSize, 1);
+
+    UA_NodeId writerGroupId = UA_NODEID_NULL;
+    if(callResponse.results[0].outputArguments[0].type == &UA_TYPES[UA_TYPES_NODEID])
+        UA_NodeId_copy((UA_NodeId*)callResponse.results[0].outputArguments[0].data, &writerGroupId);
+
+    UA_CallResponse_clear(&callResponse);
+    UA_free(inputArguments);
+
+    UA_QualifiedName statusQualifiedName = UA_QUALIFIEDNAME(0, "Status");
+    UA_NodeId writerGroupStatusId = findSingleChildNode(statusQualifiedName, 
+                                                       UA_NS0ID(HASCOMPONENT), writerGroupId);
+    ck_assert(!UA_NodeId_isNull(&writerGroupStatusId));
+
+    callMethodRequest.objectId = writerGroupStatusId;
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_ENABLE);
+    callMethodRequest.inputArguments = NULL;
+    callMethodRequest.inputArgumentsSize = 0;
+
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    
+    ck_assert(callResponse.results[0].statusCode == UA_STATUSCODE_GOOD ||
+              callResponse.results[0].statusCode == UA_STATUSCODE_BADINVALIDSTATE);
+
+    UA_CallResponse_clear(&callResponse);
+
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_DISABLE);
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    
+    ck_assert(callResponse.results[0].statusCode == UA_STATUSCODE_GOOD || 
+              callResponse.results[0].statusCode == UA_STATUSCODE_BADINVALIDSTATE);
+
+    UA_CallResponse_clear(&callResponse);
+    UA_NodeId_clear(&connectionId);
+    UA_NodeId_clear(&writerGroupId);
+    UA_NodeId_clear(&writerGroupStatusId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(TestEnableDisableReaderGroup){
+    UA_StatusCode retVal;
+    UA_Client *client = UA_Client_newForUnitTest();
+    retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    if(retVal != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+    }
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId connectionId = addPubSubConnection();
+    ck_assert(!UA_NodeId_isNull(&connectionId));
+
+    UA_Variant *inputArguments = (UA_Variant*)UA_calloc(1, sizeof(UA_Variant));
+    UA_ReaderGroupDataType readerGroupDataType;
+    UA_ReaderGroupDataType_init(&readerGroupDataType);
+    readerGroupDataType.name = UA_STRING("TestReaderGroup");
+    UA_Variant_setScalar(&inputArguments[0], &readerGroupDataType, &UA_TYPES[UA_TYPES_READERGROUPDATATYPE]);
+
+    UA_CallRequest callRequest;
+    UA_CallRequest_init(&callRequest);
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+
+    callRequest.methodsToCall = &callMethodRequest;
+    callRequest.methodsToCallSize = 1;
+    callMethodRequest.objectId = connectionId;
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBCONNECTIONTYPE_ADDREADERGROUP);
+    callMethodRequest.inputArguments = inputArguments;
+    callMethodRequest.inputArgumentsSize = 1;
+
+    UA_CallResponse callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(callResponse.results[0].outputArgumentsSize, 1);
+
+    UA_NodeId readerGroupId = UA_NODEID_NULL;
+    if(callResponse.results[0].outputArguments[0].type == &UA_TYPES[UA_TYPES_NODEID])
+        UA_NodeId_copy((UA_NodeId*)callResponse.results[0].outputArguments[0].data, &readerGroupId);
+
+    UA_CallResponse_clear(&callResponse);
+    UA_free(inputArguments);
+
+    UA_QualifiedName statusQualifiedName = UA_QUALIFIEDNAME(0, "Status");
+    UA_NodeId readerGroupStatusId = findSingleChildNode(statusQualifiedName, 
+                                                       UA_NS0ID(HASCOMPONENT), readerGroupId);
+    ck_assert(!UA_NodeId_isNull(&readerGroupStatusId));
+
+    callMethodRequest.objectId = readerGroupStatusId;
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_ENABLE);
+    callMethodRequest.inputArguments = NULL;
+    callMethodRequest.inputArgumentsSize = 0;
+
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    
+    ck_assert(callResponse.results[0].statusCode == UA_STATUSCODE_GOOD ||
+              callResponse.results[0].statusCode == UA_STATUSCODE_BADINVALIDSTATE);
+
+    UA_CallResponse_clear(&callResponse);
+
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_DISABLE);
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    
+    ck_assert(callResponse.results[0].statusCode == UA_STATUSCODE_GOOD || 
+              callResponse.results[0].statusCode == UA_STATUSCODE_BADINVALIDSTATE);
+
+    UA_CallResponse_clear(&callResponse);
+    UA_NodeId_clear(&connectionId);
+    UA_NodeId_clear(&readerGroupId);
+    UA_NodeId_clear(&readerGroupStatusId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(TestEnableDisableDataSetWriter){
+    UA_StatusCode retVal;
+    UA_Client *client = UA_Client_newForUnitTest();
+    retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    if(retVal != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+    }
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId connectionId = addPubSubConnection();
+    ck_assert(!UA_NodeId_isNull(&connectionId));
+
+    UA_WriterGroupConfig wgConfig;
+    memset(&wgConfig, 0, sizeof(wgConfig));
+    wgConfig.name = UA_STRING("DSWStatusWG");
+    wgConfig.publishingInterval = 250;
+    UA_NodeId writerGroupId = UA_NODEID_NULL;
+    retVal = UA_Server_addWriterGroup(server, connectionId, &wgConfig, &writerGroupId);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_PublishedDataSetConfig pdsConfig;
+    memset(&pdsConfig, 0, sizeof(pdsConfig));
+    pdsConfig.publishedDataSetType = UA_PUBSUB_DATASET_PUBLISHEDITEMS;
+    pdsConfig.name = UA_STRING("DSWStatusPDS");
+    UA_NodeId pdsId = UA_NODEID_NULL;
+    retVal = UA_Server_addPublishedDataSet(server, &pdsConfig, &pdsId).addResult;
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_DataSetWriterConfig dswConfig;
+    memset(&dswConfig, 0, sizeof(dswConfig));
+    dswConfig.name = UA_STRING("DSWStatus");
+    dswConfig.dataSetWriterId = 3210;
+    UA_NodeId dswId = UA_NODEID_NULL;
+    retVal = UA_Server_addDataSetWriter(server, writerGroupId, pdsId, &dswConfig, &dswId);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId dswStatusId = findSingleChildNode(UA_QUALIFIEDNAME(0, "Status"),
+                                                UA_NS0ID(HASCOMPONENT), dswId);
+    ck_assert(!UA_NodeId_isNull(&dswStatusId));
+
+    UA_CallRequest callRequest;
+    UA_CallRequest_init(&callRequest);
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+    callRequest.methodsToCall = &callMethodRequest;
+    callRequest.methodsToCallSize = 1;
+    callMethodRequest.objectId = dswStatusId;
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_ENABLE);
+
+    UA_CallResponse callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    UA_StatusCode firstEnable = callResponse.results[0].statusCode;
+    ck_assert(firstEnable == UA_STATUSCODE_GOOD ||
+              firstEnable == UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    if(firstEnable == UA_STATUSCODE_GOOD)
+        ck_assert_int_eq(callResponse.results[0].statusCode,
+                         UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_DISABLE);
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    UA_StatusCode firstDisable = callResponse.results[0].statusCode;
+    ck_assert(firstDisable == UA_STATUSCODE_GOOD ||
+              firstDisable == UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    if(firstDisable == UA_STATUSCODE_GOOD)
+        ck_assert_int_eq(callResponse.results[0].statusCode,
+                         UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    UA_NodeId_clear(&connectionId);
+    UA_NodeId_clear(&writerGroupId);
+    UA_NodeId_clear(&pdsId);
+    UA_NodeId_clear(&dswId);
+    UA_NodeId_clear(&dswStatusId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(TestEnableDisableDataSetReader){
+    UA_StatusCode retVal;
+    UA_Client *client = UA_Client_newForUnitTest();
+    retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    if(retVal != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+    }
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId connectionId = addPubSubConnection();
+    ck_assert(!UA_NodeId_isNull(&connectionId));
+
+    UA_ReaderGroupConfig rgConfig;
+    memset(&rgConfig, 0, sizeof(rgConfig));
+    rgConfig.name = UA_STRING("DSRStatusRG");
+    UA_NodeId readerGroupId = UA_NODEID_NULL;
+    retVal = UA_Server_addReaderGroup(server, connectionId, &rgConfig, &readerGroupId);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_DataSetReaderConfig dsrConfig;
+    memset(&dsrConfig, 0, sizeof(dsrConfig));
+    dsrConfig.name = UA_STRING("DSRStatus");
+    UA_NodeId dsrId = UA_NODEID_NULL;
+    retVal = UA_Server_addDataSetReader(server, readerGroupId, &dsrConfig, &dsrId);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_NodeId dsrStatusId = findSingleChildNode(UA_QUALIFIEDNAME(0, "Status"),
+                                                UA_NS0ID(HASCOMPONENT), dsrId);
+    ck_assert(!UA_NodeId_isNull(&dsrStatusId));
+
+    UA_CallRequest callRequest;
+    UA_CallRequest_init(&callRequest);
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+    callRequest.methodsToCall = &callMethodRequest;
+    callRequest.methodsToCallSize = 1;
+    callMethodRequest.objectId = dsrStatusId;
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_ENABLE);
+
+    UA_CallResponse callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    UA_StatusCode firstEnable = callResponse.results[0].statusCode;
+    ck_assert(firstEnable == UA_STATUSCODE_GOOD ||
+              firstEnable == UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    if(firstEnable == UA_STATUSCODE_GOOD)
+        ck_assert_int_eq(callResponse.results[0].statusCode,
+                         UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    callMethodRequest.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_DISABLE);
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    UA_StatusCode firstDisable = callResponse.results[0].statusCode;
+    ck_assert(firstDisable == UA_STATUSCODE_GOOD ||
+              firstDisable == UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    if(firstDisable == UA_STATUSCODE_GOOD)
+        ck_assert_int_eq(callResponse.results[0].statusCode,
+                         UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    UA_NodeId_clear(&connectionId);
+    UA_NodeId_clear(&readerGroupId);
+    UA_NodeId_clear(&dsrId);
+    UA_NodeId_clear(&dsrStatusId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(TestEnableDisableTopLevelPublishSubscribe){
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retVal = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    /* Make a child operational before disabling the root. The root method
+     * must use the manager lifecycle and disable its children, not merely
+     * overwrite the manager state. */
+    UA_NodeId connectionId = addPubSubConnection();
+    ck_assert(!UA_NodeId_isNull(&connectionId));
+    UA_NodeId connectionStatusId = findSingleChildNode(
+        UA_QUALIFIEDNAME(0, "Status"), UA_NS0ID(HASCOMPONENT), connectionId);
+    ck_assert(!UA_NodeId_isNull(&connectionStatusId));
+    UA_NodeId connectionStateId = findSingleChildNode(
+        UA_QUALIFIEDNAME(0, "State"), UA_NS0ID(HASCOMPONENT),
+        connectionStatusId);
+    ck_assert(!UA_NodeId_isNull(&connectionStateId));
+
+    UA_CallRequest callRequest;
+    UA_CallRequest_init(&callRequest);
+    UA_CallMethodRequest callMethodRequest;
+    UA_CallMethodRequest_init(&callMethodRequest);
+    callRequest.methodsToCall = &callMethodRequest;
+    callRequest.methodsToCallSize = 1;
+
+    callMethodRequest.objectId = connectionStatusId;
+    callMethodRequest.methodId =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_ENABLE);
+    UA_CallResponse callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    UA_CallResponse_clear(&callResponse);
+
+    UA_Variant stateValue;
+    UA_Variant_init(&stateValue);
+    retVal = UA_Client_readValueAttribute(client, connectionStateId, &stateValue);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    ck_assert_int_ne(*(UA_PubSubState*)stateValue.data,
+                     UA_PUBSUBSTATE_DISABLED);
+    UA_Variant_clear(&stateValue);
+
+    callMethodRequest.objectId =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+    callMethodRequest.methodId =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_DISABLE);
+
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    UA_CallResponse_clear(&callResponse);
+
+    retVal = UA_Client_readValueAttribute(client, connectionStateId, &stateValue);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(*(UA_PubSubState*)stateValue.data,
+                     UA_PUBSUBSTATE_DISABLED);
+    UA_Variant_clear(&stateValue);
+
+    /* Root Enable starts the manager through its driver lifecycle. */
+    callMethodRequest.methodId =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_ENABLE);
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    UA_CallResponse_clear(&callResponse);
+
+    /* Calling Enable a second time when already enabled exercises the
+     * BADINVALIDSTATE return path. */
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode,
+                     UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    /* And disable */
+    callMethodRequest.methodId =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBSUBSTATUSTYPE_DISABLE);
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    UA_CallResponse_clear(&callResponse);
+
+    /* And disable again (already disabled) -> BADINVALIDSTATE */
+    callResponse = UA_Client_Service_call(client, callRequest);
+    ck_assert_int_eq(callResponse.resultsSize, 1);
+    ck_assert_int_eq(callResponse.results[0].statusCode,
+                     UA_STATUSCODE_BADINVALIDSTATE);
+    UA_CallResponse_clear(&callResponse);
+
+    UA_NodeId_clear(&connectionId);
+    UA_NodeId_clear(&connectionStatusId);
+    UA_NodeId_clear(&connectionStateId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(FailedConnectionCreationRemovesEarlierGroups) {
+    UA_PubSubConnectionDataType connection = {0};
+    connection.name = UA_STRING("AtomicConnection");
+    UA_UInt16 publisher = 123;
+    UA_Variant_setScalar(&connection.publisherId, &publisher, &UA_TYPES[UA_TYPES_UINT16]);
+    connection.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+    UA_NetworkAddressUrlDataType address = UA_PUBSUB_TEST_NETWORKADDRESSURL("opc.udp://127.0.0.1:4841/");
+    UA_ExtensionObject_setValueNoDelete(&connection.address, &address,
+                                       &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
+    UA_WriterGroupDataType groups[2];
+    memset(groups, 0, sizeof(groups));
+    UA_UadpWriterGroupMessageDataType settings = {0};
+    for(size_t i = 0; i < 2; i++) {
+        groups[i].name = i == 0 ? UA_STRING("First") : UA_STRING("Rejected");
+        groups[i].writerGroupId = (UA_UInt16)(100 + i);
+        groups[i].publishingInterval = 50;
+        UA_ExtensionObject_setValueNoDelete(&groups[i].messageSettings, &settings,
+                                           &UA_TYPES[UA_TYPES_UADPWRITERGROUPMESSAGEDATATYPE]);
+    }
+    UA_DataSetWriterDataType writer = {0};
+    writer.name = UA_STRING("MissingDatasetWriter");
+    writer.dataSetName = UA_STRING("MissingDataset");
+    groups[1].dataSetWritersSize = 1;
+    groups[1].dataSetWriters = &writer;
+    connection.writerGroupsSize = 2;
+    connection.writerGroups = groups;
+    UA_Variant input;
+    UA_Variant_setScalar(&input, &connection, &UA_TYPES[UA_TYPES_PUBSUBCONNECTIONDATATYPE]);
+    UA_CallMethodRequest request = {0};
+    request.objectId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE);
+    request.methodId = UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION);
+    request.inputArgumentsSize = 1;
+    request.inputArguments = &input;
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    ck_assert_uint_eq(result.statusCode, UA_STATUSCODE_BADPARENTNODEIDINVALID);
+    UA_CallMethodResult_clear(&result);
+    UA_NodeId connectionId = findSingleChildNode(UA_QUALIFIEDNAME(0, "AtomicConnection"),
+        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPUBSUBCONNECTION), request.objectId);
+    ck_assert(UA_NodeId_isNull(&connectionId));
+    UA_NodeId_clear(&connectionId);
+} END_TEST
+
+START_TEST(PublishedItemsTemplatePreservesContract) {
+    UA_PublishedVariableDataType variable = {0};
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Double initial = 1.0;
+    attr.dataType = UA_NODEID_NUMERIC(0, UA_NS0ID_DOUBLE);
+    attr.valueRank = UA_VALUERANK_SCALAR;
+    UA_Variant_setScalar(&attr.value, &initial, &UA_TYPES[UA_TYPES_DOUBLE]);
+    ck_assert_uint_eq(UA_Server_addVariableNode(server, UA_NODEID_NUMERIC(1, 9001),
+        UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER), UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
+        UA_QUALIFIEDNAME(1, "Source"), UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+        attr, NULL, NULL), UA_STATUSCODE_GOOD);
+    variable.publishedVariable = UA_NODEID_NUMERIC(1, 9001);
+    variable.attributeId = UA_ATTRIBUTEID_VALUE;
+    UA_FieldMetaData field = {0};
+    field.name = UA_STRING("Clock");
+    field.dataType = UA_NODEID_NUMERIC(0, UA_NS0ID_DOUBLE);
+    field.builtInType = 11;
+    field.valueRank = UA_VALUERANK_SCALAR;
+    field.dataSetFieldId = UA_Guid_random();
+    UA_PublishedDataSetConfig config = {0};
+    config.name = UA_STRING("Template");
+    config.publishedDataSetType = UA_PUBSUB_DATASET_PUBLISHEDITEMS_TEMPLATE;
+    config.config.itemsTemplate.variablesToAddSize = 1;
+    config.config.itemsTemplate.variablesToAdd = &variable;
+    UA_DataSetMetaDataType *metadata = &config.config.itemsTemplate.metaData;
+    metadata->name = config.name;
+    metadata->fieldsSize = 1;
+    metadata->fields = &field;
+    metadata->dataSetClassId = UA_Guid_random();
+    metadata->configurationVersion.majorVersion = 123;
+    metadata->configurationVersion.minorVersion = 456;
+    UA_NodeId id = UA_NODEID_NULL;
+    UA_AddPublishedDataSetResult result = UA_Server_addPublishedDataSet(server, &config, &id);
+    ck_assert_uint_eq(result.addResult, UA_STATUSCODE_GOOD);
+    UA_DataSetMetaDataType actual = {0};
+    ck_assert_uint_eq(UA_Server_getPublishedDataSetMetaData(server, id, &actual), UA_STATUSCODE_GOOD);
+    ck_assert(UA_equal(&actual, metadata, &UA_TYPES[UA_TYPES_DATASETMETADATATYPE]));
+    UA_DataSetMetaDataType_clear(&actual);
+    metadata->configurationVersion.majorVersion = 789;
+    ck_assert_uint_eq(UA_Server_updatePublishedDataSetConfig(server, id, &config), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_getPublishedDataSetMetaData(server, id, &actual), UA_STATUSCODE_GOOD);
+    ck_assert(UA_equal(&actual, metadata, &UA_TYPES[UA_TYPES_DATASETMETADATATYPE]));
+    UA_DataSetMetaDataType_clear(&actual);
+    /* A rejected replacement leaves the old dataset and its contract intact. */
+    field.builtInType = 13;
+    ck_assert_uint_eq(UA_Server_updatePublishedDataSetConfig(server, id, &config), UA_STATUSCODE_BADTYPEMISMATCH);
+    field.builtInType = 11;
+    ck_assert_uint_eq(UA_Server_getPublishedDataSetMetaData(server, id, &actual), UA_STATUSCODE_GOOD);
+    ck_assert(UA_equal(&actual, metadata, &UA_TYPES[UA_TYPES_DATASETMETADATATYPE]));
+    UA_DataSetMetaDataType_clear(&actual);
+    config.name = UA_STRING("RenameNotSupported");
+    ck_assert_uint_eq(UA_Server_updatePublishedDataSetConfig(server, id, &config), UA_STATUSCODE_BADINVALIDARGUMENT);
+    config.name = UA_STRING("Template");
+    /* Empty replacements, including empty-to-empty, retain a valid contract. */
+    metadata->fieldsSize = 0;
+    metadata->fields = NULL;
+    config.config.itemsTemplate.variablesToAddSize = 0;
+    config.config.itemsTemplate.variablesToAdd = NULL;
+    for(size_t i = 0; i < 2; i++) {
+        ck_assert_uint_eq(UA_Server_updatePublishedDataSetConfig(server, id, &config), UA_STATUSCODE_GOOD);
+        ck_assert_uint_eq(UA_Server_getPublishedDataSetMetaData(server, id, &actual), UA_STATUSCODE_GOOD);
+        ck_assert(UA_equal(&actual, metadata, &UA_TYPES[UA_TYPES_DATASETMETADATATYPE]));
+        UA_DataSetMetaDataType_clear(&actual);
+    }
+    metadata->fieldsSize = 1;
+    metadata->fields = &field;
+    config.config.itemsTemplate.variablesToAddSize = 1;
+    config.config.itemsTemplate.variablesToAdd = &variable;
+    ck_assert_uint_eq(UA_Server_updatePublishedDataSetConfig(server, id, &config), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_getPublishedDataSetMetaData(server, id, &actual), UA_STATUSCODE_GOOD);
+    ck_assert(UA_equal(&actual, metadata, &UA_TYPES[UA_TYPES_DATASETMETADATATYPE]));
+    UA_DataSetMetaDataType_clear(&actual);
+    ck_assert_uint_eq(UA_Server_removePublishedDataSet(server, id), UA_STATUSCODE_GOOD);
+    UA_NodeId_clear(&id);
+    /* Reject a wrong contract and release the name so a corrected retry works. */
+    field.builtInType = 13;
+    result = UA_Server_addPublishedDataSet(server, &config, &id);
+    ck_assert_uint_eq(result.addResult, UA_STATUSCODE_BADTYPEMISMATCH);
+    field.builtInType = 11;
+    result = UA_Server_addPublishedDataSet(server, &config, &id);
+    ck_assert_uint_eq(result.addResult, UA_STATUSCODE_GOOD);
+    UA_NodeId_clear(&id);
+} END_TEST
+
+START_TEST(SubscribedDataSetUpdateRefreshesTargetVariables) {
+    UA_FieldMetaData field = {0};
+    field.name = UA_STRING("Time");
+    field.dataType = UA_TYPES[UA_TYPES_DATETIME].typeId;
+    field.builtInType = 13;
+    field.valueRank = -1;
+    UA_FieldTargetDataType target = {0};
+    target.targetNodeId = UA_NS0ID(SERVER_SERVERSTATUS_CURRENTTIME);
+    target.attributeId = UA_ATTRIBUTEID_VALUE;
+    UA_SubscribedDataSetConfig config = {0};
+    config.name = UA_STRING("Incoming");
+    config.subscribedDataSetType = UA_PUBSUB_SDS_TARGET;
+    config.dataSetMetaData.fields = &field;
+    config.dataSetMetaData.fieldsSize = 1;
+    config.subscribedDataSet.target.targetVariables = &target;
+    config.subscribedDataSet.target.targetVariablesSize = 1;
+    UA_NodeId dataset;
+    ck_assert_uint_eq(UA_Server_addSubscribedDataSet(server, &config, &dataset), UA_STATUSCODE_GOOD);
+    UA_SubscribedDataSetConfig snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    ck_assert_uint_eq(UA_Server_getSubscribedDataSetConfig(server, dataset, &snapshot), UA_STATUSCODE_GOOD);
+    UA_String_clear(&snapshot.name);
+    snapshot.name = UA_STRING_ALLOC("RenameNotSupported");
+    ck_assert_uint_eq(UA_Server_updateSubscribedDataSetConfig(server, dataset, &snapshot), UA_STATUSCODE_BADINVALIDARGUMENT);
+    UA_SubscribedDataSetConfig_clear(&snapshot);
+    target.targetNodeId = UA_NS0ID(SERVER_SERVERSTATUS_STARTTIME);
+    ck_assert_uint_eq(UA_Server_updateSubscribedDataSetConfig(server, dataset, &config), UA_STATUSCODE_GOOD);
+    UA_NodeId object = findSingleChildNode(UA_QUALIFIEDNAME(0, "SubscribedDataSet"), UA_NS0ID(HASCOMPONENT), dataset);
+    UA_NodeId variable = findSingleChildNode(UA_QUALIFIEDNAME(0, "TargetVariables"), UA_NS0ID(HASPROPERTY), object);
+    UA_Variant value;
+    UA_Variant_init(&value);
+    ck_assert_uint_eq(UA_Server_readValue(server, variable, &value), UA_STATUSCODE_GOOD);
+    ck_assert(UA_Variant_hasArrayType(&value, &UA_TYPES[UA_TYPES_FIELDTARGETDATATYPE]));
+    ck_assert(UA_NodeId_equal(&((UA_FieldTargetDataType*)value.data)[0].targetNodeId, &target.targetNodeId));
+    UA_Variant_clear(&value);
+    config.subscribedDataSet.target.targetVariablesSize = 0;
+    ck_assert_uint_eq(UA_Server_updateSubscribedDataSetConfig(server, dataset, &config), UA_STATUSCODE_BADINVALIDARGUMENT);
+    UA_NodeId_clear(&dataset);
+    UA_NodeId_clear(&object);
+    UA_NodeId_clear(&variable);
+} END_TEST
+
+START_TEST(AddConnectionRejectsRemotelyReplacedInputArguments) {
+    const UA_NodeId inputArgumentsId = UA_NODEID_NUMERIC(
+        0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION_INPUTARGUMENTS);
+    UA_StatusCode res = UA_Server_deleteNode(server, inputArgumentsId, true);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+
+    UA_Argument argument;
+    UA_Argument_init(&argument);
+    argument.name = UA_STRING("Configuration");
+    argument.dataType = UA_TYPES[UA_TYPES_BYTESTRING].typeId;
+    argument.valueRank = UA_VALUERANK_SCALAR;
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    attr.displayName = UA_LOCALIZEDTEXT("en-US", "InputArguments");
+    attr.dataType = UA_TYPES[UA_TYPES_ARGUMENT].typeId;
+    attr.valueRank = UA_VALUERANK_ONE_DIMENSION;
+    UA_UInt32 arrayDimension = 1;
+    attr.arrayDimensionsSize = 1;
+    attr.arrayDimensions = &arrayDimension;
+    UA_Variant_setArray(&attr.value, &argument, 1,
+                        &UA_TYPES[UA_TYPES_ARGUMENT]);
+    res = UA_Server_addVariableNode(
+        server, inputArgumentsId,
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PUBLISHSUBSCRIBE_ADDCONNECTION),
+        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+        UA_QUALIFIEDNAME(0, "InputArguments"),
+        UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), attr, NULL, NULL);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+
+    UA_ByteString bytes = UA_BYTESTRING("x");
+    UA_Variant input;
+    UA_Variant_init(&input);
+    UA_Variant_setScalar(&input, &bytes, &UA_TYPES[UA_TYPES_BYTESTRING]);
+    UA_CallMethodRequest request;
+    UA_CallMethodRequest_init(&request);
+    request.objectId = UA_NS0ID(PUBLISHSUBSCRIBE);
+    request.methodId = UA_NS0ID(PUBLISHSUBSCRIBE_ADDCONNECTION);
+    request.inputArgumentsSize = 1;
+    request.inputArguments = &input;
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    ck_assert_uint_eq(result.statusCode, UA_STATUSCODE_BADTYPEMISMATCH);
+    UA_CallMethodResult_clear(&result);
+}
+END_TEST
+
+START_TEST(WriterGroupOwnsConfigurationAfterMethodCall) {
+    UA_NodeId connection = addPubSubConnection();
+    UA_NetworkAddressUrlDataType address =
+        {UA_STRING_NULL, UA_STRING("opc.udp://127.0.0.1:4841/")};
+    UA_DatagramWriterGroupTransport2DataType transport;
+    UA_DatagramWriterGroupTransport2DataType_init(&transport);
+    UA_ExtensionObject_setValueNoDelete(
+        &transport.address, &address,
+        &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
+    UA_UadpWriterGroupMessageDataType message;
+    UA_UadpWriterGroupMessageDataType_init(&message);
+    UA_WriterGroupDataType group;
+    UA_WriterGroupDataType_init(&group);
+    group.name = UA_STRING("OwnedConfiguration");
+    group.writerGroupId = 7;
+    group.publishingInterval = 100;
+    group.securityMode = UA_MESSAGESECURITYMODE_NONE;
+    group.securityGroupId = UA_STRING("SecurityGroup");
+    UA_KeyValuePair property = {0};
+    property.key = UA_QUALIFIEDNAME(1, "Property");
+    UA_String propertyValue = UA_STRING("PropertyValue");
+    UA_Variant_setScalar(&property.value, &propertyValue,
+                         &UA_TYPES[UA_TYPES_STRING]);
+    group.groupProperties = &property;
+    group.groupPropertiesSize = 1;
+    UA_Double offset = 12.5;
+    message.publishingOffset = &offset;
+    message.publishingOffsetSize = 1;
+    UA_ExtensionObject_setValueNoDelete(
+        &group.transportSettings, &transport,
+        &UA_TYPES[UA_TYPES_DATAGRAMWRITERGROUPTRANSPORT2DATATYPE]);
+    UA_ExtensionObject_setValueNoDelete(
+        &group.messageSettings, &message,
+        &UA_TYPES[UA_TYPES_UADPWRITERGROUPMESSAGEDATATYPE]);
+
+    UA_WriterGroupDataType ownedGroup;
+    ck_assert_uint_eq(UA_WriterGroupDataType_copy(&group, &ownedGroup),
+                      UA_STATUSCODE_GOOD);
+    UA_Variant input;
+    UA_Variant_setScalar(&input, &ownedGroup,
+                         &UA_TYPES[UA_TYPES_WRITERGROUPDATATYPE]);
+    UA_CallMethodRequest request;
+    UA_CallMethodRequest_init(&request);
+    request.objectId = connection;
+    request.methodId = UA_NS0ID(PUBSUBCONNECTIONTYPE_ADDWRITERGROUP);
+    request.inputArguments = &input;
+    request.inputArgumentsSize = 1;
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    UA_WriterGroupDataType_clear(&ownedGroup);
+    ck_assert_uint_eq(result.statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(result.outputArgumentsSize, 1);
+
+    UA_WriterGroupConfig snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    ck_assert_uint_eq(UA_Server_getWriterGroupConfig(
+        server, *(UA_NodeId*)result.outputArguments[0].data, &snapshot),
+        UA_STATUSCODE_GOOD);
+    ck_assert(UA_ExtensionObject_hasDecodedType(
+        &snapshot.transportSettings,
+        &UA_TYPES[UA_TYPES_DATAGRAMWRITERGROUPTRANSPORT2DATATYPE]));
+    UA_DatagramWriterGroupTransport2DataType *saved =
+        (UA_DatagramWriterGroupTransport2DataType*)
+            snapshot.transportSettings.content.decoded.data;
+    ck_assert(UA_ExtensionObject_hasDecodedType(
+        &saved->address, &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]));
+    UA_NetworkAddressUrlDataType *savedAddress =
+        (UA_NetworkAddressUrlDataType*)saved->address.content.decoded.data;
+    ck_assert(UA_String_equal(&savedAddress->url, &address.url));
+    ck_assert(UA_String_equal(&snapshot.securityGroupId, &group.securityGroupId));
+    ck_assert_uint_eq(snapshot.groupProperties.mapSize, 1);
+    UA_UadpWriterGroupMessageDataType *savedMessage =
+        (UA_UadpWriterGroupMessageDataType*)
+            snapshot.messageSettings.content.decoded.data;
+    ck_assert_uint_eq(savedMessage->publishingOffsetSize, 1);
+    ck_assert(savedMessage->publishingOffset[0] == offset);
+    UA_WriterGroupConfig_clear(&snapshot);
+    UA_CallMethodResult_clear(&result);
+    UA_NodeId_clear(&connection);
+}
+END_TEST
+
+START_TEST(HeartbeatWriterViaInformationModel) {
+    UA_NodeId connection = addPubSubConnection();
+    UA_WriterGroupConfig group = {0};
+    group.name = UA_STRING("HeartbeatGroup");
+    group.publishingInterval = 100;
+    group.encodingMimeType = UA_PUBSUB_ENCODING_UADP;
+    UA_NodeId groupId;
+    ck_assert_uint_eq(UA_Server_addWriterGroup(server, connection, &group, &groupId),
+                      UA_STATUSCODE_GOOD);
+
+    UA_DataSetWriterDataType writer = {0};
+    writer.name = UA_STRING("Heartbeat");
+    writer.dataSetWriterId = 42;
+    writer.keyFrameCount = 1;
+    UA_Variant input;
+    UA_Variant_setScalar(&input, &writer,
+                         &UA_TYPES[UA_TYPES_DATASETWRITERDATATYPE]);
+    UA_CallMethodRequest request = {0};
+    request.objectId = groupId;
+    request.methodId = UA_NS0ID(WRITERGROUPTYPE_ADDDATASETWRITER);
+    request.inputArguments = &input;
+    request.inputArgumentsSize = 1;
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    ck_assert_uint_eq(result.statusCode, UA_STATUSCODE_GOOD);
+
+    UA_NodeId writerId = *(UA_NodeId*)result.outputArguments[0].data;
+    UA_NodeId propertyId = findSingleChildNode(
+        UA_QUALIFIEDNAME(0, "DataSetWriterId"), UA_NS0ID(HASPROPERTY), writerId);
+    UA_Variant value;
+    UA_Variant_init(&value);
+    ck_assert_uint_eq(UA_Server_readValue(server, propertyId, &value),
+                      UA_STATUSCODE_GOOD);
+    ck_assert(UA_Variant_hasScalarType(&value, &UA_TYPES[UA_TYPES_UINT16]));
+    ck_assert_uint_eq(*(UA_UInt16*)value.data, writer.dataSetWriterId);
+    UA_Variant_clear(&value);
+    UA_NodeId_clear(&propertyId);
+    UA_CallMethodResult_clear(&result);
+    UA_NodeId_clear(&groupId);
+    UA_NodeId_clear(&connection);
+}
+END_TEST
+
+static void
+setupLocalRemoval(void) {
+    server = UA_Server_newForUnitTest();
+    ck_assert_ptr_nonnull(server);
+}
+
+static void
+teardownLocalRemoval(void) {
+    UA_Server_delete(server);
+}
+
+static void
+createRemovalGroup(UA_NodeId connection, UA_Boolean reader,
+                    UA_NodeId *groupId, UA_NodeId *childId) {
+    if(reader) {
+        UA_ReaderGroupConfig group = {0};
+        group.name = UA_STRING("Removal reader group");
+        ck_assert_uint_eq(UA_Server_addReaderGroup(server, connection, &group, groupId),
+                          UA_STATUSCODE_GOOD);
+        UA_DataSetReaderConfig child = {0};
+        child.name = UA_STRING("Removal reader");
+        child.publisherId.idType = UA_PUBLISHERIDTYPE_UINT32;
+        child.publisherId.id.uint32 = 42;
+        ck_assert_uint_eq(UA_Server_addDataSetReader(server, *groupId, &child, childId),
+                          UA_STATUSCODE_GOOD);
+    } else {
+        UA_WriterGroupConfig group = {0};
+        group.name = UA_STRING("Removal writer group");
+        group.publishingInterval = 100;
+        group.encodingMimeType = UA_PUBSUB_ENCODING_UADP;
+        ck_assert_uint_eq(UA_Server_addWriterGroup(server, connection, &group, groupId),
+                          UA_STATUSCODE_GOOD);
+        UA_DataSetWriterConfig child = {0};
+        child.name = UA_STRING("Removal heartbeat writer");
+        child.dataSetWriterId = 42;
+        child.keyFrameCount = 1;
+        ck_assert_uint_eq(UA_Server_addDataSetWriter(server, *groupId, UA_NODEID_NULL,
+                                                    &child, childId), UA_STATUSCODE_GOOD);
+    }
+}
+
+static UA_StatusCode
+callRemovalMethod(UA_NodeId parent, UA_UInt32 method, UA_NodeId child) {
+    UA_Variant input;
+    UA_Variant_setScalar(&input, &child, &UA_TYPES[UA_TYPES_NODEID]);
+    UA_CallMethodRequest request = {0};
+    request.objectId = parent;
+    request.methodId = UA_NODEID_NUMERIC(0, method);
+    request.inputArgumentsSize = 1;
+    request.inputArguments = &input;
+    UA_CallMethodResult result = UA_Server_call(server, &request);
+    UA_StatusCode res = result.statusCode;
+    ck_assert_uint_eq(result.outputArgumentsSize, 0);
+    UA_CallMethodResult_clear(&result);
+    return res;
+}
+
+static void
+assertPubSubObjectExists(UA_NodeId id, UA_Boolean exists) {
+    UA_NodeClass nodeClass;
+    UA_StatusCode res = UA_Server_readNodeClass(server, id, &nodeClass);
+    ck_assert_uint_eq(res, exists ? UA_STATUSCODE_GOOD : UA_STATUSCODE_BADNODEIDUNKNOWN);
+    if(exists)
+        ck_assert_uint_eq(nodeClass, UA_NODECLASS_OBJECT);
+}
+
+/* The shared Method node must resolve the requested child beneath the Object
+ * on which it was called, for both individual children and whole groups. */
+START_TEST(RemovalMethodsEnforceParentOwnership) {
+    UA_Boolean reader = (_i % 2) != 0;
+    UA_Boolean removeGroup = _i >= 2;
+    UA_NodeId connections[2], groups[2], children[2];
+    for(size_t i = 0; i < 2; i++) {
+        connections[i] = addPubSubConnection();
+        createRemovalGroup(connections[i], reader, &groups[i], &children[i]);
+    }
+    UA_UInt32 method = removeGroup ? UA_NS0ID_PUBSUBCONNECTIONTYPE_REMOVEGROUP :
+        (reader ? UA_NS0ID_READERGROUPTYPE_REMOVEDATASETREADER :
+                  UA_NS0ID_WRITERGROUPTYPE_REMOVEDATASETWRITER);
+    UA_NodeId target = removeGroup ? groups[0] : children[0];
+    UA_NodeId owner = removeGroup ? connections[0] : groups[0];
+    UA_NodeId other = removeGroup ? connections[1] : groups[1];
+    ck_assert_uint_eq(callRemovalMethod(other, method, target), UA_STATUSCODE_BADNODEIDUNKNOWN);
+    for(size_t i = 0; i < 2; i++) {
+        assertPubSubObjectExists(groups[i], true);
+        assertPubSubObjectExists(children[i], true);
+    }
+
+    ck_assert_uint_eq(callRemovalMethod(owner, method, target), UA_STATUSCODE_GOOD);
+    assertPubSubObjectExists(groups[0], !removeGroup);
+    assertPubSubObjectExists(children[0], false);
+    assertPubSubObjectExists(groups[1], true);
+    assertPubSubObjectExists(children[1], true);
+    ck_assert_uint_eq(callRemovalMethod(owner, method, target), UA_STATUSCODE_BADNODEIDUNKNOWN);
+    assertPubSubObjectExists(children[1], true);
+    for(size_t i = 0; i < 2; i++) {
+        assertPubSubObjectExists(connections[i], true);
+        UA_NodeId_clear(&connections[i]);
+        UA_NodeId_clear(&groups[i]);
+        UA_NodeId_clear(&children[i]);
+    }
+} END_TEST
+
 int main(void) {
     TCase *tc_add_pubsub_informationmodel_methods_connection = tcase_create("PubSub connection delete and creation using the information model methods");
     tcase_add_checked_fixture(tc_add_pubsub_informationmodel_methods_connection, setup, teardown);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, FailedConnectionCreationRemovesEarlierGroups);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, PublishedItemsTemplatePreservesContract);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, SubscribedDataSetUpdateRefreshesTargetVariables);
     tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddNewPubSubConnectionUsingTheInformationModelMethod);
-    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemovePublishedDataSetFolders);
-    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemovePublishedDataSetItems);
-    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemoveWriterGroups);
-    //TODO TestCase add publishedDataItems and removePublishedDataItems, writergroup remove
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddConnectionRollsBackOnChildFailure);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddConnectionRejectsInvalidPublisherIdWithoutSideEffects);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemovePublishedDataSetFoldersUsingServer);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, RemoveDeepPublishedDataSetFolderTree);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemovePublishedDataSetFoldersUsingClient);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemovePublishedDataSetItemsUsingServer);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemovePublishedDataSetItemsUsingClient);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemoveWriterGroupsUsingServer);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddAndRemoveWriterGroupsUsingClient);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddandRemoveNewPubSubConnectionWithWriterGroup);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddNewPubSubConnectionWithWriterGroupAndDataSetWriter);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddNewPubSubConnectionWithReaderGroupandDataSetReader);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection,
+                   AddConnectionRejectsRemotelyReplacedInputArguments);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection,
+                   WriterGroupOwnsConfigurationAfterMethodCall);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection,
+                   HeartbeatWriterViaInformationModel);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddNewPubSubConnectionWithReaderGroup);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, AddandRemoveReaderGroup);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, ReserveIdsMultipleTimes);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, ReserveIdsInvalidTransportUri);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, TestPubSubStatusStateReading);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, TestEnableDisablePubSubConnection);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, TestEnableDisableWriterGroup);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, TestEnableDisableReaderGroup);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, TestEnableDisableDataSetWriter);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, TestEnableDisableDataSetReader);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection, TestEnableDisableTopLevelPublishSubscribe);
+    tcase_add_test(tc_add_pubsub_informationmodel_methods_connection,
+                   AddAndRemoveVariablesMethods);
 
     Suite *s = suite_create("PubSub CRUD configuration by the information model functions");
+    TCase *tc_input_contract = tcase_create("PubSub method input contracts");
+    tcase_add_loop_test(tc_input_contract, AddConnectionValidatesScalarInput, 0, 3);
+    suite_add_tcase(s, tc_input_contract);
+    TCase *tc_removal = tcase_create("PubSub removal ownership");
+    tcase_add_checked_fixture(tc_removal, setupLocalRemoval, teardownLocalRemoval);
+    tcase_add_loop_test(tc_removal, RemovalMethodsEnforceParentOwnership, 0, 4);
+    suite_add_tcase(s, tc_removal);
     suite_add_tcase(s, tc_add_pubsub_informationmodel_methods_connection);
 
     SRunner *sr = srunner_create(s);

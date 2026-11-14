@@ -1,26 +1,64 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. 
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
  *    Copyright 2014-2020 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
  *    Copyright 2017 (c) Florian Palm
  *    Copyright 2017 (c) Stefan Profanter, fortiss GmbH
  *    Copyright 2017 (c) Mark Giraud, Fraunhofer IOSB
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
  */
 
 #ifndef UA_SECURECHANNEL_H_
 #define UA_SECURECHANNEL_H_
 
+struct UA_SecureChannel;
+typedef struct UA_SecureChannel UA_SecureChannel;
+
 #include <open62541/util.h>
 #include <open62541/types.h>
 #include <open62541/plugin/log.h>
 #include <open62541/plugin/securitypolicy.h>
+#include <open62541/plugin/eventloop.h>
+#include <open62541/plugin/certificategroup.h>
 #include <open62541/transport_generated.h>
 
 #include "open62541_queue.h"
-#include "ua_connection_internal.h"
+#include "ua_types_encoding.h"
+#include "util/ua_util_internal.h"
 
 _UA_BEGIN_DECLS
+
+/* True for the ECC SecurityPolicy family, including the AEAD variants
+ * (ECC_nistP256_AesGcm/ChaChaPoly, ECC_curve25519/448). Use this instead of
+ * spelling out the policyType enum pair at each call site. */
+static UA_INLINE UA_Boolean
+UA_SecurityPolicy_isEcc(const UA_SecurityPolicy *policy) {
+    return policy != NULL &&
+        (policy->policyType == UA_SECURITYPOLICYTYPE_ECC ||
+         policy->policyType == UA_SECURITYPOLICYTYPE_ECC_AEAD);
+}
+
+/* True for AEAD SecurityPolicies (AES-GCM / ChaCha20-Poly1305). These derive a
+ * combined encryption key + IV (no separate signing key) and authenticate via
+ * the cipher tag; the SecureChannel and EccEncryptedSecret code use this to
+ * switch on the AEAD message layout. */
+static UA_INLINE UA_Boolean
+UA_SecurityPolicy_isAead(const UA_SecurityPolicy *policy) {
+    return policy != NULL && policy->policyType == UA_SECURITYPOLICYTYPE_ECC_AEAD;
+}
+
+/* Check whether a certificate permits the requested extended key usage. If the
+ * EKU extension is optional, its absence is accepted. */
+UA_StatusCode
+UA_CertificateUtils_checkExtendedKeyUsage(const UA_ByteString *certificate,
+                                          UA_CertificateEku requestedUsage,
+                                          UA_Boolean ekuRequired);
+
+/* Forward-Declaration so the SecureChannel can point to a singly-linked list of
+ * Sessions. This is only used in the server, not in the client. */
+struct UA_Session;
+typedef struct UA_Session UA_Session;
 
 /* The message header of the OPC UA binary protocol is structured as follows:
  *
@@ -51,27 +89,9 @@ _UA_BEGIN_DECLS
 /* Minimum length of a valid message (ERR message with an empty reason) */
 #define UA_SECURECHANNEL_MESSAGE_MIN_LENGTH 16
 
-/* Thread-local variables to force failure modes during testing */
-#ifdef UA_ENABLE_UNIT_TEST_FAILURE_HOOKS
-extern UA_StatusCode decrypt_verifySignatureFailure;
-extern UA_StatusCode sendAsym_sendFailure;
-extern UA_StatusCode processSym_seqNumberFailure;
-#endif
-
-/* The Session implementation differs between client and server. Still, it is
- * expected that the Session structure begins with the SessionHeader. This is
- * the interface that will be used by the SecureChannel. The lifecycle of
- * Sessions is independent of the underlying SecureChannel. But every Session
- * can be attached to only one SecureChannel. */
-typedef struct UA_SessionHeader {
-    SLIST_ENTRY(UA_SessionHeader) next;
-    UA_NodeId authenticationToken;
-    UA_SecureChannel *channel; /* The pointer back to the SecureChannel in the session. */
-} UA_SessionHeader;
-
 /* For chunked requests */
 typedef struct UA_Chunk {
-    SIMPLEQ_ENTRY(UA_Chunk) pointers;
+    TAILQ_ENTRY(UA_Chunk) pointers;
     UA_ByteString bytes;
     UA_MessageType messageType;
     UA_ChunkType chunkType;
@@ -80,7 +100,7 @@ typedef struct UA_Chunk {
                         * memory allocated for the chunk separately */
 } UA_Chunk;
 
-typedef SIMPLEQ_HEAD(UA_ChunkQueue, UA_Chunk) UA_ChunkQueue;
+typedef TAILQ_HEAD(UA_ChunkQueue, UA_Chunk) UA_ChunkQueue;
 
 typedef enum {
     UA_SECURECHANNELRENEWSTATE_NORMAL,
@@ -100,11 +120,48 @@ typedef enum {
     UA_SECURECHANNELRENEWSTATE_NEWTOKEN_CLIENT
 } UA_SecureChannelRenewState;
 
+/* The transport and message encoding are fixed for the lifetime of a
+ * SecureChannel. TCP and WebSocket both use UACP. HTTP carries service
+ * messages directly without UACP framing. */
+typedef enum {
+    UA_SECURECHANNEL_TRANSPORT_UACP = 0,
+    UA_SECURECHANNEL_TRANSPORT_HTTP = 1
+} UA_SecureChannelTransport;
+
+typedef enum {
+    UA_SECURECHANNEL_ENCODING_BINARY = 0,
+    UA_SECURECHANNEL_ENCODING_JSON = 1
+} UA_SecureChannelEncoding;
+
+static UA_INLINE UA_MessageSecurityMode
+UA_SecureChannel_httpSecurityMode(UA_Boolean useTls) {
+    return useTls ? UA_MESSAGESECURITYMODE_SIGNANDENCRYPT
+                  : UA_MESSAGESECURITYMODE_NONE;
+}
+
 struct UA_SecureChannel {
     UA_SecureChannelState state;
     UA_SecureChannelRenewState renewState;
+    UA_SecureChannelTransport transport;
+    UA_SecureChannelEncoding encoding;
     UA_MessageSecurityMode securityMode;
+    UA_ShutdownReason shutdownReason;
+
     UA_ConnectionConfig config;
+    UA_String endpointUrl;
+    UA_String remoteAddress;
+
+    /* Connection handling in the EventLoop */
+    UA_ConnectionManager *connectionManager;
+    uintptr_t connectionId;
+
+    /* The namespace mapping translates namespace indices of NodeIds during
+     * de/encoding (client only) */
+    UA_NamespaceMapping *namespaceMapping;
+
+    /* Linked lists (only used in the server) */
+    TAILQ_ENTRY(UA_SecureChannel) serverEntry;
+    TAILQ_ENTRY(UA_SecureChannel) componentEntry;
 
     /* Rules for revolving the token with a renew OPN request: The client is
      * allowed to accept messages with the old token until the OPN response has
@@ -118,9 +175,40 @@ struct UA_SecureChannel {
                                                * See the renewState. */
 
     /* The endpoint and context of the channel */
-    const UA_SecurityPolicy *securityPolicy;
+    UA_SecurityPolicy *securityPolicy;
     void *channelContext; /* For interaction with the security policy */
-    UA_Connection *connection;
+
+    /* Properties derived from the SecurityPolicy URI, cached when the policy is
+     * set (it is fixed for the channel's lifetime). This avoids re-evaluating
+     * UA_SecurityPolicy_isEnhancedSecurity / _useLegacySequenceNumbers (which
+     * scan the policy URI) on the per-chunk send and receive paths. */
+    UA_Boolean enhancedSecurity;      /* UA_SecurityPolicy_isEnhancedSecurity */
+    UA_Boolean legacySequenceNumbers; /* UA_SecurityPolicy_useLegacySequenceNumbers */
+
+    /* OPC UA Part 6 v1.05.07 §6.7.5 "ChannelThumbprint" for
+     * SecurityPolicies with secureChannelEnhancements = true.
+     * The first OPN request signature is appended to the data signed by
+     * the OPN response (and vice versa). Set on send, consumed on
+     * receive, then cleared. Never used on OPN renewals. */
+    UA_ByteString firstRequestSignature;
+
+    /* OPC UA Part 6 v1.05.07 §6.8.1 step 2 "Extract" IKM chaining
+     * accumulator for SecurityPolicies with secureChannelEnhancements =
+     * true. The IKM is the size of the policy's shared secret (e.g. 32
+     * bytes for P-256). On each renewal, the policy's generateKey
+     * wrapper XORs the new shared secret with this value and writes the
+     * result back. The SecureChannel passes this value as a prefix of
+     * the `secret` ByteString to the policy's generateKey, where the
+     * policy strips and updates it. Zero-length on the first OPN. */
+    UA_ByteString currentIKM;
+
+    /* OPC UA Part 6 v1.05.07 ChannelThumbprint: the (verified) signature
+     * of the first OpenSecureChannel *response*. Captured once on the
+     * first OPN (client: on response verify; server: on response sign)
+     * and preserved across renewals. Used to bind the CreateSession /
+     * ActivateSession SignatureData to this SecureChannel. Only set for
+     * SecurityPolicies with secureChannelEnhancements = true. */
+    UA_ByteString channelThumbprint;
 
     /* Asymmetric encryption info */
     UA_ByteString remoteCertificate;
@@ -138,31 +226,76 @@ struct UA_SecureChannel {
     UA_UInt32 receiveSequenceNumber;
     UA_UInt32 sendSequenceNumber;
 
-    /* Sessions that are bound to the SecureChannel */
-    SLIST_HEAD(, UA_SessionHeader) sessions;
+    /* Sessions that are bound to the SecureChannel (singly-linked list, only
+     * used in the server) */
+    UA_Session *sessions;
 
-    /* If a buffer is received, first all chunks are put into the completeChunks
-     * queue. Then they are processed in order. This ensures that processing
-     * buffers is reentrant with the correct processing order. (This has lead to
-     * problems in the client in the past.) */
-    UA_ChunkQueue completeChunks; /* Received full chunks that have not been
-                                   * decrypted so far */
-    UA_ChunkQueue decryptedChunks; /* Received chunks that were decrypted but
-                                    * not processed */
-    size_t decryptedChunksCount;
-    size_t decryptedChunksLength;
-    UA_ByteString incompleteChunk; /* A half-received chunk (TCP is a
-                                    * streaming protocol) is stored here */
+    /* Generic per-channel storage for the application, addressable via
+     * UA_Server_{get,set,delete}SecureChannelAttribute. Mirrors
+     * UA_Session.attributes. */
+    UA_KeyValueMap attributes;
 
-    UA_CertificateVerification *certificateVerification;
+    /* Cached from the reserved "0:maxMessageSize" entry in attributes
+     * whenever it is written, so the per-chunk size checks in
+     * UA_SecureChannel_getCompleteMessage never need to touch the map. Zero
+     * means "not set" -> config.localMaxMessageSize applies unmodified. A
+     * non-zero value can only tighten, never loosen, that static ceiling. */
+    UA_UInt32 maxMessageSizeOverride;
+
+    /* Backing storage for the handful of built-in, read-only ns0 attributes
+     * (UA_SecureChannel_getBuiltinAttribute) that are not themselves a
+     * stable, directly-addressable channel member -- e.g. connection-id
+     * needs a uintptr_t -> UA_UInt64 conversion, and security-policy-url /
+     * certificate-type-id need a default while no SecurityPolicy is set
+     * yet. Recomputed (overwritten) on every access; never owns allocated
+     * memory (String/NodeId members are always shallow references into
+     * other stable storage, e.g. the connection manager or SecurityPolicy),
+     * so UA_SecureChannel_clear does not need to clear it. */
+    struct {
+        UA_UInt64 connectionId;
+        UA_String connectionManagerName;
+        UA_String securityPolicyUri;
+        UA_NodeId certificateTypeId;
+    } builtinAttributeScratch;
+
+    /* (Decrypted) chunks waiting to be processed */
+    UA_ChunkQueue chunks;
+    size_t chunksCount;
+    size_t chunksLength;
+
+    /* Received buffer from which no chunks have been extracted so far */
+    UA_ByteString unprocessed;
+    size_t unprocessedOffset;
+    UA_Boolean unprocessedCopied;
+    UA_DelayedCallback unprocessedDelayed;
+
+    void *processOPNHeaderApplication;
     UA_StatusCode (*processOPNHeader)(void *application, UA_SecureChannel *channel,
                                       const UA_AsymmetricAlgorithmSecurityHeader *asymHeader);
 };
 
-void UA_SecureChannel_init(UA_SecureChannel *channel,
-                           const UA_ConnectionConfig *config);
+/* Transport confidentiality and OPC UA application signatures are separate
+ * for direct transports. HTTPS is represented as SignAndEncrypt, but
+ * SecurityPolicy None still has no application signature algorithm. */
+static UA_INLINE UA_Boolean
+UA_SecureChannel_hasApplicationSecurity(const UA_SecureChannel *channel) {
+    return channel->securityPolicy &&
+        channel->securityPolicy->policyType != UA_SECURITYPOLICYTYPE_NONE &&
+        (channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
+         channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT);
+}
 
-void UA_SecureChannel_close(UA_SecureChannel *channel);
+void UA_SecureChannel_init(UA_SecureChannel *channel);
+
+/* Enter CLOSING and close an owned physical ConnectionManager connection.
+ * Direct transports without such a connection complete their teardown in the
+ * transport owner. */
+void UA_SecureChannel_shutdown(UA_SecureChannel *channel,
+                               UA_ShutdownReason shutdownReason);
+
+/* Eventual cleanup after the channel has closed. It is possible to call _init
+ * on the channel afterwards to reset it to the fresh status. */
+void UA_SecureChannel_clear(UA_SecureChannel *channel);
 
 /* Process the remote configuration in the HEL/ACK handshake. The connection
  * config is initialized with the local settings. */
@@ -172,8 +305,30 @@ UA_SecureChannel_processHELACK(UA_SecureChannel *channel,
 
 UA_StatusCode
 UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
-                                   const UA_SecurityPolicy *securityPolicy,
+                                   UA_SecurityPolicy *securityPolicy,
                                    const UA_ByteString *remoteCertificate);
+
+/* Establish the policy state without a UACP OpenSecureChannel exchange. A null
+ * or empty remote certificate installs the immutable policy metadata without
+ * constructing a cryptographic channel context. */
+UA_StatusCode
+UA_SecureChannel_setSecurityPolicyWithoutOPN(
+    UA_SecureChannel *channel, UA_SecurityPolicy *securityPolicy,
+    const UA_ByteString *remoteCertificate,
+    UA_MessageSecurityMode securityMode);
+
+UA_StatusCode
+UA_SecureChannel_setSecurityMode(UA_SecureChannel *channel,
+                                 UA_MessageSecurityMode securityMode);
+
+UA_Boolean
+UA_SecureChannel_isConnected(UA_SecureChannel *channel);
+
+/* Returns true if the channel has timed out. Performs the SecurityToken
+ * rollover if required and possible. */
+UA_Boolean
+UA_SecureChannel_checkTimeout(UA_SecureChannel *channel,
+                              UA_DateTime nowMonotonic);
 
 /* Remove (partially) received unprocessed chunks */
 void
@@ -186,23 +341,115 @@ UA_StatusCode
 UA_SecureChannel_generateLocalNonce(UA_SecureChannel *channel);
 
 UA_StatusCode
-UA_SecureChannel_generateLocalKeys(const UA_SecureChannel *channel);
+UA_SecureChannel_generateLocalKeys(UA_SecureChannel *channel);
 
 UA_StatusCode
-generateRemoteKeys(const UA_SecureChannel *channel);
+generateRemoteKeys(UA_SecureChannel *channel);
+
+/* OPC UA Part 6 v1.05.07 (secureChannelEnhancements): build the
+ * channel-bound CreateSession ServerSignature data
+ *   channelThumbprint | clientNonce | H(serverChannelCert) |
+ *   H(clientChannelCert) | serverNonce
+ * Both the server (sign) and client (verify) call this with the same
+ * logical values. `out` is allocated by the callee. */
+UA_StatusCode
+UA_SecureChannel_buildCreateSessionSignatureData(
+    const UA_SecureChannel *channel, const UA_ByteString *clientNonce,
+    const UA_ByteString *serverNonce, const UA_ByteString *serverChannelCert,
+    const UA_ByteString *clientChannelCert, UA_ByteString *out);
+
+/* OPC UA Part 6 v1.05.07: build the channel-bound ActivateSession
+ * ClientSignature data
+ *   channelThumbprint | serverNonce | H(serverAppCert) |
+ *   H(serverChannelCert) | H(clientChannelCert) | clientNonce
+ * `out` is allocated by the callee. */
+UA_StatusCode
+UA_SecureChannel_buildActivateSessionSignatureData(
+    const UA_SecureChannel *channel, const UA_ByteString *serverNonce,
+    const UA_ByteString *clientNonce, const UA_ByteString *serverAppCert,
+    const UA_ByteString *serverChannelCert, const UA_ByteString *clientChannelCert,
+    UA_ByteString *out);
+
+/* OPC UA Part 6 v1.05.07: build the channel-bound ActivateSession
+ * user-token (X.509) signature data
+ *   channelThumbprint | serverNonce | H(serverAppCert) | H(serverChannelCert) |
+ *   H(clientAppCert) | H(clientChannelCert) | clientNonce
+ * This is the ClientSignature layout with an extra H(clientAppCert) - the
+ * CLIENT's APPLICATION instance certificate - inserted before
+ * H(clientChannelCert). NOTE: the user/X509-token certificate does NOT appear
+ * in the signed data (it is conveyed and validated separately); the signature
+ * only proves possession of the user key over the channel-bound data. */
+UA_StatusCode
+UA_SecureChannel_buildUserTokenSignatureData(
+    const UA_SecureChannel *channel, const UA_ByteString *serverNonce,
+    const UA_ByteString *clientNonce, const UA_ByteString *serverAppCert,
+    const UA_ByteString *serverChannelCert, const UA_ByteString *clientAppCert,
+    const UA_ByteString *clientChannelCert, UA_ByteString *out);
 
 /**
  * Sending Messages
  * ---------------- */
 
-UA_StatusCode
-UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel, UA_UInt32 requestId,
-                                          const void *content, const UA_DataType *contentType);
+/* When a fatal error occurs the Server shall send an Error Message to the
+ * Client and close the socket. When a Client encounters one of these errors, it
+ * shall also close the socket but does not send an Error Message. After the
+ * socket is closed a Client shall try to reconnect automatically using the
+ * mechanisms described in [...]. */
+void
+UA_SecureChannel_sendERR(UA_SecureChannel *channel, UA_TcpErrorMessage *error);
 
 UA_StatusCode
-UA_SecureChannel_sendSymmetricMessage(UA_SecureChannel *channel, UA_UInt32 requestId,
-                                      UA_MessageType messageType, void *payload,
-                                      const UA_DataType *payloadType);
+UA_SecureChannel_sendOPN(UA_SecureChannel *channel, UA_UInt32 requestId,
+                         const void *content, const UA_DataType *contentType);
+
+UA_StatusCode
+UA_SecureChannel_sendMSG(UA_SecureChannel *channel, UA_UInt32 requestId,
+                         void *payload, const UA_DataType *payloadType);
+
+UA_StatusCode
+UA_SecureChannel_sendCLO(UA_SecureChannel *channel, UA_UInt32 requestId,
+                         UA_CloseSecureChannelRequest *req);
+
+/* HTTP implementation of the common SecureChannel message send operation.
+ * Implemented in ua_securechannel_http.c. */
+UA_StatusCode
+UA_SecureChannel_sendMSGHttp(UA_SecureChannel *channel, UA_UInt32 requestId,
+                             void *payload, const UA_DataType *payloadType);
+
+UA_StatusCode
+UA_SecureChannel_sendHttpResponse(UA_SecureChannel *channel,
+                                  uintptr_t connectionId, void *payload,
+                                  const UA_DataType *payloadType);
+
+UA_StatusCode
+UA_Http_sendResponse(UA_ConnectionManager *cm, uintptr_t connectionId,
+                     UA_UInt16 status, const UA_String *contentType,
+                     const UA_String *contentCodingPolicy,
+                     UA_ByteString *body);
+
+const UA_String *
+UA_Http_getHeader(const UA_KeyValueMap *params, const char *name,
+                  UA_Boolean *duplicate, UA_Boolean *invalid);
+
+UA_Boolean
+UA_Http_mediaTypeEquals(const UA_String *header, const UA_String *mediaType);
+
+UA_Boolean
+UA_Http_headerValueEquals(const UA_String *header, const char *value);
+
+UA_Boolean
+UA_Http_contentTypeMatchesEncoding(const UA_String *contentType,
+                                   UA_SecureChannelEncoding encoding);
+
+extern const UA_String UA_HTTP_CONTENTTYPE_BINARY;
+extern const UA_String UA_HTTP_CONTENTTYPE_BINARY_LEGACY;
+extern const UA_String UA_HTTP_PROFILE_HTTPS_BINARY;
+extern const UA_String UA_HTTP_PROFILE_HTTP_BINARY;
+#ifdef UA_ENABLE_JSON_ENCODING
+extern const UA_String UA_HTTP_CONTENTTYPE_JSON;
+extern const UA_String UA_HTTP_PROFILE_HTTPS_JSON;
+extern const UA_String UA_HTTP_PROFILE_HTTP_JSON;
+#endif
 
 /* The MessageContext is forwarded into the encoding layer so that we can send
  * chunks before continuing to encode. This lets us reuse a fixed chunk-sized
@@ -239,7 +486,7 @@ UA_MessageContext_encode(UA_MessageContext *mc, const void *content,
 UA_StatusCode
 UA_MessageContext_finish(UA_MessageContext *mc);
 
-/* To be used when a failure occures when a MessageContext is open. Note that
+/* To be used when a failure occurs when a MessageContext is open. Note that
  * the _encode and _finish methods will clean up internally. _abort can be run
  * on a MessageContext that has already been cleaned up before. */
 void
@@ -249,39 +496,32 @@ UA_MessageContext_abort(UA_MessageContext *mc);
  * Receive Message
  * --------------- */
 
-typedef UA_StatusCode
-(UA_ProcessMessageCallback)(void *application, UA_SecureChannel *channel,
-                            UA_MessageType messageType, UA_UInt32 requestId,
-                            UA_ByteString *message);
-
-/* Process a received buffer. The callback function is called with the message
- * body if the message is complete. The message is removed afterwards. Returns
- * if an irrecoverable error occured.
+/* Process a received buffer. This always has these three steps:
+ *
+ * 1. loadBuffer: The chunks in the SecureChannel are cut into chunks.
+ *    The chunks can still point to the buffer.
+ * 2. getCompleteMessage: Assemble chunks into a complete message. This is
+ *    repeated until an error occurs or an empty message is returned.
+ * 3. persistBuffer: Make a copy of the remaining unpprocessed bytestring. So
+ *    that the NetworkManager can reuse or free the packet memory.
  *
  * Note that only MSG and CLO messages are decrypted. HEL/ACK/OPN/... are
  * forwarded verbatim to the application. */
 UA_StatusCode
-UA_SecureChannel_processBuffer(UA_SecureChannel *channel, void *application,
-                               UA_ProcessMessageCallback callback,
-                               const UA_ByteString *buffer);
+UA_SecureChannel_loadBuffer(UA_SecureChannel *channel, const UA_ByteString buffer);
 
-/* Try to receive at least one complete chunk on the connection. This blocks the
- * current thread up to the given timeout. It will return once the first buffer
- * has been received (and possibly processed when the message is complete).
- *
- * @param channel The SecureChannel
- * @param application The client or server application
- * @param callback The function pointer for processing complete messages
- * @param timeout The timeout (in milliseconds) the method will block at most.
- * @return Returns UA_STATUSCODE_GOOD or an error code. A timeout does not
- *         create an error. */
 UA_StatusCode
-UA_SecureChannel_receive(UA_SecureChannel *channel, void *application,
-                         UA_ProcessMessageCallback callback, UA_UInt32 timeout);
+UA_SecureChannel_getCompleteMessage(UA_SecureChannel *channel,
+                                    UA_MessageType *messageType, UA_UInt32 *requestId,
+                                    UA_ByteString *payload, UA_Boolean *copied,
+                                    UA_DateTime nowMonotonic);
+
+UA_StatusCode
+UA_SecureChannel_persistBuffer(UA_SecureChannel *channel);
 
 /* Internal methods in ua_securechannel_crypto.h */
 
-void
+UA_StatusCode
 hideBytesAsym(const UA_SecureChannel *channel, UA_Byte **buf_start,
               const UA_Byte **buf_end);
 
@@ -292,10 +532,10 @@ hideBytesAsym(const UA_SecureChannel *channel, UA_Byte **buf_start,
  * The offset argument points to the start of the encrypted content (beginning
  * with the SequenceHeader).*/
 UA_StatusCode
-decryptAndVerifyChunk(const UA_SecureChannel *channel,
-                      const UA_SecurityPolicyCryptoModule *cryptoModule,
-                      UA_MessageType messageType, UA_ByteString *chunk,
-                      size_t offset);
+decryptAndVerifyChunk(UA_SecureChannel *channel,
+                      const UA_SecurityPolicySignatureAlgorithm *signatureAlgorithm,
+                      const UA_SecurityPolicyEncryptionAlgorithm *encryptionAlgorithm,
+                      UA_MessageType messageType, UA_ByteString *chunk, size_t offset);
 
 size_t
 calculateAsymAlgSecurityHeaderLength(const UA_SecureChannel *channel);
@@ -306,18 +546,28 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
                    size_t securityHeaderLength, UA_UInt32 requestId,
                    size_t *const finalLength);
 
+/* Advance and return the next SequenceNumber to put into an outgoing chunk
+ * (asymmetric OPN and symmetric MSG/CLO alike). Part 6 §6.7.2.4: the legacy
+ * policies start at 1 and roll over to 1; the v1.05.07 enhanced/ECC policies
+ * (LegacySequenceNumbers = false) start at 0 and roll over to 0. */
+UA_UInt32
+UA_SecureChannel_nextSequenceNumber(UA_SecureChannel *channel);
+
 void
 setBufPos(UA_MessageContext *mc);
 
 UA_StatusCode
-checkSymHeader(UA_SecureChannel *channel, const UA_UInt32 tokenId);
+checkSymHeader(UA_SecureChannel *channel, const UA_UInt32 tokenId,
+               UA_DateTime nowMonotonic);
 
 UA_StatusCode
 checkAsymHeader(UA_SecureChannel *channel,
                 const UA_AsymmetricAlgorithmSecurityHeader *asymHeader);
 
 void
-padChunk(UA_SecureChannel *channel, const UA_SecurityPolicyCryptoModule *cm,
+padChunk(UA_SecureChannel *channel,
+         const UA_SecurityPolicySignatureAlgorithm *signatureAlgorithm,
+         const UA_SecurityPolicyEncryptionAlgorithm *encryptionAlgorithm,
          const UA_Byte *start, UA_Byte **pos);
 
 UA_StatusCode
@@ -341,59 +591,28 @@ signAndEncryptSym(UA_MessageContext *messageContext,
  * zero arguments. So we add a dummy argument that is not printed (%.0s is
  * string of length zero). */
 
-#define UA_LOG_TRACE_CHANNEL_INTERNAL(LOGGER, CHANNEL, MSG, ...)              \
-    UA_LOG_TRACE(LOGGER, UA_LOGCATEGORY_SECURECHANNEL,                        \
-                 "Connection %i | SecureChannel %" PRIu32 " | " MSG "%.0s",     \
-                 ((CHANNEL)->connection ? (int)((CHANNEL)->connection->sockfd) : 0), \
-                 (CHANNEL)->securityToken.channelId, __VA_ARGS__)
+#define UA_LOG_CHANNEL_INTERNAL(LOGGER, LEVEL, CHANNEL, MSG, ...)       \
+    do {                                                                \
+    if(UA_LOGLEVEL <= UA_LOGLEVEL_##LEVEL) {                            \
+        UA_LOG_##LEVEL(LOGGER, UA_LOGCATEGORY_SECURECHANNEL,            \
+                       "TCP %lu\t| SC %" PRIu32 "\t| " MSG "%.0s", \
+                       (long unsigned)(CHANNEL)->connectionId,          \
+                       (CHANNEL)->securityToken.channelId, __VA_ARGS__); \
+    } \
+    } while (0)
 
-#define UA_LOG_TRACE_CHANNEL(LOGGER, CHANNEL, ...)        \
-    UA_MACRO_EXPAND(UA_LOG_TRACE_CHANNEL_INTERNAL(LOGGER, CHANNEL, __VA_ARGS__, ""))
-
-#define UA_LOG_DEBUG_CHANNEL_INTERNAL(LOGGER, CHANNEL, MSG, ...)              \
-    UA_LOG_DEBUG(LOGGER, UA_LOGCATEGORY_SECURECHANNEL,                        \
-                 "Connection %i | SecureChannel %" PRIu32 " | " MSG "%.0s",     \
-                 ((CHANNEL)->connection ? (int)((CHANNEL)->connection->sockfd) : 0), \
-                 (CHANNEL)->securityToken.channelId, __VA_ARGS__)
-
-#define UA_LOG_DEBUG_CHANNEL(LOGGER, CHANNEL, ...)        \
-    UA_MACRO_EXPAND(UA_LOG_DEBUG_CHANNEL_INTERNAL(LOGGER, CHANNEL, __VA_ARGS__, ""))
-
-#define UA_LOG_INFO_CHANNEL_INTERNAL(LOGGER, CHANNEL, MSG, ...)               \
-    UA_LOG_INFO(LOGGER, UA_LOGCATEGORY_SECURECHANNEL,                         \
-                 "Connection %i | SecureChannel %" PRIu32 " | " MSG "%.0s",     \
-                 ((CHANNEL)->connection ? (int)((CHANNEL)->connection->sockfd) : 0), \
-                 (CHANNEL)->securityToken.channelId, __VA_ARGS__)
-
-#define UA_LOG_INFO_CHANNEL(LOGGER, CHANNEL, ...)        \
-    UA_MACRO_EXPAND(UA_LOG_INFO_CHANNEL_INTERNAL(LOGGER, CHANNEL, __VA_ARGS__, ""))
-
-#define UA_LOG_WARNING_CHANNEL_INTERNAL(LOGGER, CHANNEL, MSG, ...)            \
-    UA_LOG_WARNING(LOGGER, UA_LOGCATEGORY_SECURECHANNEL,                      \
-                 "Connection %i | SecureChannel %" PRIu32 " | " MSG "%.0s",     \
-                 ((CHANNEL)->connection ? (int)((CHANNEL)->connection->sockfd) : 0), \
-                 (CHANNEL)->securityToken.channelId, __VA_ARGS__)
-
-#define UA_LOG_WARNING_CHANNEL(LOGGER, CHANNEL, ...)        \
-    UA_MACRO_EXPAND(UA_LOG_WARNING_CHANNEL_INTERNAL(LOGGER, CHANNEL, __VA_ARGS__, ""))
-
-#define UA_LOG_ERROR_CHANNEL_INTERNAL(LOGGER, CHANNEL, MSG, ...)              \
-    UA_LOG_ERROR(LOGGER, UA_LOGCATEGORY_SECURECHANNEL,                        \
-                 "Connection %i | SecureChannel %" PRIu32 " | " MSG "%.0s",     \
-                 ((CHANNEL)->connection ? (int)((CHANNEL)->connection->sockfd) : 0), \
-                 (CHANNEL)->securityToken.channelId, __VA_ARGS__)
-
-#define UA_LOG_ERROR_CHANNEL(LOGGER, CHANNEL, ...)        \
-    UA_MACRO_EXPAND(UA_LOG_ERROR_CHANNEL_INTERNAL(LOGGER, CHANNEL, __VA_ARGS__, ""))
-
-#define UA_LOG_FATAL_CHANNEL_INTERNAL(LOGGER, CHANNEL, MSG, ...)              \
-    UA_LOG_FATAL(LOGGER, UA_LOGCATEGORY_SECURECHANNEL,                        \
-                 "Connection %i | SecureChannel %" PRIu32 " | " MSG "%.0s",     \
-                 ((CHANNEL)->connection ? (CHANNEL)->connection->sockfd : 0), \
-                 (CHANNEL)->securityToken.channelId, __VA_ARGS__)
-
-#define UA_LOG_FATAL_CHANNEL(LOGGER, CHANNEL, ...)        \
-    UA_MACRO_EXPAND(UA_LOG_FATAL_CHANNEL_INTERNAL(LOGGER, CHANNEL, __VA_ARGS__, ""))
+#define UA_LOG_TRACE_CHANNEL(LOGGER, CHANNEL, ...)                      \
+    UA_MACRO_EXPAND(UA_LOG_CHANNEL_INTERNAL(LOGGER, TRACE, CHANNEL, __VA_ARGS__, ""))
+#define UA_LOG_DEBUG_CHANNEL(LOGGER, CHANNEL, ...)                      \
+    UA_MACRO_EXPAND(UA_LOG_CHANNEL_INTERNAL(LOGGER, DEBUG, CHANNEL, __VA_ARGS__, ""))
+#define UA_LOG_INFO_CHANNEL(LOGGER, CHANNEL, ...)                       \
+    UA_MACRO_EXPAND(UA_LOG_CHANNEL_INTERNAL(LOGGER, INFO, CHANNEL, __VA_ARGS__, ""))
+#define UA_LOG_WARNING_CHANNEL(LOGGER, CHANNEL, ...)                    \
+    UA_MACRO_EXPAND(UA_LOG_CHANNEL_INTERNAL(LOGGER, WARNING, CHANNEL, __VA_ARGS__, ""))
+#define UA_LOG_ERROR_CHANNEL(LOGGER, CHANNEL, ...)                      \
+    UA_MACRO_EXPAND(UA_LOG_CHANNEL_INTERNAL(LOGGER, ERROR, CHANNEL, __VA_ARGS__, ""))
+#define UA_LOG_FATAL_CHANNEL(LOGGER, CHANNEL, ...)                      \
+    UA_MACRO_EXPAND(UA_LOG_CHANNEL_INTERNAL(LOGGER, FATAL, CHANNEL, __VA_ARGS__, ""))
 
 _UA_END_DECLS
 

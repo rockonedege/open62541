@@ -1,94 +1,82 @@
-# open62541
+<div align="center">
+  <a href="https://open62541.org">
+    <img alt="open62541 Logo" src="https://open62541.org/images/logo-open62541.svg" width="400px">
+  </a>
+  <br />
+  <a href="https://open62541.org" target="_blank" rel="noopener">https://open62541.org</a> | <a href="https://www.o6-automation.com" target="_blank" rel="noopener">https://www.o6-automation.com</a>
+</div>
+<br />
 
-open62541 (<http://open62541.org>) is an open source and free implementation of OPC UA (OPC Unified Architecture) written in the common subset of the C99 and C++98 languages. The library is usable with all major compilers and provides the necessary tools to implement dedicated OPC UA clients and servers, or to integrate OPC UA-based communication into existing applications. open62541 library is platform independent. All platform-specific functionality is implemented via exchangeable plugins. Plugin implementations are provided for the major operating systems.
+open62541 (<http://open62541.org>) is an open source implementation of OPC UA (OPC Unified Architecture / IEC 62541) written in the C language. The library is usable with all major compilers and provides the necessary tools to implement dedicated OPC UA clients and servers, or to integrate OPC UA-based communication into existing applications. See the [features overview](FEATURES.md) for full details.
+The open62541 library is platform independent: All platform-specific functionality is implemented via exchangeable plugins for easy porting to different (embedded) targets.
 
-open62541 is licensed under the Mozilla Public License v2.0 (MPLv2). This allows the open62541 library to be combined and distributed with any proprietary software. Only changes to the open62541 library itself need to be licensed under the MPLv2 when copied and distributed. The plugins, as well as the server and client examples are in the public domain (CC0 license). They can be reused under any license and changes do not have to be published.
+open62541 is licensed under the Mozilla Public License v2.0 (MPLv2). This allows the open62541 library to be combined and distributed with any proprietary software. Only changes to the open62541 library itself need to be licensed under the MPLv2 when copied and distributed. Some plugins and examples are in the public domain (CC0 license) and some are licensed under MPLv2. The CC0 licensed ones can be reused under any license and changes do not have to be published.
 
-The library is [available](https://github.com/open62541/open62541/releases) in standard source and binary form. In addition, the single-file source distribution merges the entire library into a single .c and .h file that can be easily added to existing projects. Example server and client implementations can be found in the [/examples](examples/) directory or further down on this page.
-
-## Project Information
-
-Build Status:
-
-[![Build Status](https://img.shields.io/travis/open62541/open62541/master.svg)](https://travis-ci.org/open62541/open62541)
-[![Build Status](https://dev.azure.com/open62541/open62541/_apis/build/status/open62541.open62541?branchName=master)](https://dev.azure.com/open62541/open62541/_build/latest?definitionId=1&branchName=master)
-[![Build Status](https://ci.appveyor.com/api/projects/status/github/open62541/open62541?branch=master&svg=true)](https://ci.appveyor.com/project/open62541/open62541/branch/master)
-[![Build Status](https://img.shields.io/docker/cloud/build/open62541/open62541)](https://cloud.docker.com/u/open62541/repository/docker/open62541/open62541)
-
-Code Quality:
-
-[![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/open62541.svg)](https://bugs.chromium.org/p/oss-fuzz/issues/list?sort=-opened&can=1&q=proj:open62541)
-[![Codacy Badge](https://api.codacy.com/project/badge/Grade/68ad08e897624c77a64fc2be66ca7b50)](https://www.codacy.com/app/open62541/open62541?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=open62541/open62541&amp;utm_campaign=Badge_Grade)
-[![Total Alerts](https://img.shields.io/lgtm/alerts/g/open62541/open62541.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/open62541/open62541/alerts)
-[![Coverage Status](https://img.shields.io/coveralls/open62541/open62541/master.svg)](https://coveralls.io/r/open62541/open62541?branch=master)
-[![codecov](https://codecov.io/gh/open62541/open62541/branch/master/graph/badge.svg)](https://codecov.io/gh/open62541/open62541)
-[![Code Quality: Cpp](https://img.shields.io/lgtm/grade/cpp/g/open62541/open62541.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/open62541/open62541/context:cpp)
-
-General Project Info:
+The library is available in standard source and binary form. In addition, the single-file source distribution merges the entire library into a single .c and .h file that can be easily added to existing projects. Example server and client implementations can be found in the [/examples](examples/) directory or further down on this page.
 
 [![Open Hub Project Status](https://www.openhub.net/p/open62541/widgets/project_thin_badge.gif)](https://www.openhub.net/p/open62541/)
-[![Overall Downloads](https://img.shields.io/github/downloads/open62541/open62541/total.svg)](https://github.com/open62541/open62541/releases)
+[![Code Scanning](https://github.com/open62541/open62541/actions/workflows/codeql.yml/badge.svg)](https://github.com/open62541/open62541/actions/workflows/codeql.yml)
+[![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/open62541.svg)](https://issues.oss-fuzz.com/issues?q=project:open62541&s=created_time:desc)
+[![codecov](https://codecov.io/gh/open62541/open62541/branch/master/graph/badge.svg)](https://codecov.io/gh/open62541/open62541)
+[![Coverity Scan](https://scan.coverity.com/projects/12248/badge.svg)](https://scan.coverity.com/projects/open62541-open62541)
 
-### Features and Certification
+## Documentation and Support
 
-open62541 implements the OPC UA binary protocol stack as well as a client and server SDK. The final server binaries can be well under 100kb, depending on the selected features and the size of the information model.
+A general introduction to OPC UA and the open62541 documentation can be found at http://open62541.org.
+Past releases of the library can be downloaded at https://github.com/open62541/open62541/releases.
 
-- Communication Stack
-  - OPC UA binary protocol
-  - OPC UA JSON encoding
-  - Secure communication with encrypted messages
-  - Exchangeable network layer (plugin) for using custom networking APIs (e.g. on embedded targets)
-  - Support for generating data types from standard XML definitions
-- Server
-  - Support for all OPC UA node types
-  - Access control for individual nodes
-  - Support for generating server-side information models from standard XML definitions (nodesets)
-  - Support for adding and removing nodes and references also at runtime.
-  - Support for inheritance and instantiation of object- and variable-types (custom constructor/destructor, instantiation of child nodes)
-  - Support for subscriptions/monitoreditems (data change notifications and events)
-- Client
-  - All OPC UA services supported
-  - Asynchronous service requests
-  - Background handling of subscriptions
-- Publish/Subscribe
-  - UADP Binary protocol with UDP-multicast or Ethernet communication
-  - PubSub JSON encoding
+The overall open62541 community handles public support requests on Github and the mailing list.
+For individual discussion and support, use the following channels:
 
-### Official Certification
+- [Mailing List](https://groups.google.com/d/forum/open62541)
+- [Issue Tracker](https://github.com/open62541/open62541/issues)
+- [Pull Requests](https://github.com/open62541/open62541/pulls)
 
-The sample server (server_ctt) built using open62541 v1.0 is in conformance with the 'Micro Embedded Device Server' Profile of OPC Foundation supporting OPC UA client/server communication, subscriptions, method calls and security (encryption) with the security policies 'Basic128Rsa15', 'Basic256' and 'Basic256Sha256' and the facets 'method server' and 'node management'. See https://open62541.org/certified-sdk for more details.
+[o6 Automation GmbH](https://www.o6-automation.com/) employs the core contributors to open62541 and provides **[commercial support](https://www.o6-automation.com/services)**.
+The project is however open to outside contributions and **contributors retain their individual copyright**. This prevents future relicensing under different license conditions.
 
-PubSub (UADP) is implemented in open62541. But the feature cannot be certified at this point in time (Sep-2019) due to the lack of official test cases and testing tools.
+We want to foster an open and welcoming community. Please take our [code of conduct](CODE_OF_CONDUCT.md) into regard.
 
-During development, the Conformance Testing Tools (CTT) of the OPC Foundation are regularly applied.
-The CTT configuration and results are tracked at https://github.com/open62541/open62541-ctt. The OPC UA profiles under regular test in the CTT are currently:
+## Commercial Use
 
-- Micro Embedded Device Server
-- Method Server Facet
-- Node Management Facet
-- Security Policies
-  - Basic128Rsa15
-  - Basic256
-  - Basic256Sha256
-- User Tokens
-  - Anonymous Facet
-  - User Name Password Server Facet
+open62541 is licensed under the MPLv2. That is, changes to files under MPLv2 fall under the same open-source license.
+But the library can be combined with private development from separate files, also if a static binary is produced, without the license affecting the private files.
+See the full [license document](LICENSE) for details.
 
-See the page on [open62541 Features](FEATURES.md) for an in-depth look at the support for the conformance units that make up the OPC UA profiles.
-  
-### Dependencies
+## Official Certification
 
-On most systems, open62541 requires the C standard library only. For dependencies during the build process, see the following list and the [build documentation](https://open62541.org/doc/current/building.html) for details.
+An example server built with open62541 v1.4 was certified for the 'Standard Server 2017 Profile' by the OPC Foundation.
+See https://open62541.org/certification for more details.
 
-- Core Library: The core library has no dependencies besides the C99 standard headers.
-- Default Plugins: The default plugins use the POSIX interfaces for networking and accessing the system clock. Ports to different (embedded) architectures are achieved by customizing the plugins.
-- Building and Code Generation: The build environment is generated via CMake. Some code is auto-generated from XML definitions that are part of the OPC UA standard. The code generation scripts run with both Python 2 and 3.
+## Build System, Code Structure and Dependencies
 
-**Note:**
-Specific optional features are dependent on third-party libraries. These are all listed under the `deps/` folder.
-Depending on the selected feature set, some of these libraries will be included in the resulting library.
+The build environment of open62541 is generated via CMake. See the [build documentation](https://www.open62541.org/doc/master/building.html) for details.
+To simplify the integration with existing software projects, the open62541 sources can be compressed (amalgamated) into a single-file-distribution, a pair of `open62541.c/.h` files.
+The functionality included in the single-file-distribution depends on the current CMake configuration.
 
-More information on the third-party libraries can be found in the corresponding [deps/README.md](deps/README.md)
+The source code is structured as follows:
+
+- Public API (`/include`): The public API is exposed to applications using open62541. The headers for plugin implementations are in `/plugins/include`.
+- Core Library (`/src`): The core library has no dependencies besides the C99 standard headers.
+- Architecture Support (`/arch`): Architecture support is implemented via the `EventLoop` plugin. This keeps the architecture-specific code - for example to use the POSIX APIs - out of the core library. Ports to different (embedded) architectures are provided.
+- Default Plugins Implementations (`/plugins`): The plugin interfaces allow the integration with different backend systems and libraries. For example concerning crypto primitives, storage of the information model, and so on. Default implementations are provided.
+- Dependencies (`/deps`): Some additional libraries are used via git submodules or have been internalized in the `deps/` folder. More information on the third-party libraries and their respective licenses can be found in [deps/README.md](deps/README.md)
+- Building and Code Generation: Some code is auto-generated from XML definitions that are part of the OPC UA standard. The code generation scripts use Python as part of the build process.
+
+On most systems, a bare-bones open62541 requires the C standard library only.
+Depending on the build configuration, open62541 depends on additional libraries, such as mbedTLS or OpenSSL for encryption.
+
+## Development
+
+As an open source project, new contributors are encouraged to help improve open62541.
+The file [CONTRIBUTING.md](CONTRIBUTING.md) aggregates good practices that we expect for code contributions.
+The following are good starting points for new contributors:
+
+- [Report bugs](https://github.com/open62541/open62541/issues)
+- Improve the [documentation](http://open62541.org/doc/master)
+- Work on issues marked as "[good first issue](https://github.com/open62541/open62541/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)"
+
+For custom development that shall eventually become part of the open62541 library, please keep one of the core maintainers in the loop.
 
 ### Code Quality
 
@@ -96,117 +84,39 @@ We emphasize code quality. The following quality metrics are continuously checke
 
 - Zero errors indicated by the Compliance Testing Tool (CTT) of the OPC Foundation for the supported features
 - Zero compiler warnings from GCC/Clang/MSVC with very strict compilation flags
-- Zero issues indicated by unit tests (more than 80% coverage)
+- Zero issues indicated by unit tests (we target more than 80% code coverage)
 - Zero issues indicated by clang-analyzer, clang-tidy, cpp-check and the Codacy static code analysis tools
 - Zero unresolved issues from fuzzing the library in Google's oss-fuzz infrastructure
 - Zero issues indicated by Valgrind (Linux), DrMemory (Windows) and Clang AddressSanitizer / MemorySanitizer for the CTT tests, unit tests and fuzzing
 
-### Documentation and Support
+### Security and Vulnerability Handling
 
-A general introduction to OPC UA and the open62541 documentation can be found at http://open62541.org/doc/current.
-Past releases of the library can be downloaded at https://github.com/open62541/open62541/releases.
-To use the latest improvements, download a nightly build of the *single-file distribution* (the entire library merged into a single source and header file) from http://open62541.org/releases. Nightly builds of MSVC binaries of the library are available [here](https://ci.appveyor.com/project/open62541/open62541/build/artifacts).
+The project has established a process for handling vulnerabilities.
+See the [SECURITY.md](SECURITY.md) for details and how to responsibly disclose findings to the maintainers.
 
-For individual discussion and support, use the following channels:
+## Installation and Examples
 
-- the [mailing list](https://groups.google.com/d/forum/open62541)
-- our [IRC channel](http://webchat.freenode.net/?channels=%23open62541)
-- the [bugtracker](https://github.com/open62541/open62541/issues)
+On Debian/Ubuntu systems, a simple ```apt install libopen62541-1.4-dev``` installs the library and the development header files.
+Using the GCC compiler, just run ```gcc -std=c99 <server.c> -lopen62541 -o server```.
 
-We want to foster an open and welcoming community. Please take our [code of conduct](CODE_OF_CONDUCT.md) into regard.
-
-Jointly with the overall open62541 community, the core maintainers steer the long-term development. The current core maintainers are (as of April 2018, in alphabetical order):
-
-- Chris-Paul Iatrou (Dresden University of Technology, Chair for Process Control Systems Engineering)
-- Florian Palm (RWTH Aachen University, Chair of Process Control Engineering)
-- Julius Pfrommer (Fraunhofer IOSB, Karlsruhe)
-- Stefan Profanter (fortiss, Munich)
-
-### Docker container
-
-Official docker container builds are available on [Docker Cloud](https://cloud.docker.com/u/open62541/repository/registry-1.docker.io/open62541/open62541)
-
-More information can be found in the [Docker README](docker/README.md)
-
-## Support & Development
-
-### Commercial Support
-
-The open62541 community handles support requests for the open source library and its development. Custom development and individual support is provided by commercial partners that are affiliated with open62541:
-
-- [Kalycito Infotech, Tamil Nadu, INDIA](https://www.kalycito.com/landing/open62541-commercial-partner) for embedded and realtime IIoT applications (Contact: enterprise.services@kalycito.com)
-- [basysKom GmbH, Darmstadt, Germany](https://www.basyskom.com/) Software Engineering for Embedded Systems. (Contact: info@basysKom.com) 
-
-For custom development that shall eventually become part of the open62541 library, please keep one of the core maintainers in the loop. Again, please note that all changes to files that are already licensed under the MPLv2 automatically become MPLv2 as well. Static linking of the open62541 library with code under a different license is possible. All architecture-specific code is implemented in the form of exchangeable plugins under a very permissible CC0 license.
-
-### Development
-
-As an open source project, new contributors are encouraged to help improve open62541. The following are good starting points for new contributors:
-
-- [Report bugs](https://github.com/open62541/open62541/issues)
-- Improve the [documentation](http://open62541.org/doc/current)
-- Work on issues marked as "[good first issue](https://github.com/open62541/open62541/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)"
-
-### Success Stories and Users of open62541
-
-A list of projects and companies using our open62541 stack can be found in our Wiki:
-
-https://github.com/open62541/open62541/wiki/References-to-open62541
-
-## Installation and code usage
-
-For every release, we provide some pre-packed release packages which you can directly use in your compile infrastructure.
-
-Have a look at the [release page](https://github.com/open62541/open62541/releases) and the corresponding attached assets.
-
-A more detailed explanation on how to install the open62541 SDK is given in our [documentation](https://open62541.org/doc/current/installing.html).
-
-You can not directly download a .zip package from the main branches using the Github UI, since then some of the submodules and version strings are missing.
-Therefore you have three options to install and use this stack:
-
-- **Recommended:** Use any of the prepared packages attached to every release or in the package repository of your distro (if available).  
-  Please check the install guide for more info.
-  
-- Download a .zip package of special `pack/` branches.  
-  These pack branches are up-to-date with the corresponding base branches, but already have the submodules in-place and the version string set correctly.  
-  Here are some direct download links for the current pack branches:  
-  - [pack/master.zip](https://github.com/open62541/open62541/archive/pack/master.zip)
-  - [pack/1.0.zip](https://github.com/open62541/open62541/archive/pack/1.0.zip)
-   
-- Clone this repository and initialize all the submodules using `git submodule update --init --recursive`. Then either use `make install` or setup your CMake project correspondingly.
-
-## Examples
+A more detailed explanation on how to install the open62541 SDK is given in our [documentation](https://www.open62541.org/doc/master/building.html#building-the-library).
+In essence, clone the repository and initialize all the submodules using `git submodule update --init --recursive`. Then use CMake to configure your build.
 
 A complete list of examples can be found in the [examples directory](https://github.com/open62541/open62541/tree/master/examples).
 
-To build the examples, we recommend to install the open62541 project as mentioned in previous section.
-
 ### Example Server Implementation
 
-The following simple server example can be built using gcc, after you installed open62541 on your system.
-
-Using the GCC compiler, just run ```gcc -std=c99 -lopen62541 -DUA_ARCHITECTURE_POSIX <server.c> -o server``` (under Windows you may need to add ``` -lws2_32``` 
-and change `-DUA_ARCHITECTURE_POSIX` to `-DUA_ARCHITECTURE_WIN32`).
 ```c
-#include <signal.h>
 #include <open62541/server.h>
-#include <open62541/server_config_default.h>
-
-UA_Boolean running = true;
-void signalHandler(int sig) {
-    running = false;
-}
 
 int main(int argc, char** argv)
 {
-    signal(SIGINT, signalHandler); /* catch ctrl-c */
-
-    /* Create a server listening on port 4840 */
+    /* Create a server listening on port 4840 (default) */
     UA_Server *server = UA_Server_new();
-    UA_ServerConfig_setDefault(UA_Server_getConfig(server));
 
-    /* Add a variable node */
-    /* 1) Define the node attributes */
+    /* Add a variable node to the server */
+
+    /* 1) Define the variable attributes */
     UA_VariableAttributes attr = UA_VariableAttributes_default;
     attr.displayName = UA_LOCALIZEDTEXT("en-US", "the answer");
     UA_Int32 myInteger = 42;
@@ -214,28 +124,30 @@ int main(int argc, char** argv)
 
     /* 2) Define where the node shall be added with which browsename */
     UA_NodeId newNodeId = UA_NODEID_STRING(1, "the.answer");
-    UA_NodeId parentNodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
-    UA_NodeId parentReferenceNodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES);
+    UA_NodeId parentNodeId = UA_NS0ID(OBJECTSFOLDER);
+    UA_NodeId parentReferenceNodeId = UA_NS0ID(ORGANIZES);
     UA_NodeId variableType = UA_NODEID_NULL; /* take the default variable type */
     UA_QualifiedName browseName = UA_QUALIFIEDNAME(1, "the answer");
 
     /* 3) Add the node */
-    UA_Server_addVariableNode(server, newNodeId, parentNodeId, parentReferenceNodeId,
-                              browseName, variableType, attr, NULL, NULL);
+    UA_Server_addVariableNode(server, newNodeId, parentNodeId,
+                              parentReferenceNodeId, browseName,
+                              variableType, attr, NULL, NULL);
 
-    /* Run the server loop */
-    UA_StatusCode status = UA_Server_run(server, &running);
+    /* Run the server (until ctrl-c interrupt) */
+    UA_StatusCode status = UA_Server_runUntilInterrupt(server);
 
+    /* Clean up */
     UA_Server_delete(server);
-    return status;
+    return status == UA_STATUSCODE_GOOD ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 ```
 
 ### Example Client Implementation
+
 ```c
 #include <stdio.h>
 #include <open62541/client.h>
-#include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
 
 int main(int argc, char *argv[])
@@ -262,6 +174,6 @@ int main(int argc, char *argv[])
     /* Clean up */
     UA_Variant_clear(&value);
     UA_Client_delete(client); /* Disconnects the client internally */
-    return status;
+    return status == UA_STATUSCODE_GOOD ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 ```

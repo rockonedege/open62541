@@ -13,6 +13,7 @@
 #define UA_OPEN62541_VER_PATCH ${OPEN62541_VER_PATCH}
 #define UA_OPEN62541_VER_LABEL "${OPEN62541_VER_LABEL}" /* Release candidate label, etc. */
 #define UA_OPEN62541_VER_COMMIT "${OPEN62541_VER_COMMIT}"
+#define UA_OPEN62541_VERSION "${OPEN62541_VERSION}"
 
 /**
  * Feature Options
@@ -20,59 +21,73 @@
  * Changing the feature options has no effect on a pre-compiled library. */
 
 #define UA_LOGLEVEL ${UA_LOGLEVEL}
-#ifndef UA_ENABLE_AMALGAMATION
 #cmakedefine UA_ENABLE_AMALGAMATION
-#endif
-#cmakedefine UA_ENABLE_METHODCALLS
 #cmakedefine UA_ENABLE_NODEMANAGEMENT
 #cmakedefine UA_ENABLE_SUBSCRIPTIONS
 #cmakedefine UA_ENABLE_PUBSUB
-#cmakedefine UA_ENABLE_PUBSUB_ENCRYPTION
 #cmakedefine UA_ENABLE_PUBSUB_FILE_CONFIG
-#cmakedefine UA_ENABLE_PUBSUB_ETH_UADP
-#cmakedefine UA_ENABLE_PUBSUB_DELTAFRAMES
 #cmakedefine UA_ENABLE_PUBSUB_INFORMATIONMODEL
-#cmakedefine UA_ENABLE_PUBSUB_INFORMATIONMODEL_METHODS
-#cmakedefine UA_ENABLE_DA
-#cmakedefine UA_ENABLE_ENCRYPTION
+#cmakedefine UA_ENABLE_DIAGNOSTICS
 #cmakedefine UA_ENABLE_HISTORIZING
-#cmakedefine UA_ENABLE_PARSING
-#cmakedefine UA_ENABLE_EXPERIMENTAL_HISTORIZING
+#cmakedefine UA_ENABLE_AUDITING
 #cmakedefine UA_ENABLE_SUBSCRIPTIONS_EVENTS
 #cmakedefine UA_ENABLE_JSON_ENCODING
-#cmakedefine UA_ENABLE_PUBSUB_MQTT
+#cmakedefine UA_ENABLE_XML_ENCODING
+#cmakedefine UA_ENABLE_MQTT
+#cmakedefine UA_ENABLE_LWS_MQTT
+#cmakedefine UA_ENABLE_NODESET_INJECTOR
+#cmakedefine UA_INFORMATION_MODEL_AUTOLOAD
+#cmakedefine UA_ENABLE_RBAC
+#cmakedefine UA_ENABLE_TPM2_SECURITY
+
 #cmakedefine UA_ENABLE_ENCRYPTION_MBEDTLS
 #cmakedefine UA_ENABLE_ENCRYPTION_OPENSSL
-#cmakedefine UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS
+#cmakedefine UA_ENABLE_ENCRYPTION_LIBRESSL
+#if defined(UA_ENABLE_ENCRYPTION_MBEDTLS) || \
+    defined(UA_ENABLE_ENCRYPTION_OPENSSL) || \
+    defined(UA_ENABLE_ENCRYPTION_LIBRESSL)
+# define UA_ENABLE_ENCRYPTION
+#endif
+
+/* Role-Based Access Control (RBAC)
+ * Configurable storage size (in bytes) for the node permission index.
+ * Valid options: 2, 4 (default), 8
+ * The index references a position in the server's internal rolePermissions
+ * array. Larger sizes allow more distinct role-permission configurations
+ * at the cost of increased per-node memory usage. */
+#ifndef UA_ROLEPERMISSIONS_NODE_SIZE_BYTE
+# define UA_ROLEPERMISSIONS_NODE_SIZE_BYTE 4
+#endif
 
 /* Multithreading */
-#cmakedefine UA_ENABLE_IMMUTABLE_NODES
 #define UA_MULTITHREADING ${UA_MULTITHREADING}
+
+/* Driver */
+#cmakedefine UA_ENABLE_DRIVER_FILE_TRANSFER
+#cmakedefine UA_ENABLE_DRIVER_MDNS_MDNSD
+#cmakedefine UA_ENABLE_DRIVER_MDNS_AVAHI
+#cmakedefine UA_ENABLE_DRIVER_GDS_RECEIVER
 
 /* Advanced Options */
 #cmakedefine UA_ENABLE_STATUSCODE_DESCRIPTIONS
 #cmakedefine UA_ENABLE_TYPEDESCRIPTION
+#cmakedefine UA_ENABLE_INLINABLE_EXPORT
 #cmakedefine UA_ENABLE_NODESET_COMPILER_DESCRIPTIONS
 #cmakedefine UA_ENABLE_DETERMINISTIC_RNG
-#cmakedefine UA_ENABLE_DISCOVERY
-#cmakedefine UA_ENABLE_DISCOVERY_MULTICAST
-#cmakedefine UA_ENABLE_WEBSOCKET_SERVER
+#cmakedefine UA_ENABLE_LWS
+#cmakedefine UA_ENABLE_HTTP_COMPRESSION
+#cmakedefine UA_ENABLE_EVENTLOOP_GLIB
 #cmakedefine UA_ENABLE_QUERY
-#cmakedefine UA_ENABLE_MALLOC_SINGLETON
 #cmakedefine UA_ENABLE_DISCOVERY_SEMAPHORE
-#cmakedefine UA_ENABLE_UNIT_TEST_FAILURE_HOOKS
-#cmakedefine UA_ENABLE_VALGRIND_INTERACTIVE
-#define UA_VALGRIND_INTERACTIVE_INTERVAL ${UA_VALGRIND_INTERACTIVE_INTERVAL}
+#cmakedefine UA_NAMESPACE_ZERO_MINIMAL
 #cmakedefine UA_GENERATED_NAMESPACE_ZERO
 #cmakedefine UA_GENERATED_NAMESPACE_ZERO_FULL
-#cmakedefine UA_ENABLE_PUBSUB_MONITORING
-#cmakedefine UA_ENABLE_PUBSUB_BUFMALLOC
-
-#cmakedefine UA_PACK_DEBIAN
+#cmakedefine UA_ENABLE_PUBSUB_SKS
 
 /* Options for Debugging */
 #cmakedefine UA_DEBUG
 #cmakedefine UA_DEBUG_DUMP_PKGS
+#cmakedefine UA_DEBUG_FILE_LINE_INFO
 
 /**
  * Function Export
@@ -98,18 +113,398 @@
 # endif
 #endif
 
-/* Select default architecture if non is selected through CMake or compiler define */
-#if ${UA_ARCHITECTURES_NODEF}
-# ifdef _WIN32
-#  define UA_ARCHITECTURE_WIN32
+/**
+ * Inline Functions
+ * ---------------- */
+#ifdef _MSC_VER
+# define UA_INLINE __inline
+#else
+# define UA_INLINE inline
+#endif
+
+/* An inlinable method is typically defined as "static inline". Some
+ * applications, such as language bindings with a C FFI (foreign function
+ * interface), can however not work with static inline methods. These can set
+ * the global UA_ENABLE_INLINABLE_EXPORT macro which causes all inlinable
+ * methods to be exported as a regular public API method.
+ *
+ * Note that UA_ENABLE_INLINABLE_EXPORT has a negative impact for both size and
+ * performance of the library. */
+#if defined(UA_ENABLE_INLINABLE_EXPORT) && defined(UA_INLINABLE_IMPL)
+# define UA_INLINABLE(decl, impl) UA_EXPORT decl; decl impl
+#elif defined(UA_ENABLE_INLINABLE_EXPORT)
+# define UA_INLINABLE(decl, impl) UA_EXPORT decl;
+#else
+# define UA_INLINABLE(decl, impl) static UA_INLINE decl impl
+#endif
+
+/**
+ * Thread-Local Variables
+ * ----------------------
+ * Not all platforms have thread-local variables. When available we use them to
+ * get speed-ups by pre-populating data structures with the following pattern:
+ *
+ * (Only) inside a function we define some variable with UA_STATIC_THREAD_LOCAL.
+ * If thread-local storage is available the variable is created and initially
+ * populated once per thread. If thread-local storage is not available, then the
+ * variable is always newly created on the stack. This allows the same code for
+ * both cases with and without thread-local storage. */
+
+#if UA_MULTITHREADING >= 100
+# if defined(_MSC_VER)
+#  define UA_STATIC_THREAD_LOCAL static __declspec(thread)
+# elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#  define UA_STATIC_THREAD_LOCAL static _Thread_local /* C11 or newer */
+# elif defined(__GNUC__) || defined(__clang__)
+#  define UA_STATIC_THREAD_LOCAL static __thread
+# endif
+#endif
+#ifndef UA_STATIC_THREAD_LOCAL
+# define UA_STATIC_THREAD_LOCAL /* No __thread and (ALSO!!) no static */
+#endif
+
+/**
+ * Atomic Operations
+ * -----------------
+ * Atomic operations synchronize across processor cores and enable lockless
+ * multi-threading. The following macro definitions generalize the C11 atomic
+ * operations for integers and pointers. But we only support void-ptr /
+ * uintptr_t elements to help maintaining portable code. Explicit casting to
+ * uintptr_t is done on platforms that require it.
+ *
+ * - T UA_atomic_load(T* addr);
+ * - void UA_atomic_store(T *addr, T newval);
+ * - void UA_atomic_xchg(T *addr, T newval, T* old);
+ * - void UA_atomic_cmpxchg(T *addr, T *expected, T newval); */
+
+/* More atomic implementations in the arch-specific headers */
+#if UA_MULTITHREADING < 100 /* Naive definitions without multithreading */
+# define UA_atomic(T) T
+# define UA_atomic_load(addr) (*(addr))
+# define UA_atomic_store(addr, newval) do { *addr = newval; } while(0)
+# define UA_atomic_xchg(addr, newval, old)                              \
+    do { *old = *addr; *addr = newval; } while(0)
+# define UA_atomic_cmpxchg(addr, expected, newval)                      \
+    do { if(*addr == *expected) { *addr = newval; }                     \
+         else                   { *expected = *addr; } } while(0)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && \
+     !defined(__STDC_NO_ATOMICS__) /* C11 Atomics */
+# ifdef __cplusplus
+#  include <atomic>
+#  define UA_atomic(T) std::atomic<T>
 # else
-#  define UA_ARCHITECTURE_POSIX
+#  include <stdatomic.h>
+#  define UA_atomic(T) _Atomic(T)
+# endif
+# define UA_atomic_load(addr) atomic_load(addr)
+# define UA_atomic_store(addr, newval) atomic_store(addr, newval)
+# define UA_atomic_xchg(addr, newval, old)                              \
+    do { *old = atomic_exchange(addr, newval); } while(0)
+# define UA_atomic_cmpxchg(addr, expected, newval)                      \
+    atomic_compare_exchange_strong(addr, expected, newval);
+#elif defined(__GNUC__) || defined(__clang__) /* GCC and Clang intrinsics */
+# define UA_atomic(T) T
+# define UA_atomic_load(addr)                                           \
+    __atomic_load_n(addr, __ATOMIC_SEQ_CST)
+# define UA_atomic_store(addr, newval)                                  \
+    __atomic_store_n(addr, newval, __ATOMIC_SEQ_CST)
+# define UA_atomic_xchg(addr, newval, old)                              \
+    do {                                                                \
+        *old = __atomic_exchange_n(addr, newval, __ATOMIC_SEQ_CST);     \
+    } while(0)
+# define UA_atomic_cmpxchg(addr, expected, newval)                      \
+    __atomic_compare_exchange_n(addr, expected, newval, false,          \
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#endif
+
+/* Stack-allocation of memory. Use C99 variable-length arrays if possible.
+ * Otherwise revert to alloca. Note that alloca is not supported on some
+ * platforms. */
+#ifndef UA_STACKARRAY
+# if defined(__GNUC__) || defined(__clang__)
+#  define UA_STACKARRAY(TYPE, NAME, SIZE) TYPE NAME[SIZE]
+# else
+# if defined(__GNUC__) || defined(__clang__)
+#  define UA_alloca(size) __builtin_alloca (size)
+# elif defined(_WIN32)
+#  define UA_alloca(SIZE) _alloca(SIZE)
+# else
+#  include <alloca.h>
+#  define UA_alloca(SIZE) alloca(SIZE)
+# endif
+#  define UA_STACKARRAY(TYPE, NAME, SIZE) \
+    /* cppcheck-suppress allocaCalled */  \
+    TYPE *(NAME) = (TYPE*)UA_alloca(sizeof(TYPE) * (SIZE))
 # endif
 #endif
 
-// specific architectures can undef this
-#define UA_HAS_GETIFADDR
+/**
+ * Assertions
+ * ----------
+ * The assert macro is disabled by defining NDEBUG. It is often forgotten to
+ * include -DNDEBUG in the compiler flags when using the single-file release. So
+ * we make assertions dependent on the UA_DEBUG definition handled by CMake. */
+#ifdef UA_DEBUG
+# define UA_assert(ignore) assert(ignore)
+#else
+# define UA_assert(ignore) do {} while(0)
+#endif
 
-#include "${UA_ARCHITECTURE}/ua_architecture.h"
+/* Outputs an error message at compile time if the assert fails.
+ * Example usage: UA_STATIC_ASSERT(sizeof(long)==7, use_another_compiler_luke)
+ * See: https://stackoverflow.com/a/4815532/869402 */
+#if defined(__cplusplus) && __cplusplus >= 201103L                 /* C++11 or above */
+# define UA_STATIC_ASSERT(cond,msg) static_assert(cond, #msg)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L     /* C11 or above */
+# define UA_STATIC_ASSERT(cond,msg) _Static_assert(cond, #msg)
+#elif defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER) /* GCC, Clang, MSC */
+# define UA_CTASTR2(pre,post) pre ## post
+# define UA_CTASTR(pre,post) UA_CTASTR2(pre,post)
+# ifndef __COUNTER__ /* PPC GCC fix */
+#  define __COUNTER__ __LINE__
+# endif
+# define UA_STATIC_ASSERT(cond,msg)                             \
+    typedef struct {                                            \
+        unsigned int UA_CTASTR(static_assertion_failed_,msg) : !!(cond); \
+    } UA_CTASTR(static_assertion_failed_,__COUNTER__)
+#else /* Everybody else */
+# define UA_STATIC_ASSERT(cond,msg) typedef char static_assertion_##msg[(cond)?1:-1]
+#endif
+
+/**
+ * Locking for Multithreading
+ * --------------------------
+ * If locking is enabled, the locks must be reentrant. That is, the same thread
+ * must be able to take the same lock several times. This is required because we
+ * sometimes call a user-defined callback when the server-lock is still held.
+ * The user-defined code then should be able to call (public) methods which
+ * again take the server-lock. */
+
+/* See the arch-specific headers for the lock implementations */
+#if UA_MULTITHREADING < 100
+# define UA_LOCK_INIT(lock)
+# define UA_LOCK_DESTROY(lock)
+# define UA_LOCK(lock)
+# define UA_UNLOCK(lock)
+# define UA_LOCK_ASSERT(lock)
+#endif
+
+/**
+ * Functions that can be called from independent threads are marked with
+ * the UA_THREADSAFE macro. This is currently only an information for the
+ * developer. It can be used in the future for instrumentation and static
+ * code analysis. */
+#define UA_THREADSAFE
+
+/**
+ * Dynamic Linking
+ * ---------------
+ * Explicit attribute for functions to be exported in a shared library. */
+#if defined(_WIN32) && defined(UA_DYNAMIC_LINKING)
+# ifdef UA_DYNAMIC_LINKING_EXPORT /* export dll */
+#  ifdef __GNUC__
+#   define UA_EXPORT __attribute__ ((dllexport))
+#  else
+#   define UA_EXPORT __declspec(dllexport)
+#  endif
+# else /* import dll */
+#  ifdef __GNUC__
+#   define UA_EXPORT __attribute__ ((dllimport))
+#  else
+#   define UA_EXPORT __declspec(dllimport)
+#  endif
+# endif
+#else /* non win32 */
+# if __GNUC__ || __clang__
+#  define UA_EXPORT __attribute__ ((visibility ("default")))
+# endif
+#endif
+#ifndef UA_EXPORT
+# define UA_EXPORT /* fallback to default */
+#endif
+
+/**
+ * Non-aliasing pointers
+ * -------------------- */
+#ifdef _MSC_VER
+# define UA_RESTRICT __restrict
+#elif defined(__GNUC__)
+# define UA_RESTRICT __restrict__
+#elif defined(__CODEGEARC__)
+# define UA_RESTRICT _RESTRICT
+#else
+# define UA_RESTRICT restrict
+#endif
+
+/**
+ * Likely/Unlikely Conditions
+ * --------------------------
+ * Condition is likely/unlikely, to help branch prediction. */
+#if defined(__GNUC__) || defined(__clang__)
+# define UA_LIKELY(x) __builtin_expect((x), 1)
+# define UA_UNLIKELY(x) __builtin_expect((x), 0)
+#else
+# define UA_LIKELY(x) (x)
+# define UA_UNLIKELY(x) (x)
+#endif
+
+/**
+ * Function attributes
+ * ------------------- */
+#if defined(__GNUC__) || defined(__clang__)
+# define UA_FUNC_ATTR_MALLOC __attribute__((malloc))
+# define UA_FUNC_ATTR_PURE __attribute__ ((pure))
+# define UA_FUNC_ATTR_CONST __attribute__((const))
+# define UA_FORMAT(X,Y) __attribute__ ((format (printf, X, Y)))
+#elif defined(_MSC_VER) && _MSC_VER >= 1800
+# include <sal.h>
+# define UA_FUNC_ATTR_MALLOC
+# define UA_FUNC_ATTR_PURE
+# define UA_FUNC_ATTR_CONST
+# define UA_FORMAT(X,Y)
+#else
+# define UA_FUNC_ATTR_MALLOC
+# define UA_FUNC_ATTR_PURE
+# define UA_FUNC_ATTR_CONST
+# define UA_FORMAT(X,Y)
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+# define UA_DEPRECATED __attribute__((deprecated))
+#elif defined(_MSC_VER)
+# define UA_DEPRECATED __declspec(deprecated)
+#else
+# define UA_DEPRECATED
+#endif
+
+/**
+ * Internal Attributes
+ * -------------------
+ * These attributes are only defined if the macro UA_INTERNAL is defined. That
+ * way public methods can be annotated (e.g. to warn for unused results) but
+ * warnings are only triggered for internal code. */
+
+#if defined(UA_INTERNAL) && (defined(__GNUC__) || defined(__clang__))
+# define UA_INTERNAL_DEPRECATED \
+    _Pragma ("GCC warning \"Macro is deprecated for internal use\"")
+#else
+# define UA_INTERNAL_DEPRECATED
+#endif
+
+#if defined(UA_INTERNAL) && (defined(__GNUC__) || defined(__clang__))
+# define UA_INTERNAL_FUNC_ATTR_WARN_UNUSED_RESULT \
+    __attribute__((warn_unused_result))
+#else
+# define UA_INTERNAL_FUNC_ATTR_WARN_UNUSED_RESULT
+#endif
+
+/**
+ * Detect Endianness and IEEE 754 floating point
+ * ---------------------------------------------
+ * Integers and floating point numbers are transmitted in little-endian (IEEE
+ * 754 for floating point) encoding. If the target architecture uses the same
+ * format, numeral datatypes can be memcpy'd (overlayed) on the network buffer.
+ * Otherwise, a slow default encoding routine is used that works for every
+ * architecture.
+ *
+ * Integer Endianness
+ * ^^^^^^^^^^^^^^^^^^
+ * The definition ``UA_LITTLE_ENDIAN`` is true when the integer representation
+ * of the target architecture is little-endian. */
+#ifndef UA_LITTLE_ENDIAN
+# if defined(_WIN32) /* Win32 */
+#  define UA_LITTLE_ENDIAN 1
+# elif defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) /* GCC, Clang */
+#  define UA_LITTLE_ENDIAN (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+# elif defined(__ARM_ACLE) /* Arm C Language Extensions */
+#  if defined(__ARM_BIG_ENDIAN)
+#   define UA_LITTLE_ENDIAN 0
+#  else
+#   define UA_LITTLE_ENDIAN 1
+#  endif
+# elif defined(__IAR_SYSTEMS_ICC__) && defined(__LITTLE_ENDIAN__) /* IAR */
+#  define UA_LITTLE_ENDIAN (__LITTLE_ENDIAN__ == 1)
+# elif defined(__i386__) || defined(__x86_64__) || defined(__amd64__) /* x86 */
+#  define UA_LITTLE_ENDIAN 1
+# else /* Unknown targets use the portable encoding path */
+#  define UA_LITTLE_ENDIAN 0
+# endif
+#endif
+
+/* Can the integers be memcpy'd onto the network buffer? Add additional checks
+ * here. Some platforms (e.g. QNX) have sizeof(bool) > 1. */
+#ifndef UA_BINARY_OVERLAYABLE_INTEGER
+# if UA_LITTLE_ENDIAN == 1
+#  ifdef __cplusplus
+UA_STATIC_ASSERT(sizeof(bool) == 1, cannot_overlay_integers_with_large_bool);
+#  else
+UA_STATIC_ASSERT(sizeof(_Bool) == 1, cannot_overlay_integers_with_large_bool);
+#  endif
+#  define UA_BINARY_OVERLAYABLE_INTEGER 1
+# else
+#  define UA_BINARY_OVERLAYABLE_INTEGER 0
+# endif
+#endif
+
+/**
+ * Float Endianness
+ * ^^^^^^^^^^^^^^^^
+ * The definition ``UA_FLOAT_IEEE754`` is set to true when the floating point
+ * number representation of the target architecture is IEEE 754. The definition
+ * ``UA_FLOAT_LITTLE_ENDIAN`` is set to true when the floating point number
+ * representation is in little-endian encoding. */
+
+#ifndef UA_FLOAT_IEEE754
+# if defined(_WIN32)
+#  define UA_FLOAT_IEEE754 1
+# elif defined(__i386__) || defined(__x86_64__)  || defined(__amd64__) || \
+       defined(__ia64__) || defined(__powerpc__) || defined(__sparc__) || \
+       defined(__arm__)  || defined(__aarch64__) || defined(__arm64__)
+#  define UA_FLOAT_IEEE754 1
+# elif defined(__STDC_IEC_559__)
+#  define UA_FLOAT_IEEE754 1
+# elif defined(ESP_PLATFORM)
+#  define UA_FLOAT_IEEE754 1
+# else
+#  define UA_FLOAT_IEEE754 0
+# endif
+#endif
+
+/* Wikipedia says (https://en.wikipedia.org/wiki/Endianness): Although the
+ * ubiquitous x86 processors of today use little-endian storage for all types of
+ * data (integer, floating point, BCD), there are a number of hardware
+ * architectures where floating-point numbers are represented in big-endian form
+ * while integers are represented in little-endian form. */
+#if defined(_WIN32)
+# define UA_FLOAT_LITTLE_ENDIAN 1
+#elif defined(__i386__) || defined(__x86_64__) || defined(__amd64__)
+# define UA_FLOAT_LITTLE_ENDIAN 1
+#elif defined(__FLOAT_WORD_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    (__FLOAT_WORD_ORDER__ == __ORDER_LITTLE_ENDIAN__) /* Defined only in GCC */
+# define UA_FLOAT_LITTLE_ENDIAN 1
+#elif defined(__FLOAT_WORD_ORDER) && defined(__LITTLE_ENDIAN) && \
+    (__FLOAT_WORD_ORDER == __LITTLE_ENDIAN) /* Defined only in GCC */
+# define UA_FLOAT_LITTLE_ENDIAN 1
+#elif defined(__clang__) && (UA_LITTLE_ENDIAN == 1)
+# define UA_FLOAT_LITTLE_ENDIAN 1 /* Clang assumption (ARM64, x86_64, ...) */
+#endif
+#ifndef UA_FLOAT_LITTLE_ENDIAN
+# define UA_FLOAT_LITTLE_ENDIAN 0
+#endif
+
+/* Only if the floating points are litle-endian **and** in IEEE 754 format can
+ * we memcpy directly onto the network buffer. */
+#if (UA_FLOAT_IEEE754 == 1) && (UA_FLOAT_LITTLE_ENDIAN == 1)
+# define UA_BINARY_OVERLAYABLE_FLOAT 1
+#else
+# define UA_BINARY_OVERLAYABLE_FLOAT 0
+#endif
+
+/**
+ * Architecture
+ * ------------
+ * Definitions to enable architecture-specific includes and features. */
+#cmakedefine UA_ARCHITECTURE_LWIP /* Can be used with multiple archs  */
+#include "${UA_ARCHITECTURE_INCLUDE}"
 
 #endif /* UA_CONFIG_H_ */

@@ -2,8 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
- * Copyright (c) 2017 - 2018 Fraunhofer IOSB (Author: Tino Bischoff)
+ * Copyright (c) 2017-2018 Fraunhofer IOSB (Author: Tino Bischoff)
  * Copyright (c) 2017-2019 Fraunhofer IOSB (Author: Andreas Ebner)
+ * Copyright (c) 2025 Fraunhofer IOSB (Author: Julius Pfrommer)
+ * Copyright 2025 (c) o6 Automation GmbH (Author: Julius Pfrommer)
  */
 
 #ifndef UA_PUBSUB_NETWORKMESSAGE_H_
@@ -12,300 +14,154 @@
 #include <open62541/types.h>
 #include <open62541/types_generated.h>
 #include <open62541/plugin/securitypolicy.h>
+#include <open62541/pubsub.h>
+
+#include "../ua_types_encoding.h"
+
+#ifdef UA_ENABLE_PUBSUB
 
 _UA_BEGIN_DECLS
 
-/* DataSet Payload Header */
 typedef struct {
-    UA_Byte count;
-    UA_UInt16* dataSetWriterIds;
-} UA_DataSetPayloadHeader;
-
-/* FieldEncoding Enum  */
-typedef enum {
-    UA_FIELDENCODING_VARIANT = 0,
-    UA_FIELDENCODING_RAWDATA = 1,
-    UA_FIELDENCODING_DATAVALUE = 2
-} UA_FieldEncoding;
-
-/* DataSetMessage Type */
-typedef enum {
-    UA_DATASETMESSAGE_DATAKEYFRAME = 0,
-    UA_DATASETMESSAGE_DATADELTAFRAME = 1,
-    UA_DATASETMESSAGE_EVENT = 2,
-    UA_DATASETMESSAGE_KEEPALIVE = 3
-} UA_DataSetMessageType;
-
-/* DataSetMessage Header */
-typedef struct {
-    UA_Boolean dataSetMessageValid;
-    UA_FieldEncoding fieldEncoding;
-    UA_Boolean dataSetMessageSequenceNrEnabled;
-    UA_Boolean timestampEnabled;
-    UA_Boolean statusEnabled;
-    UA_Boolean configVersionMajorVersionEnabled;
-    UA_Boolean configVersionMinorVersionEnabled;
-    UA_DataSetMessageType dataSetMessageType;
-    UA_Boolean picoSecondsIncluded;
-    UA_UInt16 dataSetMessageSequenceNr;
-    UA_UtcTime timestamp;
-    UA_UInt16 picoSeconds;
-    UA_UInt16 status;
-    UA_UInt32 configVersionMajorVersion;
-    UA_UInt32 configVersionMinorVersion;
-} UA_DataSetMessageHeader;
-
-/**
- * DataSetMessage
- * ^^^^^^^^^^^^^^ */
+    Ctx ctx;
+    UA_NetworkMessage_EncodingOptions eo;
+    UA_PubSubOffsetTable *ot;
+} PubSubEncodeCtx;
 
 typedef struct {
-    UA_UInt16 fieldCount;
-    UA_DataValue* dataSetFields;
-    UA_ByteString rawFields;
-    /* Json keys for the dataSetFields: TODO: own dataSetMessageType for json? */
-    UA_String* fieldNames;
-} UA_DataSetMessage_DataKeyFrameData;
+    Ctx ctx;
+    UA_NetworkMessage_EncodingOptions eo;
+} PubSubDecodeCtx;
+
+#ifdef UA_ENABLE_JSON_ENCODING
+typedef struct {
+    CtxJson ctx;
+    UA_NetworkMessage_EncodingOptions eo;
+} PubSubEncodeJsonCtx;
 
 typedef struct {
-    UA_UInt16 fieldIndex;
-    UA_DataValue fieldValue;
-} UA_DataSetMessage_DeltaFrameField;
-
-typedef struct {
-    UA_UInt16 fieldCount;
-    UA_DataSetMessage_DeltaFrameField* deltaFrameFields;
-} UA_DataSetMessage_DataDeltaFrameData;
-
-typedef struct {
-    UA_DataSetMessageHeader header;
-    union {
-        UA_DataSetMessage_DataKeyFrameData keyFrameData;
-        UA_DataSetMessage_DataDeltaFrameData deltaFrameData;
-    } data;
-} UA_DataSetMessage;
-
-typedef struct {
-    UA_UInt16* sizes;
-    UA_DataSetMessage* dataSetMessages;
-} UA_DataSetPayload;
-
-typedef enum {
-    UA_PUBLISHERDATATYPE_BYTE = 0,
-    UA_PUBLISHERDATATYPE_UINT16 = 1,
-    UA_PUBLISHERDATATYPE_UINT32 = 2,
-    UA_PUBLISHERDATATYPE_UINT64 = 3,
-    UA_PUBLISHERDATATYPE_STRING = 4
-} UA_PublisherIdDatatype;
-
-typedef enum {
-    UA_NETWORKMESSAGE_DATASET = 0,
-    UA_NETWORKMESSAGE_DISCOVERY_REQUEST = 1,
-    UA_NETWORKMESSAGE_DISCOVERY_RESPONSE = 2
-} UA_NetworkMessageType;
-
-/**
- * UA_NetworkMessageGroupHeader
- * ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ */
-typedef struct {
-    UA_Boolean writerGroupIdEnabled;
-    UA_Boolean groupVersionEnabled;
-    UA_Boolean networkMessageNumberEnabled;
-    UA_Boolean sequenceNumberEnabled;
-    UA_UInt16 writerGroupId;
-    UA_UInt32 groupVersion; // spec: type "VersionTime"
-    UA_UInt16 networkMessageNumber;
-    UA_UInt16 sequenceNumber;
-} UA_NetworkMessageGroupHeader;
-
-/**
- * UA_NetworkMessageSecurityHeader
- * ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ */
-typedef struct {
-    UA_Boolean networkMessageSigned;
-    UA_Boolean networkMessageEncrypted;
-    UA_Boolean securityFooterEnabled;
-    UA_Boolean forceKeyReset;
-    UA_UInt32 securityTokenId;      // spec: IntegerId
-    UA_ByteString messageNonce;
-    UA_UInt16 securityFooterSize;
-} UA_NetworkMessageSecurityHeader;
-
-/**
- * UA_NetworkMessage
- * ^^^^^^^^^^^^^^^^^ */
-typedef struct {
-    UA_Byte version;
-    UA_Boolean messageIdEnabled;
-    UA_String messageId; /* For Json NetworkMessage */
-    UA_Boolean publisherIdEnabled;
-    UA_Boolean groupHeaderEnabled;
-    UA_Boolean payloadHeaderEnabled;
-    UA_PublisherIdDatatype publisherIdType;
-    UA_Boolean dataSetClassIdEnabled;
-    UA_Boolean securityEnabled;
-    UA_Boolean timestampEnabled;
-    UA_Boolean picosecondsEnabled;
-    UA_Boolean chunkMessage;
-    UA_Boolean promotedFieldsEnabled;
-    UA_NetworkMessageType networkMessageType;
-    union {
-        UA_Byte publisherIdByte;
-        UA_UInt16 publisherIdUInt16;
-        UA_UInt32 publisherIdUInt32;
-        UA_UInt64 publisherIdUInt64;
-        UA_Guid publisherIdGuid;
-        UA_String publisherIdString;
-    } publisherId;
-    UA_Guid dataSetClassId;
-
-    UA_NetworkMessageGroupHeader groupHeader;
-
-    union {
-        UA_DataSetPayloadHeader dataSetPayloadHeader;
-    } payloadHeader;
-    
-    UA_DateTime timestamp;
-    UA_UInt16 picoseconds;
-    UA_UInt16 promotedFieldsSize;
-    UA_Variant* promotedFields; /* BaseDataType */
-    
-    UA_NetworkMessageSecurityHeader securityHeader;
-
-    union {
-        UA_DataSetPayload dataSetPayload;
-    } payload;
-    
-    UA_ByteString securityFooter;
-} UA_NetworkMessage;
-
-/**********************************************/
-/*          Network Message Offsets           */
-/**********************************************/
-
-/* Offsets for buffered messages in the PubSub fast path. */
-typedef enum {
-    UA_PUBSUB_OFFSETTYPE_DATASETMESSAGE_SEQUENCENUMBER,
-    UA_PUBSUB_OFFSETTYPE_NETWORKMESSAGE_SEQUENCENUMBER,
-    UA_PUBSUB_OFFSETTYPE_TIMESTAMP_PICOSECONDS,
-    UA_PUBSUB_OFFSETTYPE_TIMESTAMP,     /* source pointer */
-    UA_PUBSUB_OFFSETTYPE_TIMESTAMP_NOW, /* no source */
-    UA_PUBSUB_OFFSETTYPE_PAYLOAD_DATAVALUE,
-    UA_PUBSUB_OFFSETTYPE_PAYLOAD_VARIANT,
-    UA_PUBSUB_OFFSETTYPE_PAYLOAD_RAW,
-    /* For subscriber RT */
-    UA_PUBSUB_OFFSETTYPE_PUBLISHERID,
-    UA_PUBSUB_OFFSETTYPE_WRITERGROUPID,
-    UA_PUBSUB_OFFSETTYPE_DATASETWRITERID
-    /* Add more offset types as needed */
-} UA_NetworkMessageOffsetType;
-
-typedef struct {
-    UA_NetworkMessageOffsetType contentType;
-    union {
-        struct {
-            UA_DataValue *value;
-            size_t valueBinarySize;
-        } value;
-        UA_DateTime *timestamp;
-    } offsetData;
-    size_t offset;
-} UA_NetworkMessageOffset;
-
-typedef struct {
-    UA_ByteString buffer; /* The precomputed message buffer */
-    UA_NetworkMessageOffset *offsets; /* Offsets for changes in the message buffer */
-    size_t offsetsSize;
-    UA_Boolean RTsubscriberEnabled; /* Addtional offsets computation like publisherId, WGId if this bool enabled */
-    UA_NetworkMessage *nm; /* The precomputed NetworkMessage for subscriber */
-} UA_NetworkMessageOffsetBuffer;
-
-/**
- * DataSetMessage
- * ^^^^^^^^^^^^^^ */
-
-UA_StatusCode
-UA_DataSetMessageHeader_encodeBinary(const UA_DataSetMessageHeader* src,
-                                     UA_Byte **bufPos, const UA_Byte *bufEnd);
-
-UA_StatusCode
-UA_DataSetMessageHeader_decodeBinary(const UA_ByteString *src, size_t *offset,
-                                     UA_DataSetMessageHeader* dst);
-
-size_t
-UA_DataSetMessageHeader_calcSizeBinary(const UA_DataSetMessageHeader* p);
-
-UA_StatusCode
-UA_DataSetMessage_encodeBinary(const UA_DataSetMessage* src, UA_Byte **bufPos,
-                               const UA_Byte *bufEnd);
-
-UA_StatusCode
-UA_DataSetMessage_decodeBinary(const UA_ByteString *src, size_t *offset,
-                               UA_DataSetMessage* dst, UA_UInt16 dsmSize);
-
-size_t
-UA_DataSetMessage_calcSizeBinary(UA_DataSetMessage *p, UA_NetworkMessageOffsetBuffer *offsetBuffer,
-                                 size_t currentOffset);
-
-void UA_DataSetMessage_clear(const UA_DataSetMessage* p);
-
-/**
- * NetworkMessage
- * ^^^^^^^^^^^^^^ */
-
-UA_StatusCode
-UA_NetworkMessage_updateBufferedMessage(UA_NetworkMessageOffsetBuffer *buffer);
-
-UA_StatusCode
-UA_NetworkMessage_updateBufferedNwMessage(UA_NetworkMessageOffsetBuffer *buffer,
-                                          const UA_ByteString *src, size_t *bufferPosition);
-
-/* If dataToEncryptStart not-NULL, then it will be set to the start-position of
- * the payload in the buffer. */
-UA_StatusCode
-UA_NetworkMessage_encodeBinary(const UA_NetworkMessage* src,
-                               UA_Byte **bufPos, const UA_Byte *bufEnd,
-                               UA_Byte **dataToEncryptStart);
-
-UA_StatusCode
-UA_NetworkMessage_decodeBinary(const UA_ByteString *src, size_t *offset,
-                               UA_NetworkMessage* dst);
-
-size_t
-UA_NetworkMessage_calcSizeBinary(UA_NetworkMessage *p,
-                                 UA_NetworkMessageOffsetBuffer *offsetBuffer);
-
-#ifdef UA_ENABLE_PUBSUB_ENCRYPTION
-UA_StatusCode
-UA_NetworkMessage_signEncrypt(UA_NetworkMessage *nm, UA_MessageSecurityMode securityMode,
-                              UA_PubSubSecurityPolicy *policy, void *policyContext,
-                              UA_Byte *messageStart, UA_Byte *encryptStart,
-                              UA_Byte *sigStart);
+    ParseCtx ctx;
+    UA_NetworkMessage_EncodingOptions eo;
+} PubSubDecodeJsonCtx;
 #endif
 
-void
-UA_NetworkMessage_clear(UA_NetworkMessage* p);
+/* Keep component-count-dependent encoding metadata off the stack for large
+ * groups. Metadata borrows its field arrays, so only this array is freed. */
+#define UA_PUBSUB_METADATA_STACK_CAPACITY 16
 
-void
-UA_NetworkMessage_delete(UA_NetworkMessage* p);
+static UA_INLINE UA_DataSetMessage_EncodingMetaData *
+allocEncodingMetaData(size_t count, UA_DataSetMessage_EncodingMetaData *stack) {
+    if(count <= UA_PUBSUB_METADATA_STACK_CAPACITY) {
+        memset(stack, 0, count * sizeof(*stack));
+        return stack;
+    }
+    if(count > SIZE_MAX / sizeof(*stack))
+        return NULL;
+    return (UA_DataSetMessage_EncodingMetaData*)UA_calloc(count, sizeof(*stack));
+}
 
+static UA_INLINE void
+freeEncodingMetaData(UA_DataSetMessage_EncodingMetaData *metadata,
+                     UA_DataSetMessage_EncodingMetaData *stack) {
+    if(metadata != stack)
+        UA_free(metadata);
+}
+
+const UA_FieldMetaData *
+getFieldMetaData(const UA_DataSetMessage_EncodingMetaData *emd,
+                 size_t index);
+
+const UA_DataSetMessage_EncodingMetaData *
+findEncodingMetaData(const UA_NetworkMessage_EncodingOptions *eo,
+                     UA_UInt16 dsWriterId);
+
+/******************/
+/* DataSetMessage */
+/******************/
+
+UA_StatusCode
+UA_DataSetMessageHeader_encodeBinary(PubSubEncodeCtx *ctx,
+                                     const UA_DataSetMessageHeader *src);
+
+UA_StatusCode
+UA_DataSetMessageHeader_decodeBinary(PubSubDecodeCtx *ctx,
+                                     UA_DataSetMessageHeader *dst);
+
+UA_StatusCode
+UA_DataSetMessage_encodeBinary(PubSubEncodeCtx *ctx,
+                               const UA_DataSetMessage_EncodingMetaData *emd,
+                               const UA_DataSetMessage *src);
+
+UA_StatusCode
+UA_DataSetMessage_decodeBinary(PubSubDecodeCtx *ctx,
+                               const UA_DataSetMessage_EncodingMetaData *em,
+                               UA_DataSetMessage *dsm,
+                               size_t dsmSize);
+
+size_t
+UA_DataSetMessage_calcSizeBinary(PubSubEncodeCtx *ctx,
+                                 const UA_DataSetMessage_EncodingMetaData *em,
+                                 const UA_DataSetMessage *src,
+                                 size_t currentOffset);
+
+/******************/
+/* NetworkMessage */
+/******************/
+
+size_t
+UA_NetworkMessage_calcSizeBinaryInternal(PubSubEncodeCtx *ctx,
+                                         const UA_NetworkMessage *src);
+
+UA_StatusCode
+UA_NetworkMessage_encodeHeaders(PubSubEncodeCtx *ctx,
+                                const UA_NetworkMessage *src);
+
+UA_StatusCode
+UA_NetworkMessage_encodePayload(PubSubEncodeCtx *ctx,
+                                const UA_NetworkMessage *src);
+
+UA_StatusCode
+UA_NetworkMessage_encodeFooters(PubSubEncodeCtx *ctx,
+                                const UA_NetworkMessage *src);
+
+UA_StatusCode
+UA_NetworkMessage_decodeHeaders(PubSubDecodeCtx *ctx,
+                                UA_NetworkMessage *dst);
+
+UA_StatusCode
+UA_NetworkMessage_decodePayload(PubSubDecodeCtx *ctx,
+                                UA_NetworkMessage *dst);
+
+UA_StatusCode
+UA_NetworkMessage_decodeFooters(PubSubDecodeCtx *ctx,
+                                UA_NetworkMessage *dst);
+
+UA_StatusCode
+UA_NetworkMessage_makeSyntheticPayloadHeader(const UA_NetworkMessage_EncodingOptions *eo,
+                                             UA_NetworkMessage *dst);
+
+UA_StatusCode
+UA_NetworkMessage_encodeBinaryWithEncryptStart(PubSubEncodeCtx *ctx,
+                                               const UA_NetworkMessage *src,
+                                               UA_Byte **dataToEncryptStart);
+
+UA_StatusCode
+UA_NetworkMessage_signEncrypt(UA_NetworkMessage *nm,
+                              UA_MessageSecurityMode securityMode,
+                              UA_PubSubSecurityPolicy *policy,
+                              void *policyContext,
+                              UA_Byte *messageStart,
+                              UA_Byte *encryptStart,
+                              UA_Byte *sigStart);
 
 #ifdef UA_ENABLE_JSON_ENCODING
 UA_StatusCode
-UA_NetworkMessage_encodeJson(const UA_NetworkMessage *src,
-                             UA_Byte **bufPos, const UA_Byte **bufEnd, UA_String *namespaces,
-                             size_t namespaceSize, UA_String *serverUris,
-                             size_t serverUriSize, UA_Boolean useReversible);
-
-size_t
-UA_NetworkMessage_calcSizeJson(const UA_NetworkMessage *src,
-                               UA_String *namespaces, size_t namespaceSize,
-                               UA_String *serverUris, size_t serverUriSize,
-                               UA_Boolean useReversible);
-
-UA_StatusCode UA_NetworkMessage_decodeJson(UA_NetworkMessage *dst, const UA_ByteString *src);
+UA_NetworkMessage_encodeJsonInternal(PubSubEncodeJsonCtx *ctx,
+                                     const UA_NetworkMessage *src);
 #endif
 
 _UA_END_DECLS
+
+#endif /* UA_ENABLE_PUBSUB */
 
 #endif /* UA_PUBSUB_NETWORKMESSAGE_H_ */

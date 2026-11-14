@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 ### This Source Code Form is subject to the terms of the Mozilla Public
 ### License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,13 +8,23 @@
 ###    Copyright 2014-2017 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
 ###    Copyright 2016-2017 (c) Stefan Profanter, fortiss GmbH
 
+if __name__ == "__main__" and __package__ is None:
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    __package__ = "nodeset_compiler"
 
 import logging
 import argparse
 import sys
-from datatypes import NodeId
-from nodeset import *
+import xml.etree.ElementTree as etree
+from pathlib import Path
 
+from .datatypes import NodeId
+from .nodeset import *
+from .namespace_plan import parse_namespace_plan
+
+# Parse the arguments
 parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument('-e', '--existing',
                     metavar="<existingNodeSetXML>",
@@ -32,6 +41,14 @@ parser.add_argument('-x', '--xml',
                     dest="infiles",
                     default=[],
                     help='NodeSet XML files with nodes that shall be generated.')
+
+parser.add_argument('--bsd',
+                    metavar="<nodeSetBSD>",
+                    type=argparse.FileType('rb'),
+                    action='append',
+                    dest="bsdFile",
+                    default=[],
+                    help='Nodeset BSD file which must be specified if self-defined data types are contained in the XML and the BSD blob is not integrated in the XML.')
 
 parser.add_argument('outputFile',
                     metavar='<outputFile>',
@@ -64,7 +81,29 @@ parser.add_argument('-t', '--types-array',
                     type=str,
                     dest="typesArray",
                     default=[],
-                    help='Types array for the given namespace. Can be used mutliple times to define (in the same order as the .xml files, first for --existing, then --xml) the type arrays')
+                    help='Types array for the given namespace. Can be used multiple times to define (in the same order as the .xml files, first for --existing, then --xml) the type arrays')
+
+parser.add_argument('--namespaceMap', action='append', default=[], dest='namespace_map',
+                    help='Shared node and datatype namespace plan: <index>:<uri>. No-copy loading assumes matching server indexes.')
+
+parser.add_argument('--batch', metavar='<manifest.json>',
+                    help='Generate separate modules from a JSON manifest with one shared namespace plan. outputFile is the output directory.')
+parser.add_argument('--types-array-for', nargs=2, action='append', default=[],
+                    metavar=('XML', 'ARRAY'),
+                    help='Assign an imported XML file to a datatype array explicitly.')
+
+parser.add_argument('--types-schema', dest='typesSchema', default=None,
+                    help='Directory containing the NodeIds.csv and Opc.Ua.Types.bsd '
+                         'used to build the library. Defaults to the bundled schema.')
+
+parser.add_argument('--types-output',
+                    metavar='<outputFile>',
+                    type=str,
+                    dest='typesOutput',
+                    default=None,
+                    help='Generate a static datatype array from inline NodeSet '
+                         'Definitions. The value is the output file basename '
+                         'without the _generated suffix.')
 
 parser.add_argument('-v', '--verbose', action='count',
                     default=1,
@@ -79,6 +118,11 @@ parser.add_argument('--backend',
 
 args = parser.parse_args()
 
+if args.batch:
+    from .nodeset_batch import generate_batch
+    generate_batch(args)
+    sys.exit(0)
+
 # Set up logging
 # By default logging outputs to stderr. We want to redirect it to stdout, otherwise build output from cmake
 # is in stdout and nodeset compiler in stderr
@@ -88,57 +132,85 @@ logger.setLevel(logging.INFO)
 verbosity = 0
 if args.verbose:
     verbosity = int(args.verbose)
-if (verbosity == 1):
+if verbosity == 1:
     logging.basicConfig(level=logging.ERROR)
-elif (verbosity == 2):
+elif verbosity == 2:
     logging.basicConfig(level=logging.WARNING)
-elif (verbosity == 3):
+elif verbosity == 3:
     logging.basicConfig(level=logging.INFO)
-elif (verbosity >= 4):
+elif verbosity >= 4:
     logging.basicConfig(level=logging.DEBUG)
 else:
     logging.basicConfig(level=logging.CRITICAL)
 
-# Set up logging
-logger = logging.getLogger(__name__)
 # Create a new nodeset. The nodeset name is not significant.
 # Parse the XML files
-ns = NodeSet()
+ns = NodeSet(parse_namespace_plan(args.namespace_map) if args.namespace_map else None)
+ns.standardTypesSchema = args.typesSchema
 nsCount = 0
 loadedFiles = list()
+fileArrays = {Path(path).resolve(): array for path, array in args.types_array_for}
 
+# Remove duplicate entries in typesArray, which occur when a nodeset has more than one depend.
+tmp_list = []
+for e in args.typesArray:
+    if e not in tmp_list:
+        tmp_list.append(e)
+args.typesArray = tmp_list
 
 def getTypesArray(nsIdx):
     if nsIdx < len(args.typesArray):
         return args.typesArray[nsIdx]
-    else:
-        return "UA_TYPES"
+    return "UA_TYPES"
+
+def consumesTypesArray(xmlfile):
+    """Whether this NodeSet consumes the next positional datatype array."""
+    from .type_parser import has_native_types
+    root = etree.parse(xmlfile).getroot()
+    xmlfile.seek(0)
+    if not args.typesOutput:
+        return any(elem.tag.rsplit("}", 1)[-1] == "UADataType" for elem in root)
+    return has_native_types(root)
 
 for xmlfile in args.existing:
     if xmlfile.name in loadedFiles:
-        logger.info("Skipping Nodeset since it is already loaded: {} ".format(xmlfile.name))
+        logger.info("Skipping Nodeset since it is already loaded: %s", xmlfile.name)
         continue
     loadedFiles.append(xmlfile.name)
-    logger.info("Preprocessing (existing) " + str(xmlfile.name))
-    ns.addNodeSet(xmlfile, True, typesArray=getTypesArray(nsCount))
-    nsCount +=1
+    logger.info("Preprocessing (existing) %s", xmlfile.name)
+    if Path(xmlfile.name).resolve() in fileArrays:
+        ns.addNodeSet(xmlfile, True, typesArray=fileArrays[Path(xmlfile.name).resolve()])
+        continue
+    if consumesTypesArray(xmlfile):
+        ns.addNodeSet(xmlfile, True, typesArray=getTypesArray(nsCount))
+        nsCount += 1
+        continue
+    ns.addNodeSet(xmlfile, True, typesArray="UA_TYPES")
+
 for xmlfile in args.infiles:
     if xmlfile.name in loadedFiles:
-        logger.info("Skipping Nodeset since it is already loaded: {} ".format(xmlfile.name))
+        logger.info("Skipping Nodeset since it is already loaded: %s", xmlfile.name)
         continue
     loadedFiles.append(xmlfile.name)
-    logger.info("Preprocessing " + str(xmlfile.name))
-    ns.addNodeSet(xmlfile, typesArray=getTypesArray(nsCount))
-    nsCount +=1
+    logger.info("Preprocessing %s", xmlfile.name)
+    if consumesTypesArray(xmlfile):
+        ns.addNodeSet(xmlfile, typesArray=getTypesArray(nsCount))
+        nsCount += 1
+        continue
+    ns.addNodeSet(xmlfile, typesArray="UA_TYPES")
+
+for array in fileArrays.values():
+    if array not in args.typesArray:
+        args.typesArray.append(array)
 
 # # We need to notify the open62541 server of the namespaces used to be able to use i.e. ns=3
 # namespaceArrayNames = preProc.getUsedNamespaceArrayNames()
 # for key in namespaceArrayNames:
 #   ns.addNamespace(key, namespaceArrayNames[key])
 
-# Set the nodes from the ignore list to hidden. This removes them from dependency calculation
-# and from printing their generated code.
-# These nodes should be already pre-created on the server to avoid any errors during
+# Set the nodes from the ignore list to hidden. This removes them from
+# dependency calculation and from printing their generated code. These nodes
+# should be already pre-created on the server to avoid any errors during
 # creation.
 for ignoreFile in args.ignoreFiles:
     for line in ignoreFile.readlines():
@@ -146,22 +218,22 @@ for ignoreFile in args.ignoreFiles:
         id = line.replace("\n", "")
         ns.hide_node(NodeId(id))
         #if not ns.hide_node(NodeId(id)):
-        #    logger.info("Can't ignore node, namespace does currently not contain a node with id " + str(id))
+        #    logger.info("Cannot ignore node, namespace does currently not contain a node with id " + str(id))
     ignoreFile.close()
 
 # Remove nodes that are not printable or contain parsing errors, such as
 # unresolvable or no references or invalid NodeIDs
 ns.sanitize()
 
-# Allocate/Parse the data values. In order to do this, we must have run
-# buidEncodingRules.
-ns.allocateVariables()
+# Generate the BSD file from the XML.
+ns.generateParser(args.existing, args.infiles, args.bsdFile)
 
+# Create inverse references
 ns.addInverseReferences()
 
-
-# Remove blacklisted nodes from the nodeset.
-# We need to have the inverse references here to ensure the reference is deleted from the referencing node too
+# Remove blacklisted nodes from the nodeset. We need to have the inverse
+# references here to ensure the reference is deleted from the referencing node
+# too
 if args.blacklistFiles:
     for blacklist in args.blacklistFiles:
         for line in blacklist.readlines():
@@ -173,26 +245,27 @@ if args.blacklistFiles:
                 continue
             n = ns.getNodeByIDString(id)
             if n is None:
-                logger.debug("Can't blacklist node, namespace does currently not contain a node with id " + str(id))
+                logger.debug("Cannot blacklist node, namespace does currently not contain a node with id %s", id)
             else:
                 ns.remove_node(n)
         blacklist.close()
     ns.sanitize()
 
+# Figure out from the references which is the parent for each node
 ns.setNodeParent()
 
-logger.info("Generating Code for Backend: {}".format(args.backend))
+logger.info("Generating Code for Backend: %s (%i Nodes)", args.backend, len(ns.nodes))
 
 if args.backend == "open62541":
     # Create the C code with the open62541 backend of the compiler
-    from backend_open62541 import generateOpen62541Code
-    generateOpen62541Code(ns, args.outputFile, args.internal_headers, args.typesArray)
+    from .backend_open62541 import generateOpen62541Code
+    generateOpen62541Code(ns, args.outputFile, args.internal_headers,
+                          args.typesArray, args.typesOutput, args.namespace_map)
 elif args.backend == "graphviz":
-    from backend_graphviz import generateGraphvizCode
+    from .backend_graphviz import generateGraphvizCode
     generateGraphvizCode(ns, filename=args.outputFile)
 else:
-    logger.error("Unsupported backend: {}".format(args.backend))
+    logger.error("Unsupported backend: %s", args.backend)
     exit(1)
-
 
 logger.info("NodeSet generation code successfully printed")

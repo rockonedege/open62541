@@ -13,17 +13,21 @@
 
 _UA_BEGIN_DECLS
 
-UA_Client UA_EXPORT * UA_Client_new(void);
-
 UA_StatusCode UA_EXPORT
 UA_ClientConfig_setDefault(UA_ClientConfig *config);
 
 #ifdef UA_ENABLE_ENCRYPTION
+/* Replaces the configured encryption policies. Previous policy arrays are
+ * retained until the configuration is cleared, preserving references held by
+ * open SecureChannels and Sessions, including across repeated calls. */
 UA_StatusCode UA_EXPORT
 UA_ClientConfig_setDefaultEncryption(UA_ClientConfig *config,
-                                     UA_ByteString localCertificate, UA_ByteString privateKey,
-                                     const UA_ByteString *trustList, size_t trustListSize,
-                                     const UA_ByteString *revocationList, size_t revocationListSize);
+                                     UA_ByteString localCertificate,
+                                     UA_ByteString privateKey,
+                                     const UA_ByteString *trustList,
+                                     size_t trustListSize,
+                                     const UA_ByteString *revocationList,
+                                     size_t revocationListSize);
 #endif
 
 _UA_END_DECLS

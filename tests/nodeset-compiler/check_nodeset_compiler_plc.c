@@ -8,15 +8,16 @@
 
 #include "check.h"
 #include "testing_clock.h"
+#include "test_helpers.h"
 #include "tests/namespace_tests_di_generated.h"
 #include "tests/namespace_tests_plc_generated.h"
-#include "unistd.h"
+#include <stdlib.h>
 
 UA_Server *server = NULL;
 
 static void setup(void) {
-    server = UA_Server_new();
-    UA_ServerConfig_setDefault(UA_Server_getConfig(server));
+    server = UA_Server_newForUnitTest();
+    ck_assert(server != NULL);
     UA_Server_run_startup(server);
 }
 
@@ -26,13 +27,13 @@ static void teardown(void) {
 }
 
 START_TEST(Server_addDiNodeset) {
-    UA_StatusCode retval = namespace_tests_di_generated(server);
+    UA_StatusCode retval = namespace_tests_di_generated(server, true);
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 }
 END_TEST
 
 START_TEST(Server_addPlcNodeset) {
-    UA_StatusCode retval = namespace_tests_plc_generated(server);
+    UA_StatusCode retval = namespace_tests_plc_generated(server, true);
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 }
 END_TEST

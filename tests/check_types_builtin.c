@@ -4,12 +4,13 @@
 
 #include <open62541/types.h>
 #include <open62541/types_generated.h>
-#include <open62541/types_generated_encoding_binary.h>
-#include <open62541/types_generated_handling.h>
 #include <open62541/util.h>
 
-#include "ua_types_encoding_binary.h"
+#include "util/ua_util_internal.h"
 
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
 #include <check.h>
 #include <float.h>
 #include <math.h>
@@ -20,6 +21,71 @@ enum UA_VARIANT_ENCODINGMASKTYPE_enum {
     UA_VARIANT_ENCODINGMASKTYPE_DIMENSIONS  = (0x01 << 6),     // bit 6
     UA_VARIANT_ENCODINGMASKTYPE_ARRAY       = (0x01 << 7)      // bit 7
 };
+
+static UA_Variant* EncodeDecodeVariant(UA_Variant* sourceVariant) {
+    UA_ByteString encodedVariant;
+    UA_ByteString_init(&encodedVariant);
+    UA_StatusCode encodeResult = UA_encodeBinary(sourceVariant, &UA_TYPES[UA_TYPES_VARIANT], &encodedVariant, NULL);
+    UA_Variant* decodedVariant = UA_Variant_new();
+    UA_StatusCode decodeResult = UA_decodeBinary(&encodedVariant, decodedVariant, &UA_TYPES[UA_TYPES_VARIANT], NULL );
+
+    ck_assert_int_eq(encodeResult, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(decodeResult, UA_STATUSCODE_GOOD);
+
+    UA_ByteString_clear(&encodedVariant);
+
+    return decodedVariant;
+}
+
+static void AssertVariantsEqual(UA_Variant* v1, UA_Variant* v2) {
+    ck_assert_ptr_eq(v1->type, v2->type);
+    ck_assert_uint_eq(v1->arrayLength, v2->arrayLength);
+    ck_assert_uint_eq(v1->arrayDimensionsSize, v2->arrayDimensionsSize);
+
+    for(size_t i = 0; i < v1->arrayDimensionsSize; i++) {
+       ck_assert_uint_eq(v1->arrayDimensions[i], v2->arrayDimensions[i]);
+    }
+
+    if(v1->type->pointerFree) {
+       int cmp = memcmp(v1->data, v2->data, v1->type->memSize * v1->arrayLength);
+       ck_assert_int_eq(cmp, 0);
+    }
+}
+
+static void EncodeDecodeArrayOfExtensionObjectTest(UA_ExtensionObject* sourceArray, size_t arraySize) {
+    UA_UInt32 dimensions = (UA_UInt32)arraySize;
+
+    UA_Variant sourceVariant;
+    UA_Variant_setArray(&sourceVariant, sourceArray, arraySize, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT]);
+    sourceVariant.arrayDimensionsSize = 1;
+    sourceVariant.arrayDimensions = &dimensions;
+
+    UA_Variant* decodedVariant = EncodeDecodeVariant(&sourceVariant);
+    AssertVariantsEqual(&sourceVariant, decodedVariant);
+    UA_ExtensionObject* decodedArray = (UA_ExtensionObject*)decodedVariant->data;
+
+    for(size_t i = 0; i < arraySize; i++) {
+        ck_assert_uint_eq(sourceArray[i].encoding,
+                          decodedArray[i].encoding);
+        if(sourceArray[i].encoding < UA_EXTENSIONOBJECT_DECODED ) {
+           ck_assert_uint_eq(UA_NodeId_order(&sourceArray[i].content.encoded.typeId,
+                                             &decodedArray[i].content.encoded.typeId),
+                             UA_ORDER_EQ);
+           ck_assert(UA_String_equal(&sourceArray[i].content.encoded.body,
+                                     &decodedArray[i].content.encoded.body));
+        }
+        else {
+           ck_assert_ptr_eq(sourceArray[i].content.decoded.type,
+                            decodedArray[i].content.decoded.type);
+           int cmp = memcmp(sourceArray[i].content.decoded.data,
+                            decodedArray[i].content.decoded.data,
+                            sourceArray[i].content.decoded.type->memSize);
+           ck_assert_int_eq(cmp, 0);
+        }
+    }
+
+    UA_Variant_delete(decodedVariant);
+}
 
 START_TEST(UA_Byte_decodeShallCopyAndAdvancePosition) {
     // given
@@ -33,7 +99,7 @@ START_TEST(UA_Byte_decodeShallCopyAndAdvancePosition) {
     // then
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(pos, 1);
-    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_BYTE]));
+    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_BYTE], NULL));
     ck_assert_uint_eq(dst, 0x08);
 }
 END_TEST
@@ -196,7 +262,9 @@ END_TEST
 START_TEST(UA_Int64_decodeShallRespectSign) {
     // given
     UA_ByteString rawMessage;
-    UA_Int64 expectedVal = (UA_Int64)0xFF << 56;
+    /* The shift operand must be unsigned to avoid signed-int shift UB;
+     * UA_Int64 is signed so 0xFF << 56 directly is undefined. */
+    UA_Int64 expectedVal = ((UA_Int64)(UA_UInt32)0xFF) << 56;
     UA_Byte  mem[8]      = { 00, 00, 00, 00, 0x00, 0x00, 0x00, 0xFF };
     rawMessage.data   = mem;
     rawMessage.length = 8;
@@ -303,7 +371,7 @@ START_TEST(UA_String_decodeShallAllocateMemoryAndCopyString) {
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(dst.length, 8);
     ck_assert_int_eq(dst.data[3], 'L');
-    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_STRING]));
+    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_STRING], NULL));
     // finally
     UA_String_clear(&dst);
 }
@@ -352,7 +420,7 @@ START_TEST(UA_NodeId_decodeTwoByteShallReadTwoBytesAndSetNamespaceToZero) {
     // then
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(pos, 2);
-    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_NODEID]));
+    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_NODEID], NULL));
     ck_assert_int_eq(dst.identifierType, UA_NODEIDTYPE_NUMERIC);
     ck_assert_int_eq(dst.identifier.numeric, 16);
     ck_assert_int_eq(dst.namespaceIndex, 0);
@@ -370,7 +438,7 @@ START_TEST(UA_NodeId_decodeFourByteShallReadFourBytesAndRespectNamespace) {
     // then
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(pos, 4);
-    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_NODEID]));
+    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_NODEID], NULL));
     ck_assert_int_eq(dst.identifierType, UA_NODEIDTYPE_NUMERIC);
     ck_assert_int_eq(dst.identifier.numeric, 256);
     ck_assert_int_eq(dst.namespaceIndex, 1);
@@ -388,7 +456,7 @@ START_TEST(UA_NodeId_decodeStringShallAllocateMemory) {
     // then
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(pos, 10);
-    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_NODEID]));
+    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_NODEID], NULL));
     ck_assert_int_eq(dst.identifierType, UA_NODEIDTYPE_STRING);
     ck_assert_int_eq(dst.namespaceIndex, 1);
     ck_assert_uint_eq(dst.identifier.string.length, 3);
@@ -409,7 +477,7 @@ START_TEST(UA_Variant_decodeWithOutArrayFlagSetShallSetVTAndAllocateMemoryForArr
     // then
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(pos, 5);
-    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_VARIANT]));
+    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_VARIANT], NULL));
     //ck_assert_ptr_eq((const void *)dst.type, (const void *)&UA_TYPES[UA_TYPES_INT32]); //does not compile in gcc 4.6
     ck_assert_uint_eq((uintptr_t)dst.type, (uintptr_t)&UA_TYPES[UA_TYPES_INT32]);
     ck_assert_uint_eq(dst.arrayLength, 0);
@@ -435,7 +503,7 @@ START_TEST(UA_Variant_decodeWithArrayFlagSetShallSetVTAndAllocateMemoryForArray)
     // then
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(pos, 1+4+2*4);
-    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_VARIANT]));
+    ck_assert_uint_eq(pos, UA_calcSizeBinary(&dst, &UA_TYPES[UA_TYPES_VARIANT], NULL));
     //ck_assert_ptr_eq((const (void*))dst.type, (const void*)&UA_TYPES[UA_TYPES_INT32]); //does not compile in gcc 4.6
     ck_assert_uint_eq((uintptr_t)dst.type,(uintptr_t)&UA_TYPES[UA_TYPES_INT32]);
     ck_assert_uint_eq(dst.arrayLength, 2);
@@ -810,10 +878,6 @@ START_TEST(UA_Float_encodeShallWorkOnExample) {
         {0x00, 0x00, 0x80, 0x7F}, // INF
         {0x00, 0x00, 0x80, 0xFF} // -INF
     };
-#if defined(_MSC_VER)
-    /* On Visual Studio, -NAN is encoded differently */
-    result[4][3] = 127;
-#endif
 
     UA_Byte data[] = {0x55, 0x55, 0x55,  0x55};
     UA_ByteString dst = {4, data};
@@ -869,7 +933,7 @@ START_TEST(UA_String_encodeShallWorkOnExample) {
     UA_StatusCode retval = UA_String_encodeBinary(&src, &pos, end);
     // then
     ck_assert_uint_eq((uintptr_t)(pos - dst.data), sizeof(UA_Int32)+11);
-    ck_assert_uint_eq(sizeof(UA_Int32)+11, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_STRING]));
+    ck_assert_uint_eq(sizeof(UA_Int32)+11, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_STRING], NULL));
     ck_assert_int_eq(dst.data[0], 11);
     ck_assert_int_eq(dst.data[sizeof(UA_Int32)+0], 'A');
     ck_assert_int_eq(dst.data[sizeof(UA_Int32)+1], 'C');
@@ -878,6 +942,53 @@ START_TEST(UA_String_encodeShallWorkOnExample) {
     ck_assert_int_eq(dst.data[sizeof(UA_Int32)+4], 'T');
     ck_assert_int_eq(dst.data[sizeof(UA_Int32)+5], 0x20); //Space
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+}
+END_TEST
+
+START_TEST(UA_String_encodeShallWorkOnEmpty) {
+    // given
+    UA_String src = UA_STRING_NULL;
+    UA_Byte data[] = { 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+                       0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+                       0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55 };
+    UA_ByteString dst = { 24, data };
+    UA_Byte *pos = dst.data;
+    const UA_Byte *end = &dst.data[dst.length];
+
+    // when
+    UA_StatusCode retval = UA_String_encodeBinary(&src, &pos, end);
+
+    // then
+    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(data[0], 0xFF);
+
+    ///////
+
+    // given
+    src = UA_STRING("");
+    pos = dst.data;
+    end = &dst.data[dst.length];
+
+    // when
+    retval = UA_String_encodeBinary(&src, &pos, end);
+
+    // then
+    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(data[0], 0x00);
+
+    ///////
+
+    // given
+    src.data = (UA_Byte*)"";
+    pos = dst.data;
+    end = &dst.data[dst.length];
+
+    // when
+    retval = UA_String_encodeBinary(&src, &pos, end);
+
+    // then
+    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(data[0], 0x00);
 }
 END_TEST
 
@@ -899,8 +1010,76 @@ START_TEST(UA_ExpandedNodeId_encodeShallWorkOnExample) {
     // then
     ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq((uintptr_t)(pos - dst.data), 13);
-    ck_assert_uint_eq(13, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_EXPANDEDNODEID]));
+    ck_assert_uint_eq(13, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_EXPANDEDNODEID], NULL));
     ck_assert_int_eq(dst.data[0], 0x80); // namespaceuri flag
+}
+END_TEST
+
+/* Part 6, 5.2.2.10: with a NamespaceUri, the NamespaceIndex is encoded as 0,
+ * whatever the NodeId holds. */
+START_TEST(UA_ExpandedNodeId_encodeWithUriWritesIndexZero) {
+    UA_ExpandedNodeId src = UA_EXPANDEDNODEID_NUMERIC(3, 1000);
+    src.namespaceUri = UA_STRING("urn:x");
+
+    UA_ByteString dst = UA_BYTESTRING_NULL;
+    UA_StatusCode retval =
+        UA_encodeBinary(&src, &UA_TYPES[UA_TYPES_EXPANDEDNODEID], &dst, NULL);
+    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+    /* Four-byte form: mask, namespace (1 byte), identifier (2 bytes) */
+    ck_assert_uint_eq(dst.data[0], 0x80 | 0x01);
+    ck_assert_uint_eq(dst.data[1], 0);
+    ck_assert_uint_eq(dst.length,
+                      UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_EXPANDEDNODEID], NULL));
+
+    UA_ExpandedNodeId back;
+    retval = UA_decodeBinary(&dst, &back, &UA_TYPES[UA_TYPES_EXPANDEDNODEID], NULL);
+    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(back.nodeId.namespaceIndex, 0);
+    ck_assert_uint_eq(back.nodeId.identifier.numeric, 1000);
+    ck_assert(UA_String_equal(&back.namespaceUri, &src.namespaceUri));
+    UA_ExpandedNodeId_clear(&back);
+    UA_ByteString_clear(&dst);
+}
+END_TEST
+
+/* Part 6, 5.2.2.5: a DateTime at or before 1601-01-01 is encoded as 0, one at
+ * or after 9999-12-31 23:59:59 as the maximum Int64. Arrays included. */
+START_TEST(UA_DateTime_encodeClampsToTheValidRange) {
+    const UA_DateTime last = 265046774399LL * UA_DATETIME_SEC;
+    UA_DateTime in[5] = {-1, 0, 5, last - 1, last};
+    UA_DateTime out[5] = {0, 0, 5, last - 1, UA_INT64_MAX};
+
+    /* Arrays must not be memcpy'd, or they would skip the clamping */
+    ck_assert(!UA_TYPES[UA_TYPES_DATETIME].overlayable);
+
+    for(size_t i = 0; i < 5; i++) {
+        UA_ByteString dst = UA_BYTESTRING_NULL;
+        UA_StatusCode retval =
+            UA_encodeBinary(&in[i], &UA_TYPES[UA_TYPES_DATETIME], &dst, NULL);
+        ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+        UA_DateTime back;
+        retval = UA_decodeBinary(&dst, &back, &UA_TYPES[UA_TYPES_DATETIME], NULL);
+        ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+        ck_assert_int_eq(back, out[i]);
+        UA_ByteString_clear(&dst);
+    }
+
+    UA_Variant v;
+    UA_Variant_setArray(&v, in, 5, &UA_TYPES[UA_TYPES_DATETIME]);
+    UA_ByteString dst = UA_BYTESTRING_NULL;
+    UA_StatusCode retval =
+        UA_encodeBinary(&v, &UA_TYPES[UA_TYPES_VARIANT], &dst, NULL);
+    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(dst.length,
+                      UA_calcSizeBinary(&v, &UA_TYPES[UA_TYPES_VARIANT], NULL));
+    UA_Variant back;
+    retval = UA_decodeBinary(&dst, &back, &UA_TYPES[UA_TYPES_VARIANT], NULL);
+    ck_assert_int_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(back.arrayLength, 5);
+    for(size_t i = 0; i < 5; i++)
+        ck_assert_int_eq(((UA_DateTime*)back.data)[i], out[i]);
+    UA_Variant_clear(&back);
+    UA_ByteString_clear(&dst);
 }
 END_TEST
 
@@ -922,7 +1101,7 @@ START_TEST(UA_DataValue_encodeShallWorkOnExampleWithoutVariant) {
     UA_StatusCode retval = UA_DataValue_encodeBinary(&src, &pos, end);
     // then
     ck_assert_uint_eq((uintptr_t)(pos - dst.data), 9);
-    ck_assert_uint_eq(9, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_DATAVALUE]));
+    ck_assert_uint_eq(9, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_DATAVALUE], NULL));
     ck_assert_int_eq(dst.data[0], 0x08); // encodingMask
     ck_assert_int_eq(dst.data[1], 80);   // 8 Byte serverTimestamp
     ck_assert_int_eq(dst.data[2], 0);
@@ -959,7 +1138,7 @@ START_TEST(UA_DataValue_encodeShallWorkOnExampleWithVariant) {
     UA_StatusCode retval = UA_DataValue_encodeBinary(&src, &pos, end);
     // then
     ck_assert_uint_eq((uintptr_t)(pos - dst.data), 1+(1+4)+8);           // represents the length
-    ck_assert_uint_eq(1+(1+4)+8, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_DATAVALUE]));
+    ck_assert_uint_eq(1+(1+4)+8, UA_calcSizeBinary(&src, &UA_TYPES[UA_TYPES_DATAVALUE], NULL));
     ck_assert_int_eq(dst.data[0], 0x08 | 0x01); // encodingMask
     ck_assert_int_eq(dst.data[1], 0x06);        // Variant's Encoding Mask - INT32
     ck_assert_int_eq(dst.data[2], 45);          // the single value
@@ -1052,6 +1231,60 @@ START_TEST(UA_ExpandedNodeId_hashIdentical) {
 }
 END_TEST
 
+START_TEST(UA_ExpandedNodeId_constructors) {
+    /* Test UA_EXPANDEDNODEID_STRING */
+    char testStr[] = "TestString";
+    UA_ExpandedNodeId enStr = UA_EXPANDEDNODEID_STRING(1, testStr);
+    ck_assert_uint_eq(enStr.nodeId.namespaceIndex, 1);
+    ck_assert_int_eq(enStr.nodeId.identifierType, UA_NODEIDTYPE_STRING);
+    UA_String expectedStr = UA_STRING("TestString");
+    ck_assert(UA_String_equal(&enStr.nodeId.identifier.string, &expectedStr));
+    ck_assert(UA_String_equal(&enStr.namespaceUri, &UA_STRING_NULL));
+    ck_assert_uint_eq(enStr.serverIndex, 0);
+
+    /* Test UA_EXPANDEDNODEID_STRING_ALLOC */
+    UA_ExpandedNodeId enStrAlloc = UA_EXPANDEDNODEID_STRING_ALLOC(2, "AllocString");
+    ck_assert_uint_eq(enStrAlloc.nodeId.namespaceIndex, 2);
+    ck_assert_int_eq(enStrAlloc.nodeId.identifierType, UA_NODEIDTYPE_STRING);
+    UA_String expectedAlloc = UA_STRING("AllocString");
+    ck_assert(UA_String_equal(&enStrAlloc.nodeId.identifier.string, &expectedAlloc));
+    UA_ExpandedNodeId_clear(&enStrAlloc);
+
+    /* Test UA_EXPANDEDNODEID_STRING_GUID */
+    UA_Guid testGuid = {0x12345678, 0x1234, 0x1234,
+                        {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0}};
+    UA_ExpandedNodeId enGuid = UA_EXPANDEDNODEID_STRING_GUID(3, testGuid);
+    ck_assert_uint_eq(enGuid.nodeId.namespaceIndex, 3);
+    ck_assert_int_eq(enGuid.nodeId.identifierType, UA_NODEIDTYPE_GUID);
+    ck_assert(UA_Guid_equal(&enGuid.nodeId.identifier.guid, &testGuid));
+
+    /* Test UA_EXPANDEDNODEID_BYTESTRING */
+    char bsData[] = "ByteData";
+    UA_ExpandedNodeId enBs = UA_EXPANDEDNODEID_BYTESTRING(4, bsData);
+    ck_assert_uint_eq(enBs.nodeId.namespaceIndex, 4);
+    ck_assert_int_eq(enBs.nodeId.identifierType, UA_NODEIDTYPE_BYTESTRING);
+    UA_String expectedBs = UA_STRING("ByteData");
+    ck_assert(UA_String_equal(&enBs.nodeId.identifier.byteString, &expectedBs));
+
+    /* Test UA_EXPANDEDNODEID_BYTESTRING_ALLOC */
+    UA_ExpandedNodeId enBsAlloc = UA_EXPANDEDNODEID_BYTESTRING_ALLOC(5, "AllocByte");
+    ck_assert_uint_eq(enBsAlloc.nodeId.namespaceIndex, 5);
+    ck_assert_int_eq(enBsAlloc.nodeId.identifierType, UA_NODEIDTYPE_BYTESTRING);
+    UA_String expectedBsAlloc = UA_STRING("AllocByte");
+    ck_assert(UA_String_equal(&enBsAlloc.nodeId.identifier.byteString, &expectedBsAlloc));
+    UA_ExpandedNodeId_clear(&enBsAlloc);
+
+    /* Test UA_EXPANDEDNODEID_NODEID */
+    UA_NodeId testNodeId = UA_NODEID_NUMERIC(6, 12345);
+    UA_ExpandedNodeId enFromNodeId = UA_EXPANDEDNODEID_NODEID(testNodeId);
+    ck_assert_uint_eq(enFromNodeId.nodeId.namespaceIndex, 6);
+    ck_assert_int_eq(enFromNodeId.nodeId.identifierType, UA_NODEIDTYPE_NUMERIC);
+    ck_assert_uint_eq(enFromNodeId.nodeId.identifier.numeric, 12345);
+    ck_assert(UA_String_equal(&enFromNodeId.namespaceUri, &UA_STRING_NULL));
+    ck_assert_uint_eq(enFromNodeId.serverIndex, 0);
+}
+END_TEST
+
 START_TEST(UA_ExtensionObject_copyShallWorkOnExample) {
     // given
     /* UA_Byte data[3] = { 1, 2, 3 }; */
@@ -1135,6 +1368,47 @@ START_TEST(UA_Array_copyUA_StringShallWorkOnExample) {
     //finally
     UA_Array_delete(srcArray, 3, &UA_TYPES[UA_TYPES_STRING]);
     UA_Array_delete(dstArray, 3, &UA_TYPES[UA_TYPES_STRING]);
+}
+END_TEST
+
+START_TEST(UA_Array_allocationOverflowShallBeRejected) {
+    const UA_DataType *type = &UA_TYPES[UA_TYPES_STRING];
+    size_t overflowSize = SIZE_MAX / type->memSize + 1;
+
+    ck_assert_ptr_eq(UA_Array_new(overflowSize, type), NULL);
+
+    UA_String src = UA_STRING_STATIC("x");
+    void *dst = &src;
+    UA_StatusCode retval = UA_Array_copy(&src, overflowSize, &dst, type);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADOUTOFMEMORY);
+    ck_assert_ptr_eq(dst, &src);
+
+    void *array = UA_EMPTY_ARRAY_SENTINEL;
+    size_t arraySize = 0;
+    retval = UA_Array_resize(&array, &arraySize, overflowSize, type);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADOUTOFMEMORY);
+    ck_assert_ptr_eq(array, UA_EMPTY_ARRAY_SENTINEL);
+    ck_assert_uint_eq(arraySize, 0);
+
+    arraySize = overflowSize;
+    retval = UA_Array_resize(&array, &arraySize, 0, type);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADOUTOFMEMORY);
+    ck_assert_ptr_eq(array, UA_EMPTY_ARRAY_SENTINEL);
+    ck_assert_uint_eq(arraySize, overflowSize);
+}
+END_TEST
+
+START_TEST(UA_Array_appendSizeOverflowShallBeRejected) {
+    void *array = UA_EMPTY_ARRAY_SENTINEL;
+    size_t arraySize = SIZE_MAX;
+    UA_Byte value = 42;
+
+    UA_StatusCode retval = UA_Array_append(&array, &arraySize, &value,
+                                           &UA_TYPES[UA_TYPES_BYTE]);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADOUTOFMEMORY);
+    ck_assert_ptr_eq(array, UA_EMPTY_ARRAY_SENTINEL);
+    ck_assert_uint_eq(arraySize, SIZE_MAX);
+    ck_assert_uint_eq(value, 42);
 }
 END_TEST
 
@@ -1348,6 +1622,60 @@ START_TEST(UA_Variant_copyShallWorkOnByteStringIndexRange) {
 }
 END_TEST
 
+/* An array of length zero is an empty array, not a scalar */
+START_TEST(UA_Variant_setArrayWithSizeZeroIsEmptyArray) {
+    UA_Int32 values[1] = {42};
+    UA_Variant v;
+    UA_Variant_setArray(&v, values, 0, &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert(!UA_Variant_isScalar(&v));
+    ck_assert(UA_Variant_hasArrayType(&v, &UA_TYPES[UA_TYPES_INT32]));
+    ck_assert_ptr_eq(v.data, UA_EMPTY_ARRAY_SENTINEL);
+    ck_assert_uint_eq(v.arrayLength, 0);
+
+    /* Copied and cleared as an empty array. The array is not taken over. */
+    UA_Variant copy;
+    ck_assert_uint_eq(UA_Variant_copy(&v, &copy), UA_STATUSCODE_GOOD);
+    ck_assert(!UA_Variant_isScalar(&copy));
+    ck_assert_uint_eq(copy.arrayLength, 0);
+    UA_Variant_clear(&copy);
+    UA_Variant_clear(&v);
+    ck_assert_int_eq(values[0], 42);
+
+    /* NULL with length zero remains a null array */
+    UA_Variant_setArray(&v, NULL, 0, &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert_ptr_eq(v.data, NULL);
+    ck_assert(!UA_Variant_isScalar(&v));
+}
+END_TEST
+
+START_TEST(UA_Variant_setRangeRejectsUnclampedSourceSize) {
+    UA_UInt32 initial[10] = {0};
+    UA_Variant value;
+    UA_Variant_init(&value);
+    UA_StatusCode res =
+        UA_Variant_setArrayCopy(&value, initial, 10,
+                                &UA_TYPES[UA_TYPES_UINT32]);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+
+    UA_UInt32 source[13] = {0};
+    UA_NumericRangeDimension dimension = {3, 15};
+    UA_NumericRange range = {1, &dimension};
+    res = UA_Variant_setRangeCopy(&value, source, 13, range);
+    ck_assert_uint_eq(res, UA_STATUSCODE_BADINDEXRANGEINVALID);
+
+    /* A source matching the reduced range is written */
+    UA_UInt32 fitting[7] = {1, 2, 3, 4, 5, 6, 7};
+    res = UA_Variant_setRangeCopy(&value, fitting, 7, range);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+    UA_UInt32 *data = (UA_UInt32*)value.data;
+    ck_assert_uint_eq(data[2], 0);
+    ck_assert_uint_eq(data[3], 1);
+    ck_assert_uint_eq(data[9], 7);
+
+    UA_Variant_clear(&value);
+}
+END_TEST
+
 START_TEST(UA_Variant_copyShallWorkOn1DArrayExample) {
     // given
     UA_String *srcArray = (UA_String*)UA_Array_new(3, &UA_TYPES[UA_TYPES_STRING]);
@@ -1470,7 +1798,7 @@ START_TEST(UA_ExtensionObject_encodeDecodeShallWorkOnExtensionObject) {
     /* varAttr.specifiedAttributes |= UA_NODEATTRIBUTESMASK_VALUE; */
     /* varAttr.specifiedAttributes |= UA_NODEATTRIBUTESMASK_USERWRITEMASK; */
 
-    /* /\* wrap it into a extension object attributes *\/ */
+    /* /\* wrap it into an extension object attributes *\/ */
     /* UA_ExtensionObject extensionObject; */
     /* UA_ExtensionObject_init(&extensionObject); */
     /* extensionObject.typeId = UA_TYPES[UA_TYPES_VARIABLEATTRIBUTES].typeId; */
@@ -1507,6 +1835,130 @@ START_TEST(UA_ExtensionObject_encodeDecodeShallWorkOnExtensionObject) {
 }
 END_TEST
 
+START_TEST(UA_Variant_encodeDecodeShallWorkOnVariantWithStruct) {
+    UA_Range* sourceRange = UA_Range_new();
+    sourceRange->low = 1.0;
+    sourceRange->high = 10.0;
+
+    UA_Variant sourceVariant;
+    UA_Variant_setScalar(&sourceVariant, sourceRange, &UA_TYPES[UA_TYPES_RANGE]);
+
+    UA_Variant* decodedVariant = EncodeDecodeVariant(&sourceVariant);
+    AssertVariantsEqual(&sourceVariant, decodedVariant);
+
+    UA_Variant_delete(decodedVariant);
+    UA_Variant_clear(&sourceVariant);
+}
+END_TEST
+
+START_TEST(UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfStruct) {
+    const size_t arraySize = 2;
+    UA_Range* sourceRangeArray = (UA_Range*)UA_Array_new( arraySize, &UA_TYPES[UA_TYPES_RANGE]);
+
+    for(size_t i = 0; i < arraySize; i++) {
+        UA_Range* rangeElement = &sourceRangeArray[i];
+        UA_Range_init(rangeElement);
+        rangeElement->low = 1.0;
+        rangeElement->high = 10.0;
+    }
+
+    UA_UInt32 *dimensions;
+    dimensions = (UA_UInt32*)UA_malloc(sizeof(UA_UInt32));
+    dimensions[0] = (UA_UInt32)arraySize;
+
+    UA_Variant sourceVariant;
+    UA_Variant_setArray(&sourceVariant, sourceRangeArray, arraySize, &UA_TYPES[UA_TYPES_RANGE]);
+    sourceVariant.arrayDimensionsSize = 1;
+    sourceVariant.arrayDimensions = dimensions;
+
+    UA_Variant* decodedVariant = EncodeDecodeVariant(&sourceVariant);
+    AssertVariantsEqual(&sourceVariant, decodedVariant);
+
+    UA_Variant_delete(decodedVariant);
+    UA_Variant_clear(&sourceVariant);
+}
+END_TEST
+
+START_TEST(UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfDifferentTypes) {
+    const size_t arraySize = 2;
+    UA_ExtensionObject sourceArray[2];
+    UA_Range arrayElement0 = { 1.0, 2.0 };
+    UA_ComplexNumberType arrayElement1 = { 3.0, 4.0 };
+
+    UA_ExtensionObject* arrayElement = sourceArray;
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_DECODED;
+    arrayElement->content.decoded.data = &arrayElement0;
+    arrayElement->content.decoded.type = &UA_TYPES[UA_TYPES_RANGE];
+
+    arrayElement = &sourceArray[1];
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_DECODED;
+    arrayElement->content.decoded.data = &arrayElement1;
+    arrayElement->content.decoded.type = &UA_TYPES[UA_TYPES_COMPLEXNUMBERTYPE];
+
+    EncodeDecodeArrayOfExtensionObjectTest(sourceArray, arraySize);
+}
+END_TEST
+
+START_TEST(UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfExtensionObjectsWithUnknownType) {
+    const size_t arraySize = 2;
+    UA_ExtensionObject sourceArray[2];
+
+    UA_ExtensionObject* arrayElement = sourceArray;
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_ENCODED_BYTESTRING;
+    arrayElement->content.encoded.body = UA_BYTESTRING("DataOfUnknownType");
+    arrayElement->content.encoded.typeId = UA_NODEID_NUMERIC(2, 4);
+
+    arrayElement = &sourceArray[1];
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_ENCODED_BYTESTRING;
+    arrayElement->content.encoded.body = UA_BYTESTRING("DataOfUnknownType");
+    arrayElement->content.encoded.typeId = UA_NODEID_NUMERIC(2, 4);
+
+    EncodeDecodeArrayOfExtensionObjectTest(sourceArray, arraySize);
+}
+END_TEST
+
+START_TEST(UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfExtensionObjectsXmlEncoded) {
+    const size_t arraySize = 2;
+    UA_ExtensionObject sourceArray[2];
+
+    UA_ExtensionObject* arrayElement = sourceArray;
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_ENCODED_XML;
+    arrayElement->content.encoded.body = UA_STRING("<uax:Boolean>false</uax:Boolean>");
+    arrayElement->content.encoded.typeId = UA_TYPES[UA_TYPES_BOOLEAN].typeId;
+
+    arrayElement = &sourceArray[1];
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_ENCODED_XML;
+    arrayElement->content.encoded.body = UA_STRING("<uax:Boolean>true</uax:Boolean>");
+    arrayElement->content.encoded.typeId = UA_TYPES[UA_TYPES_BOOLEAN].typeId;
+
+    EncodeDecodeArrayOfExtensionObjectTest(sourceArray, arraySize);
+}
+END_TEST
+
+START_TEST(UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfExtensionObjectsNoBody) {
+    const size_t arraySize = 2;
+    UA_ExtensionObject sourceArray[2];
+
+    UA_ExtensionObject* arrayElement = sourceArray;
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_ENCODED_NOBODY;
+    arrayElement->content.encoded.typeId = UA_TYPES[UA_TYPES_BOOLEAN].typeId;
+
+    arrayElement = &sourceArray[1];
+    UA_ExtensionObject_init(arrayElement);
+    arrayElement->encoding = UA_EXTENSIONOBJECT_ENCODED_NOBODY;
+    arrayElement->content.encoded.typeId = UA_TYPES[UA_TYPES_BOOLEAN].typeId;
+
+    EncodeDecodeArrayOfExtensionObjectTest(sourceArray, arraySize);
+}
+END_TEST
+
 START_TEST(UA_StatusCode_utils) {
 
     ck_assert(UA_TRUE == UA_StatusCode_isBad(UA_STATUSCODE_BADINTERNALERROR));
@@ -1520,6 +1972,379 @@ START_TEST(UA_StatusCode_utils) {
     ck_assert(UA_TRUE == UA_StatusCode_isBad((UA_StatusCode) -1));
     ck_assert(UA_FALSE == UA_StatusCode_isBad((UA_StatusCode) 1));
 
+} END_TEST
+
+START_TEST(UA_StatusCode_isGoodUncertain) {
+    ck_assert(UA_StatusCode_isGood(UA_STATUSCODE_GOOD) == true);
+    ck_assert(UA_StatusCode_isGood(UA_STATUSCODE_GOODNODATA) == true);
+    ck_assert(UA_StatusCode_isGood(UA_STATUSCODE_BADINTERNALERROR) == false);
+    ck_assert(UA_StatusCode_isGood(UA_STATUSCODE_UNCERTAININITIALVALUE) == false);
+
+    ck_assert(UA_StatusCode_isUncertain(UA_STATUSCODE_UNCERTAININITIALVALUE) == true);
+    ck_assert(UA_StatusCode_isUncertain(UA_STATUSCODE_UNCERTAINSUBSTITUTEVALUE) == true);
+    ck_assert(UA_StatusCode_isUncertain(UA_STATUSCODE_GOOD) == false);
+    ck_assert(UA_StatusCode_isUncertain(UA_STATUSCODE_BADINTERNALERROR) == false);
+} END_TEST
+
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+START_TEST(UA_findDataTypeByName_test) {
+    UA_QualifiedName qn = UA_QUALIFIEDNAME(0, "Boolean");
+    const UA_DataType *type = UA_findDataTypeByName(&qn);
+    ck_assert_ptr_ne(type, NULL);
+    ck_assert(type == &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+    qn = UA_QUALIFIEDNAME(0, "String");
+    type = UA_findDataTypeByName(&qn);
+    ck_assert_ptr_ne(type, NULL);
+    ck_assert(type == &UA_TYPES[UA_TYPES_STRING]);
+
+    qn = UA_QUALIFIEDNAME(0, "NodeId");
+    type = UA_findDataTypeByName(&qn);
+    ck_assert_ptr_ne(type, NULL);
+    ck_assert(type == &UA_TYPES[UA_TYPES_NODEID]);
+
+    qn = UA_QUALIFIEDNAME(0, "UInt32");
+    type = UA_findDataTypeByName(&qn);
+    ck_assert_ptr_ne(type, NULL);
+    ck_assert(type == &UA_TYPES[UA_TYPES_UINT32]);
+
+    qn = UA_QUALIFIEDNAME(0, "NonExistentType");
+    type = UA_findDataTypeByName(&qn);
+    ck_assert_ptr_eq(type, NULL);
+} END_TEST
+
+#endif
+
+START_TEST(UA_Variant_isArray_test) {
+    UA_Variant v;
+    UA_Variant_init(&v);
+    ck_assert(UA_Variant_isArray(&v) == false);
+
+    UA_Int32 scalar = 42;
+    UA_Variant_setScalarCopy(&v, &scalar, &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert(UA_Variant_isArray(&v) == false);
+    ck_assert(UA_Variant_isScalar(&v) == true);
+    UA_Variant_clear(&v);
+
+    UA_Int32 arr[] = {1, 2, 3, 4, 5};
+    UA_Variant_setArrayCopy(&v, arr, 5, &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert(UA_Variant_isArray(&v) == true);
+    ck_assert(UA_Variant_isScalar(&v) == false);
+    UA_Variant_clear(&v);
+} END_TEST
+
+START_TEST(UA_DateTime_toUnixTime_test) {
+    UA_DateTime dt = UA_DateTime_fromUnixTime(1000);
+    UA_Int64 unixTime = UA_DateTime_toUnixTime(dt);
+    ck_assert_int_eq(unixTime, 1000);
+
+    dt = UA_DateTime_fromUnixTime(0);
+    unixTime = UA_DateTime_toUnixTime(dt);
+    ck_assert_int_eq(unixTime, 0);
+
+    dt = UA_DateTime_fromUnixTime(1609459200);
+    unixTime = UA_DateTime_toUnixTime(dt);
+    ck_assert_int_eq(unixTime, 1609459200);
+} END_TEST
+
+START_TEST(UA_DataType_isNumeric_test) {
+    /* Test numeric types */
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_BYTE]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_SBYTE]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_INT16]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_UINT16]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_INT32]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_UINT32]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_INT64]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_UINT64]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_FLOAT]) == true);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_DOUBLE]) == true);
+
+    /* Test non-numeric types */
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_BOOLEAN]) == false);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_STRING]) == false);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_DATETIME]) == false);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_GUID]) == false);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_NODEID]) == false);
+    ck_assert(UA_DataType_isNumeric(&UA_TYPES[UA_TYPES_STATUSCODE]) == false);
+} END_TEST
+
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+START_TEST(UA_DataType_getStructMember_test) {
+    /* Test getting struct members from ReadValueId */
+    const UA_DataType *type = &UA_TYPES[UA_TYPES_READVALUEID];
+    size_t offset = 0;
+    const UA_DataType *memberType = NULL;
+    UA_Boolean isArray = false;
+
+    /* Test finding NodeId member (capital N) */
+    UA_Boolean found = UA_DataType_getStructMember(type, "NodeId", &offset, &memberType, &isArray);
+    ck_assert(found == true);
+    ck_assert(memberType == &UA_TYPES[UA_TYPES_NODEID]);
+    ck_assert(isArray == false);
+
+    /* Test finding AttributeId member (capital A) */
+    found = UA_DataType_getStructMember(type, "AttributeId", &offset, &memberType, &isArray);
+    ck_assert(found == true);
+    ck_assert(memberType == &UA_TYPES[UA_TYPES_UINT32]);
+    ck_assert(isArray == false);
+
+    /* Test finding IndexRange member (capital I) */
+    found = UA_DataType_getStructMember(type, "IndexRange", &offset, &memberType, &isArray);
+    ck_assert(found == true);
+    ck_assert(memberType == &UA_TYPES[UA_TYPES_STRING]);
+    ck_assert(isArray == false);
+
+    /* Test finding non-existent member */
+    found = UA_DataType_getStructMember(type, "nonExistent", &offset, &memberType, &isArray);
+    ck_assert(found == false);
+
+    /* Test with a type that has array members - BrowseResult */
+    type = &UA_TYPES[UA_TYPES_BROWSERESULT];
+    found = UA_DataType_getStructMember(type, "References", &offset, &memberType, &isArray);
+    ck_assert(found == true);
+    ck_assert(isArray == true);
+} END_TEST
+#endif
+
+START_TEST(UA_ExtensionObject_decodeNullEncodingId) {
+    UA_NodeId nullId = UA_NODEID_NULL;
+    ck_assert_ptr_eq(UA_findDataTypeByBinary(&nullId), NULL);
+
+    UA_Byte data[] = {0, 0, 1, 1, 0, 0, 0, 5};
+    UA_ByteString input = {sizeof(data), data};
+    UA_ExtensionObject eo;
+    size_t offset = 0;
+    ck_assert_uint_eq(UA_decodeBinaryInternal(&input, &offset, &eo,
+                      &UA_TYPES[UA_TYPES_EXTENSIONOBJECT], NULL), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(offset, input.length);
+    ck_assert_uint_eq(eo.encoding, UA_EXTENSIONOBJECT_ENCODED_BYTESTRING);
+    ck_assert(UA_NodeId_isNull(&eo.content.encoded.typeId));
+    ck_assert_uint_eq(eo.content.encoded.body.length, 1);
+    ck_assert_uint_eq(eo.content.encoded.body.data[0], 5);
+    UA_ExtensionObject_clear(&eo);
+
+    /* Numeric zero in another namespace can be a registered encoding id. */
+    UA_DataType custom = UA_TYPES[UA_TYPES_BOOLEAN];
+    custom.typeId = UA_NODEID_NUMERIC(1, 123);
+    custom.binaryEncodingId = UA_NODEID_NUMERIC(1, 0);
+    UA_DataTypeArray customTypes = {NULL, 1, &custom, false, false};
+    UA_DecodeBinaryOptions options = {0};
+    options.customTypes = &customTypes;
+    UA_Byte namespaced[] = {1, 1, 0, 0, 1, 1, 0, 0, 0, 5};
+    input.data = namespaced;
+    input.length = sizeof(namespaced);
+    offset = 0;
+    ck_assert_uint_eq(UA_decodeBinaryInternal(&input, &offset, &eo,
+                      &UA_TYPES[UA_TYPES_EXTENSIONOBJECT], &options), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(eo.encoding, UA_EXTENSIONOBJECT_DECODED);
+    ck_assert_ptr_eq(eo.content.decoded.type, &custom);
+    UA_ExtensionObject_clear(&eo);
+
+    /* Legitimate null ExtensionObjects still have no body. */
+    data[2] = 0;
+    input.data = data;
+    input.length = 3;
+    ck_assert_uint_eq(UA_decodeBinary(&input, &eo, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT],
+                                     NULL), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(eo.encoding, UA_EXTENSIONOBJECT_ENCODED_NOBODY);
+    UA_ExtensionObject_clear(&eo);
+} END_TEST
+
+START_TEST(UA_Variant_decodeNullEncodingId) {
+    UA_Byte data[] = {0x96, 2, 0, 0, 0,
+                     0, 0, 1, 1, 0, 0, 0, 5,
+                     0, 0, 1, 1, 0, 0, 0, 0};
+    UA_ByteString input = {sizeof(data), data};
+    UA_Variant v;
+    ck_assert_uint_eq(UA_decodeBinary(&input, &v, &UA_TYPES[UA_TYPES_VARIANT], NULL),
+                      UA_STATUSCODE_GOOD);
+    ck_assert_ptr_eq(v.type, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT]);
+    ck_assert_uint_eq(v.arrayLength, 2);
+    UA_ExtensionObject *eo = (UA_ExtensionObject*)v.data;
+    ck_assert_uint_eq(eo[0].encoding, UA_EXTENSIONOBJECT_ENCODED_BYTESTRING);
+    ck_assert_uint_eq(eo[1].encoding, UA_EXTENSIONOBJECT_ENCODED_BYTESTRING);
+    ck_assert_uint_eq(eo[0].content.encoded.body.data[0], 5);
+    ck_assert_uint_eq(eo[1].content.encoded.body.data[0], 0);
+    UA_Variant_clear(&v);
+
+    data[4] = 0x16;
+    input.data = data + 4;
+    input.length = 9;
+    ck_assert_uint_eq(UA_decodeBinary(&input, &v, &UA_TYPES[UA_TYPES_VARIANT], NULL),
+                      UA_STATUSCODE_GOOD);
+    ck_assert(UA_Variant_hasScalarType(&v, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT]));
+    eo = (UA_ExtensionObject*)v.data;
+    ck_assert_uint_eq(eo->encoding, UA_EXTENSIONOBJECT_ENCODED_BYTESTRING);
+    ck_assert_uint_eq(eo->content.encoded.body.data[0], 5);
+    UA_Variant_clear(&v);
+} END_TEST
+
+START_TEST(UA_Variant_decodeReservedTypeIds) {
+    UA_Byte scalar[] = {0, 3, 0, 0, 0, 0x00, 0x80, 0xff};
+    UA_Byte nullScalar[] = {0, 0xff, 0xff, 0xff, 0xff};
+    UA_Byte emptyScalar[] = {0, 0, 0, 0, 0};
+    UA_Byte nullArray[] = {0x80, 0xff, 0xff, 0xff, 0xff};
+    UA_Byte emptyArray[] = {0x80, 0, 0, 0, 0};
+    UA_Byte array[] = {0x80, 2, 0, 0, 0,
+                      3, 0, 0, 0, 0x00, 0x80, 0xff,
+                      1, 0, 0, 0, 0x05};
+    UA_Byte matrix[] = {0xc0, 2, 0, 0, 0,
+                       3, 0, 0, 0, 0x00, 0x80, 0xff,
+                       1, 0, 0, 0, 0x05,
+                       2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0};
+    UA_ByteString inputs[] = {
+        {sizeof(scalar), scalar}, {sizeof(nullScalar), nullScalar},
+        {sizeof(emptyScalar), emptyScalar}, {sizeof(nullArray), nullArray},
+        {sizeof(emptyArray), emptyArray}, {sizeof(array), array},
+        {sizeof(matrix), matrix}
+    };
+
+    for(UA_Byte id = 26; id <= 31; id++) {
+        for(size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+            UA_ByteString *input = &inputs[i];
+            UA_Byte flags = input->data[0] & 0xc0;
+            input->data[0] = flags | id;
+            UA_Variant v;
+            size_t offset = 0;
+            ck_assert_uint_eq(UA_decodeBinaryInternal(input, &offset, &v,
+                              &UA_TYPES[UA_TYPES_VARIANT], NULL), UA_STATUSCODE_GOOD);
+            ck_assert_uint_eq(offset, input->length);
+            ck_assert_ptr_eq(v.type, &UA_TYPES[UA_TYPES_BYTESTRING]);
+            ck_assert_int_eq(UA_Variant_isScalar(&v), flags == 0);
+            if(flags & 0x80)
+                ck_assert_uint_eq(v.arrayLength, i >= 5 ? 2 : 0);
+            if(flags & 0x40) {
+                ck_assert_uint_eq(v.arrayDimensionsSize, 2);
+                ck_assert_uint_eq(v.arrayDimensions[0], 1);
+                ck_assert_uint_eq(v.arrayDimensions[1], 2);
+            }
+
+            /* Preserve payload, null/empty distinctions and dimensions, but
+             * re-encode with the ordinary ByteString wire type id (15). */
+            UA_ByteString encoded = UA_BYTESTRING_NULL;
+            ck_assert_uint_eq(UA_encodeBinary(&v, &UA_TYPES[UA_TYPES_VARIANT],
+                                              &encoded, NULL), UA_STATUSCODE_GOOD);
+            input->data[0] = flags | 15;
+            ck_assert(UA_ByteString_equal(input, &encoded));
+            UA_ByteString_clear(&encoded);
+            UA_Variant_clear(&v);
+        }
+    }
+} END_TEST
+
+START_TEST(UA_Variant_decodeReservedTypeIdsMalformed) {
+    UA_Byte scalar[] = {0, 3, 0, 0, 0, 0x00, 0x80, 0xff};
+    UA_Byte matrix[] = {0xc0, 2, 0, 0, 0,
+                       1, 0, 0, 0, 0x05, 1, 0, 0, 0, 0x06,
+                       2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0};
+    UA_ByteString inputs[] = {{sizeof(scalar), scalar}, {sizeof(matrix), matrix}};
+    for(UA_Byte id = 26; id <= 31; id++) {
+        scalar[0] = id;
+        matrix[0] = 0xc0 | id;
+        for(size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+            for(size_t length = 1; length < inputs[i].length; length++) {
+                UA_ByteString truncated = {length, inputs[i].data};
+                UA_Variant v;
+                ck_assert_uint_eq(UA_decodeBinary(&truncated, &v,
+                                  &UA_TYPES[UA_TYPES_VARIANT], NULL),
+                                  UA_STATUSCODE_BADDECODINGERROR);
+                UA_Variant_clear(&v);
+            }
+        }
+    }
+
+    /* Only ids 26..31 are normalized; higher ids still fail. */
+    for(UA_Byte id = 32; id <= 63; id++) {
+        scalar[0] = id;
+        UA_Variant v;
+        ck_assert_uint_eq(UA_decodeBinary(&inputs[0], &v,
+                          &UA_TYPES[UA_TYPES_VARIANT], NULL),
+                          UA_STATUSCODE_BADDECODINGERROR);
+        UA_Variant_clear(&v);
+    }
+} END_TEST
+
+START_TEST(UA_Variant_decodeScalarDimensions) {
+    /* Reject the illegal flag even without trailing bytes. */
+    UA_Byte data[] = {0x46, 0xff, 0xff, 0xff, 0xff, 0xde, 0xad, 0xbe, 0xef};
+    UA_ByteString input = {sizeof(data), data};
+    UA_Variant v;
+    for(size_t len = 5; len <= sizeof(data); len += 4) {
+        input.length = len;
+        ck_assert_uint_eq(UA_decodeBinary(&input, &v, &UA_TYPES[UA_TYPES_VARIANT], NULL),
+                          UA_STATUSCODE_BADDECODINGERROR);
+        UA_Variant_clear(&v);
+    }
+    data[0] = 0x06;
+    input.length = 5;
+    ck_assert_uint_eq(UA_decodeBinary(&input, &v, &UA_TYPES[UA_TYPES_VARIANT], NULL),
+                      UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(*(UA_Int32*)v.data, -1);
+    UA_Variant_clear(&v);
+} END_TEST
+
+START_TEST(UA_type_lookup_boundaries) {
+    for(size_t i = 0; i < UA_TYPES_COUNT; ++i) {
+        ck_assert_uint_eq(UA_TYPES[i].typeId.namespaceIndex, 0);
+        ck_assert_int_eq(UA_TYPES[i].typeId.identifierType, UA_NODEIDTYPE_NUMERIC);
+        ck_assert(UA_findDataType(&UA_TYPES[i].typeId) == &UA_TYPES[i]);
+        if(i > 0)
+            ck_assert_int_eq(UA_NodeId_order(&UA_TYPES[i-1].typeId,
+                                            &UA_TYPES[i].typeId), UA_ORDER_LESS);
+    }
+
+    UA_NodeId missing[6];
+    missing[0] = UA_NODEID_NUMERIC(0, 0);
+    missing[1] = UA_NODEID_NUMERIC(0, UA_UINT32_MAX);
+    missing[2] = UA_NODEID_NUMERIC(1, 1);
+    missing[3] = UA_NODEID_STRING(0, "Boolean");
+    missing[4] = UA_NODEID_GUID(0, UA_GUID_NULL);
+    missing[5] = UA_NODEID_BYTESTRING(0, "Boolean");
+    for(size_t i = 0; i < sizeof(missing) / sizeof(missing[0]); ++i)
+        ck_assert_ptr_eq(UA_findDataType(&missing[i]), NULL);
+
+    /* A missing numeric identifier inside the standard type range. */
+    for(size_t i = 1; i < UA_TYPES_COUNT; ++i) {
+        UA_UInt32 previous = UA_TYPES[i-1].typeId.identifier.numeric;
+        if(UA_TYPES[i].typeId.identifier.numeric > previous + 1) {
+            UA_NodeId gap = UA_NODEID_NUMERIC(0, previous + 1);
+            ck_assert_ptr_eq(UA_findDataType(&gap), NULL);
+        }
+    }
+
+    /* Unsorted custom arrays and chained arrays still use linear lookup. */
+    UA_DataType custom[2] = {UA_TYPES[UA_TYPES_BOOLEAN], UA_TYPES[UA_TYPES_INT32]};
+    custom[0].typeId = UA_NODEID_STRING(2, "Custom");
+    custom[1].typeId = UA_NODEID_NUMERIC(0, 0);
+    UA_DataTypeArray tail = {NULL, 1, &custom[1], false, false};
+    UA_DataTypeArray head = {&tail, 1, &custom[0], false, false};
+    for(size_t i = 0; i < 2; ++i)
+        ck_assert(UA_findDataTypeWithCustom(&custom[i].typeId, &head) == &custom[i]);
+    ck_assert(UA_findDataTypeWithCustom(&UA_TYPES[0].typeId, &head) == &UA_TYPES[0]);
+    ck_assert_ptr_eq(UA_findDataTypeWithCustom(&missing[1], &head), NULL);
+
+    /* Skipping UA_TYPES must still find custom types of every NodeId kind. */
+    for(size_t i = 0; i < sizeof(missing) / sizeof(missing[0]); ++i) {
+        custom[1].typeId = missing[i];
+        ck_assert(UA_findDataTypeWithCustom(&missing[i], &head) == &custom[1]);
+    }
+} END_TEST
+
+START_TEST(UA_type_lookup_speed) {
+    clock_t begin, finish;
+    begin = clock();
+
+    UA_NodeId readRequestId = UA_TYPES[UA_TYPES_READREQUEST].typeId;
+
+    for(size_t i = 0; i < 1000; i++) {
+        const UA_DataType *t = UA_findDataType(&readRequestId);
+        ck_assert(t == &UA_TYPES[UA_TYPES_READREQUEST]);
+    }
+
+    finish = clock();
+    double time_spent = (double)(finish - begin) / CLOCKS_PER_SEC;
+    printf("duration of the type lookup was %f s\n", time_spent);
 } END_TEST
 
 static Suite *testSuite_builtin(void) {
@@ -1553,6 +2378,11 @@ static Suite *testSuite_builtin(void) {
     tcase_add_test(tc_decode, UA_Variant_decodeWithArrayFlagSetShallSetVTAndAllocateMemoryForArray);
     tcase_add_test(tc_decode, UA_Variant_decodeWithOutDeleteMembersShallFailInCheckMem);
     tcase_add_test(tc_decode, UA_Variant_decodeWithTooSmallSourceShallReturnWithError);
+    tcase_add_test(tc_decode, UA_ExtensionObject_decodeNullEncodingId);
+    tcase_add_test(tc_decode, UA_Variant_decodeNullEncodingId);
+    tcase_add_test(tc_decode, UA_Variant_decodeReservedTypeIds);
+    tcase_add_test(tc_decode, UA_Variant_decodeReservedTypeIdsMalformed);
+    tcase_add_test(tc_decode, UA_Variant_decodeScalarDimensions);
     suite_add_tcase(s, tc_decode);
 
     TCase *tc_encode = tcase_create("encode");
@@ -1568,10 +2398,19 @@ static Suite *testSuite_builtin(void) {
     tcase_add_test(tc_encode, UA_Float_encodeShallWorkOnExample);
     tcase_add_test(tc_encode, UA_Double_encodeShallWorkOnExample);
     tcase_add_test(tc_encode, UA_String_encodeShallWorkOnExample);
+    tcase_add_test(tc_encode, UA_String_encodeShallWorkOnEmpty);
     tcase_add_test(tc_encode, UA_ExpandedNodeId_encodeShallWorkOnExample);
+    tcase_add_test(tc_encode, UA_ExpandedNodeId_encodeWithUriWritesIndexZero);
+    tcase_add_test(tc_encode, UA_DateTime_encodeClampsToTheValidRange);
     tcase_add_test(tc_encode, UA_DataValue_encodeShallWorkOnExampleWithoutVariant);
     tcase_add_test(tc_encode, UA_DataValue_encodeShallWorkOnExampleWithVariant);
     tcase_add_test(tc_encode, UA_ExtensionObject_encodeDecodeShallWorkOnExtensionObject);
+    tcase_add_test(tc_encode, UA_Variant_encodeDecodeShallWorkOnVariantWithStruct);
+    tcase_add_test(tc_encode, UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfStruct);
+    tcase_add_test(tc_encode, UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfDifferentTypes);
+    tcase_add_test(tc_encode, UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfExtensionObjectsWithUnknownType);
+    tcase_add_test(tc_encode, UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfExtensionObjectsXmlEncoded);
+    tcase_add_test(tc_encode, UA_Variant_encodeDecodeShallWorkOnVariantWithArrayOfExtensionObjectsNoBody);
     suite_add_tcase(s, tc_encode);
 
     TCase *tc_convert = tcase_create("convert");
@@ -1585,16 +2424,21 @@ static Suite *testSuite_builtin(void) {
 
     TCase *tc_hash = tcase_create("hash");
     tcase_add_test(tc_hash, UA_ExpandedNodeId_hashIdentical);
+    tcase_add_test(tc_hash, UA_ExpandedNodeId_constructors);
     suite_add_tcase(s, tc_hash);
 
     TCase *tc_copy = tcase_create("copy");
     tcase_add_test(tc_copy, UA_Array_copyByteArrayShallWorkOnExample);
     tcase_add_test(tc_copy, UA_Array_copyUA_StringShallWorkOnExample);
+    tcase_add_test(tc_copy, UA_Array_allocationOverflowShallBeRejected);
+    tcase_add_test(tc_copy, UA_Array_appendSizeOverflowShallBeRejected);
     tcase_add_test(tc_copy, UA_ExtensionObject_copyShallWorkOnExample);
     tcase_add_test(tc_copy, UA_Variant_copyShallWorkOnSingleValueExample);
     tcase_add_test(tc_copy, UA_Variant_copyShallWorkOn1DArrayExample);
     tcase_add_test(tc_copy, UA_Variant_copyShallWorkOn2DArrayExample);
     tcase_add_test(tc_copy, UA_Variant_copyShallWorkOnByteStringIndexRange);
+    tcase_add_test(tc_copy, UA_Variant_setRangeRejectsUnclampedSourceSize);
+    tcase_add_test(tc_copy, UA_Variant_setArrayWithSizeZeroIsEmptyArray);
 
     tcase_add_test(tc_copy, UA_DiagnosticInfo_copyShallWorkOnExample);
     tcase_add_test(tc_copy, UA_ApplicationDescription_copyShallWorkOnExample);
@@ -1606,6 +2450,18 @@ static Suite *testSuite_builtin(void) {
 
     TCase *tc_utils = tcase_create("utils");
     tcase_add_test(tc_utils, UA_StatusCode_utils);
+    tcase_add_test(tc_utils, UA_type_lookup_speed);
+    tcase_add_test(tc_utils, UA_type_lookup_boundaries);
+    tcase_add_test(tc_utils, UA_StatusCode_isGoodUncertain);
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+    tcase_add_test(tc_utils, UA_findDataTypeByName_test);
+#endif
+    tcase_add_test(tc_utils, UA_Variant_isArray_test);
+    tcase_add_test(tc_utils, UA_DateTime_toUnixTime_test);
+    tcase_add_test(tc_utils, UA_DataType_isNumeric_test);
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+    tcase_add_test(tc_utils, UA_DataType_getStructMember_test);
+#endif
     suite_add_tcase(s, tc_utils);
 
     return s;

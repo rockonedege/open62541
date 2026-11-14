@@ -22,6 +22,7 @@
 
 #include "client/ua_client_internal.h"
 #include <server/ua_server_internal.h>
+#include "test_helpers.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -33,17 +34,17 @@
 #include <sys/stat.h>
 
 UA_Server *server;
-UA_Boolean running;
+UA_atomic(uintptr_t) running;
 pthread_t server_thread;
 
 static void * serverloop(void *_) {
-    while(running)
+    while(UA_atomic_load(&running))
         UA_Server_run_iterate(server, true);
     return NULL;
 }
 
 static void start_server(void) {
-    running = true;
+    UA_atomic_store(&running, true);
 
     /* less log output */
     UA_ServerConfig initialConfig;
@@ -54,15 +55,13 @@ static void start_server(void) {
 
     UA_ServerConfig *config = UA_Server_getConfig(server);
     config->applicationDescription.applicationType = UA_APPLICATIONTYPE_SERVER;
-    config->mdnsEnabled = true;
-    config->mdnsConfig.mdnsServerName = UA_String_fromChars("Sample Multicast Server");
 
     UA_Server_run_startup(server);
     pthread_create(&server_thread, NULL, serverloop, NULL);
 }
 
 static void teardown_server(void) {
-    running = false;
+    UA_atomic_store(&running, false);
     pthread_join(server_thread, NULL);
     UA_Server_run_shutdown(server);
     UA_Server_delete(server);
@@ -85,7 +84,7 @@ static void emptyCorpusDir(void) {
 
 /*************************************************
  * The following list of client requests is based
- * on ua_server_binary.c:getServicePointers to
+ * on ua_transport_tcp.c:getServicePointers to
  * cover all possible services and their inputs
  ************************************************/
 
@@ -152,14 +151,12 @@ initUaRegisterServer(UA_RegisteredServer *requestServer) {
     requestServer->serverNames = &server->config.applicationDescription.applicationName;
     requestServer->serverNamesSize = 1;
 
-    size_t nl_discurls = server->config.networkLayersSize;
+    size_t nl_discurls = server->config.serverUrlsSize;
     requestServer->discoveryUrls = (UA_String*)UA_malloc(sizeof(UA_String) * nl_discurls);
     requestServer->discoveryUrlsSize = nl_discurls;
     for(size_t i = 0; i < nl_discurls; ++i) {
-        UA_ServerNetworkLayer *nl = &server->config.networkLayers[i];
-        requestServer->discoveryUrls[i] = nl->discoveryUrl;
+        requestServer->discoveryUrls[i] = server->config.serverUrls[i];
     }
-
 }
 
 static UA_StatusCode
@@ -198,14 +195,6 @@ registerServer2Request(UA_Client *client) {
 
     initUaRegisterServer(&request.server);
 
-    request.discoveryConfigurationSize = 1;
-    request.discoveryConfiguration = UA_ExtensionObject_new();
-    UA_ExtensionObject_init(&request.discoveryConfiguration[0]);
-    // Set to NODELETE so that we can just use a pointer to the mdns config
-    request.discoveryConfiguration[0].encoding = UA_EXTENSIONOBJECT_DECODED_NODELETE;
-    request.discoveryConfiguration[0].content.decoded.type = &UA_TYPES[UA_TYPES_MDNSDISCOVERYCONFIGURATION];
-    request.discoveryConfiguration[0].content.decoded.data = &server->config.mdnsConfig;
-
     // First try with RegisterServer2, if that isn't implemented, use RegisterServer
     UA_RegisterServer2Response response;
     UA_RegisterServer2Response_init(&response);
@@ -214,7 +203,6 @@ registerServer2Request(UA_Client *client) {
 
     ASSERT_GOOD(response.responseHeader.serviceResult);
     UA_free(request.server.discoveryUrls);
-    UA_ExtensionObject_delete(request.discoveryConfiguration);
 
     UA_RegisterServer2Response_clear(&response);
 
@@ -410,7 +398,7 @@ subscriptionRequests(UA_Client *client) {
     ASSERT_GOOD(setPublishingModeResponse.responseHeader.serviceResult);
     UA_SetPublishingModeRequest_clear(&setPublishingModeRequest);
     UA_SetPublishingModeResponse_clear(&setPublishingModeResponse);
-    
+
 
     // createMonitoredItemsRequest
     UA_UInt32 monId;
@@ -426,15 +414,20 @@ subscriptionRequests(UA_Client *client) {
     monId = monResponse.monitoredItemId;
 
     // publishRequest
+    // Both helpers are internal and require the client lock to be held.
     UA_PublishRequest publishRequest;
     UA_PublishRequest_init(&publishRequest);
-    ASSERT_GOOD(UA_Client_preparePublishRequest(client, &publishRequest));
-    UA_Client_sendAsyncRequest(client, &publishRequest,
-                               &UA_TYPES[UA_TYPES_PUBLISHREQUEST], NULL,
-                               &UA_TYPES[UA_TYPES_PUBLISHRESPONSE], NULL, NULL);
-    // here we don't care about the return value since it may be UA_STATUSCODE_BADMESSAGENOTAVAILABLE
-    // ASSERT_GOOD(publishResponse.responseHeader.serviceResult);
+    lockClient(client);
+    UA_StatusCode publishRetval = __Client_preparePublishRequest(client, &publishRequest);
+    if(publishRetval == UA_STATUSCODE_GOOD)
+        __Client_AsyncService(client, &publishRequest,
+                              &UA_TYPES[UA_TYPES_PUBLISHREQUEST], NULL,
+                              &UA_TYPES[UA_TYPES_PUBLISHRESPONSE], NULL, NULL);
+    unlockClient(client);
+    // here we don't care about the async return value since it may be
+    // UA_STATUSCODE_BADMESSAGENOTAVAILABLE
     UA_PublishRequest_clear(&publishRequest);
+    ASSERT_GOOD(publishRetval);
 
     // republishRequest
     UA_RepublishRequest republishRequest;
@@ -463,7 +456,7 @@ subscriptionRequests(UA_Client *client) {
     ASSERT_GOOD(modifyMonitoredItemsResponse.responseHeader.serviceResult);
     UA_ModifyMonitoredItemsRequest_clear(&modifyMonitoredItemsRequest);
     UA_ModifyMonitoredItemsResponse_clear(&modifyMonitoredItemsResponse);
-    
+
     // setMonitoringMode
     UA_SetMonitoringModeRequest setMonitoringModeRequest;
     UA_SetMonitoringModeRequest_init(&setMonitoringModeRequest);
@@ -569,8 +562,7 @@ int main(void) {
     emptyCorpusDir();
     start_server();
 
-    UA_Client *client = UA_Client_new();
-    UA_ClientConfig_setDefault(UA_Client_getConfig(client));
+    UA_Client *client = UA_Client_newForUnitTest();
 
     // this will also call getEndpointsRequest
     UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
@@ -581,8 +573,7 @@ int main(void) {
 
     if(retval == UA_STATUSCODE_GOOD) {
         // now also connect with user/pass so that fuzzer also knows how to do that
-        client = UA_Client_new();
-        UA_ClientConfig_setDefault(UA_Client_getConfig(client));
+        client = UA_Client_newForUnitTest();
         retval = UA_Client_connectUsername(client, "opc.tcp://localhost:4840", "user1", "password");
         retval = retval == UA_STATUSCODE_BADUSERACCESSDENIED ? UA_STATUSCODE_GOOD : retval;
         UA_Client_disconnect(client);

@@ -19,14 +19,19 @@ typedef struct UA_AccessControl UA_AccessControl;
 /**
  * .. _access-control:
  *
- * Access Control Plugin API
- * =========================
+ * AccessControl Plugin API
+ * ========================
  * The access control callback is used to authenticate sessions and grant access
  * rights accordingly.
  *
  * The ``sessionId`` and ``sessionContext`` can be both NULL. This is the case
  * when, for example, a MonitoredItem (the underlying Subscription) is detached
- * from its Session but continues to run. */
+ * from its Session but continues to run.
+ *
+ * The callbacks ``activateSession``, ``getUserRightsMask``,
+ * ``getUserAccessLevel``, ``getUserExecutable``, ``getUserExecutableOnObject``
+ * and ``allowBrowseNode`` are mandatory. The server does not start without
+ * them. The other callbacks can be NULL. */
 
 struct UA_AccessControl {
     void *context;
@@ -39,7 +44,22 @@ struct UA_AccessControl {
     /* Authenticate a session. The session context is attached to the session
      * and later passed into the node-based access control callbacks. The new
      * session is rejected if a StatusCode other than UA_STATUSCODE_GOOD is
-     * returned. */
+     * returned.
+     *
+     * Note that this callback can be called several times for a Session. For
+     * example when a Session is recovered (activated) on a new
+     * SecureChannel.
+     *
+     * The following checks are performed in the server before calling
+     * activateSession:
+     *
+     * - Select matching Endpoint/UserTokenPolicy (compare token type,
+     *   SecureChannel and PolicyId from the UserIdentityToken)
+     * - Cryptographic checks:
+     *   - Check the encryption algorithm from the UserIdentityToken
+     *   - UsernamePassword/IssuedToken: Decrypt the secret
+     *   - Check the x509 auth certificate signature and validate the
+     *     certificate against the server's sessionPKI */
     UA_StatusCode (*activateSession)(UA_Server *server, UA_AccessControl *ac,
                                      const UA_EndpointDescription *endpointDescription,
                                      const UA_ByteString *secureChannelRemoteCertificate,
@@ -99,9 +119,17 @@ struct UA_AccessControl {
                                   const UA_NodeId *nodeId, void *nodeContext);
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
+    /* Allow creating a subscription */
+    UA_Boolean (*allowCreateSubscription)(UA_Server *server, UA_AccessControl *ac,
+                                          const UA_NodeId *sessionId, void *sessionContext);
+
     /* Allow transfer of a subscription to another session. The Server shall
      * validate that the Client of that Session is operating on behalf of the
-     * same user */
+     * same user. The oldSessionId is NULL for a Subscription that is detached
+     * from its Session. The server only calls this after it has verified that
+     * the new Session has the identity (user, and for anonymous users the
+     * client ApplicationUri over a secure SecureChannel) of the Session the
+     * Subscription was detached from. */
     UA_Boolean (*allowTransferSubscription)(UA_Server *server, UA_AccessControl *ac,
                                             const UA_NodeId *oldSessionId, void *oldSessionContext,
                                             const UA_NodeId *newSessionId, void *newSessionContext);

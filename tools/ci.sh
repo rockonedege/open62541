@@ -1,183 +1,34 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Exit immediately if a command exits with a non-zero status
-set -e 
+# Reusable CI functions. Source this file before invoking a function.
 
-# Use the error status of the first failure in a pipeline
+set -e
 set -o pipefail
-
-# Exit if an uninitialized variable is accessed
 set -o nounset
 
-# Use all available cores
-if which nproc > /dev/null; then
-    MAKEOPTS="-j$(nproc)"
-else
-    MAKEOPTS="-j$(sysctl -n hw.ncpu)"
-fi
+CI_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CI_REPOSITORY_ROOT="$(cd "${CI_SCRIPT_DIR}/.." && pwd)"
 
-###########
-# cpplint #
-###########
+function clang_tidy_all {
+    local build_dir="${CLANG_TIDY_BUILD_DIR:-${CI_REPOSITORY_ROOT}/build-clang-tidy}"
+    local c_compiler="${CLANG_TIDY_C_COMPILER:-clang-22}"
+    local clang_tidy="${CLANG_TIDY_BINARY:-clang-tidy-22}"
+    local run_clang_tidy="${RUN_CLANG_TIDY_BINARY:-run-clang-tidy-22}"
+    local jobs="${CLANG_TIDY_JOBS:-2}"
 
-function cpplint {
-    mkdir -p build; cd build; rm -rf *
-    cmake ..
-    make ${MAKEOPTS} cpplint
-}
+    (cd "${CI_REPOSITORY_ROOT}" && "${clang_tidy}" --verify-config)
+    cmake -S "${CI_REPOSITORY_ROOT}" -B "${build_dir}" \
+        -DCMAKE_C_COMPILER="${c_compiler}" \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DUA_BUILD_EXAMPLES=OFF \
+        -DUA_BUILD_UNIT_TESTS=OFF
+    cmake --build "${build_dir}" \
+        --target open62541-code-generation \
+        --parallel "${jobs}"
 
-#######################
-# Build Documentation #
-#######################
-
-function build_docs {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DCMAKE_BUILD_TYPE=Release \
-          -DUA_BUILD_EXAMPLES=ON \
-          ..
-    make doc
-}
-
-#########################
-# Build Release Version #
-#########################
-
-function build_release {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DBUILD_SHARED_LIBS=ON \
-          -DUA_ENABLE_ENCRYPTION=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-          -DUA_BUILD_EXAMPLES=ON \
-          ..
-    make ${MAKEOPTS}
-}
-
-######################
-# Build Amalgamation #
-######################
-
-function build_amalgamation {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DCMAKE_BUILD_TYPE=Debug \
-          -DUA_ENABLE_AMALGAMATION=ON \
-          -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DUA_ENABLE_JSON_ENCODING=ON \
-          -DUA_ENABLE_PUBSUB=ON \
-          -DUA_ENABLE_PUBSUB_DELTAFRAMES=ON \
-          -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=OFF \
-          -DUA_ENABLE_PUBSUB_MONITORING=ON \
-          ..
-    make ${MAKEOPTS}
-}
-
-############################
-# Build and Run Unit Tests #
-############################
-
-function unit_tests {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DCMAKE_BUILD_TYPE=Debug \
-          -DUA_BUILD_EXAMPLES=ON \
-          -DUA_BUILD_UNIT_TESTS=ON \
-          -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_DISCOVERY_MULTICAST=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DUA_ENABLE_JSON_ENCODING=ON \
-          -DUA_ENABLE_PUBSUB=ON \
-          -DUA_ENABLE_PUBSUB_DELTAFRAMES=ON \
-          -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=OFF \
-          -DUA_ENABLE_PUBSUB_MONITORING=ON \
-          ..
-    make ${MAKEOPTS}
-    make test ARGS="-V"
-}
-
-function unit_tests_mt {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DCMAKE_BUILD_TYPE=Debug \
-          -DUA_MULTITHREADING=200 \
-          -DUA_BUILD_EXAMPLES=ON \
-          -DUA_BUILD_UNIT_TESTS=ON \
-          -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_DISCOVERY_MULTICAST=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          ..
-    make ${MAKEOPTS}
-    make test ARGS="-V"
-}
-
-function unit_tests_encryption_mbedtls {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DCMAKE_BUILD_TYPE=Debug \
-          -DUA_BUILD_EXAMPLES=ON \
-          -DUA_BUILD_UNIT_TESTS=ON \
-          -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_DISCOVERY_MULTICAST=ON \
-          -DUA_ENABLE_ENCRYPTION=ON \
-          -DUA_ENABLE_ENCRYPTION_MBEDTLS=ON \
-          ..
-    make ${MAKEOPTS}
-    make test ARGS="-V"
-}
-
-function unit_tests_encryption_openssl {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DCMAKE_BUILD_TYPE=Debug \
-          -DUA_BUILD_EXAMPLES=ON \
-          -DUA_BUILD_UNIT_TESTS=ON \
-          -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_DISCOVERY_MULTICAST=ON \
-          -DUA_ENABLE_ENCRYPTION=ON \
-          -DUA_ENABLE_ENCRYPTION_OPENSSL=ON \
-          ..
-    make ${MAKEOPTS}
-    make test ARGS="-V"
-}
-
-##########################################
-# Build and Run Unit Tests with Valgrind #
-##########################################
-
-function unit_tests_valgrind {
-    mkdir -p build; cd build; rm -rf *
-    cmake -DCMAKE_BUILD_TYPE=Debug \
-          -DUA_BUILD_EXAMPLES=ON \
-          -DUA_BUILD_UNIT_TESTS=ON \
-          -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_DISCOVERY_MULTICAST=ON \
-          -DUA_ENABLE_ENCRYPTION=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DUA_ENABLE_JSON_ENCODING=ON \
-          -DUA_ENABLE_PUBSUB=ON \
-          -DUA_ENABLE_PUBSUB_DELTAFRAMES=ON \
-          -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=OFF \
-          -DUA_ENABLE_PUBSUB_MONITORING=ON \
-          -DUA_ENABLE_UNIT_TESTS_MEMCHECK=ON \
-          ..
-    make ${MAKEOPTS}
-    make test ARGS="-V"
-}
-
-
-##############################
-# Clang Static Code Analysis #
-##############################
-
-function build_clang_analyzer {
-    mkdir -p build; cd build; rm -rf *
-    scan-build-11 cmake -DCMAKE_BUILD_TYPE=Debug \
-          -DUA_BUILD_EXAMPLES=ON \
-          -DUA_BUILD_UNIT_TESTS=ON \
-          -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_ENCRYPTION=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DUA_ENABLE_JSON_ENCODING=ON \
-          -DUA_ENABLE_PUBSUB=ON \
-          -DUA_ENABLE_PUBSUB_DELTAFRAMES=ON \
-          -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=OFF \
-          -DUA_ENABLE_PUBSUB_MONITORING=ON \
-          ..
-    scan-build-11 --status-bugs make ${MAKEOPTS}
+    "${run_clang_tidy}" \
+        -p "${build_dir}" \
+        -clang-tidy-binary "${clang_tidy}" \
+        -j "${jobs}" \
+        '(^|/)(arch|deps|plugins|src)/.*\.c$'
 }

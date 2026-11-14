@@ -1,6 +1,9 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
+ */
 
 #include <open62541/client.h>
 #include <open62541/client_config_default.h>
@@ -14,31 +17,31 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "test_helpers.h"
 #include "testing_clock.h"
-#include "testing_networklayers.h"
 #include "thread_wrapper.h"
 
 UA_Server *server;
-UA_Boolean running;
+UA_atomic(uintptr_t) running;
 THREAD_HANDLE server_thread;
 
 THREAD_CALLBACK(serverloop) {
-    while (running)
+    while(UA_atomic_load(&running))
         UA_Server_run_iterate(server, true);
     return 0;
 }
 
 static void setup(void) {
-    running = true;
-    server = UA_Server_new();
-    UA_ServerConfig_setDefault(UA_Server_getConfig(server));
+    UA_atomic_store(&running, true);
+    server = UA_Server_newForUnitTest();
+    ck_assert(server != NULL);
 
     UA_Server_run_startup(server);
     THREAD_CREATE(server_thread, serverloop);
 }
 
 static void teardown(void) {
-    running = false;
+    UA_atomic_store(&running, false);
     THREAD_JOIN(server_thread);
     UA_Server_run_shutdown(server);
     UA_Server_delete(server);
@@ -48,7 +51,7 @@ static void
 asyncReadCallback(UA_Client *client, void *userdata,
                   UA_UInt32 requestId, const UA_ReadResponse *response) {
     UA_UInt16 *asyncCounter = (UA_UInt16*) userdata;
-    if (response->responseHeader.serviceResult == UA_STATUSCODE_BADTIMEOUT) {
+    if(response->responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
         (*asyncCounter) = 9999;
         UA_fakeSleep(10);
     } else {
@@ -67,9 +70,8 @@ asyncReadValueAtttributeCallback(UA_Client *client, void *userdata,
 }
 
 START_TEST(Client_highlevel_async_readValue) {
-        UA_Client *client = UA_Client_new();
+        UA_Client *client = UA_Client_newForUnitTest();
         UA_ClientConfig *clientConfig = UA_Client_getConfig(client);
-        UA_ClientConfig_setDefault(clientConfig);
 #ifdef UA_ENABLE_SUBSCRIPTIONS
         clientConfig->outStandingPublishRequests = 0;
 #endif
@@ -77,11 +79,15 @@ START_TEST(Client_highlevel_async_readValue) {
         UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
-        UA_Client_recv = client->connection.recv;
-        client->connection.recv = UA_Client_recvTesting;
+        /* To generate the namespace mapping table */
+        size_t max_stop_iteration_count = 100000;
+        size_t iteration = 0;
+        while(!client->haveNamespaces && iteration < max_stop_iteration_count) {
+            UA_Client_run_iterate(client, 0);
+            iteration++;
+        }
 
         UA_UInt16 asyncCounter = 0;
-
         UA_UInt32 reqId = 0;
         retval = UA_Client_readValueAttribute_async(client,
                 UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME),
@@ -90,24 +96,28 @@ START_TEST(Client_highlevel_async_readValue) {
 
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
-        /* Process async responses during 1s */
-        UA_Client_run_iterate(client, 999 + 1);
+        /* Process event batches for up to 1s. A send-completion batch may
+         * legally make the EventLoop return before the response arrives. */
+        for(size_t i = 0; i < 100 && asyncCounter == 0; i++)
+            retval |= UA_Client_run_iterate(client, 10);
 
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
         ck_assert_uint_eq(asyncCounter, 1);
 
-        /* Simulate network cable unplugged (no response from server) */
-        UA_Client_recvTesting_result = UA_STATUSCODE_GOODNONCRITICALTIMEOUT;
+        /* Simulate network cable unplugged */
+        UA_ConnectionManager *cm = client->channel.connectionManager;
+        cm->closeConnection(cm, client->channel.connectionId);
+        UA_EventLoop *el = client->config.eventLoop;
+        el->run(el, 0);
 
         UA_Client_disconnect(client);
         UA_Client_delete(client);
 } END_TEST
 
 START_TEST(Client_read_async) {
-        UA_Client *client = UA_Client_new();
-        UA_ClientConfig *clientConfig = UA_Client_getConfig(client);
-        UA_ClientConfig_setDefault(clientConfig);
-
+        UA_Client *client = UA_Client_newForUnitTest();
+        /* This test intentionally sends a large unbounded batch. */
+        UA_Client_getConfig(client)->maxAsyncServiceCalls = 0;
         UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
@@ -141,12 +151,147 @@ START_TEST(Client_read_async) {
 
         UA_Client_disconnect(client);
         UA_Client_delete(client);
-    }END_TEST
+} END_TEST
+
+static void
+prepareCurrentTimeRead(UA_ReadRequest *rr, UA_ReadValueId *rvid) {
+    UA_ReadRequest_init(rr);
+    UA_ReadValueId_init(rvid);
+    rvid->attributeId = UA_ATTRIBUTEID_VALUE;
+    rvid->nodeId = UA_NODEID_NUMERIC(0,
+        UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
+    rr->nodesToRead = rvid;
+    rr->nodesToReadSize = 1;
+}
+
+START_TEST(Client_async_limit_abort) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_ClientConfig *cc = UA_Client_getConfig(client);
+    cc->maxAsyncServiceCalls = 1;
+    cc->asyncServiceCallRule = UA_RULEHANDLING_ABORT;
+
+    UA_StatusCode retval =
+        UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_ReadRequest rr;
+    UA_ReadValueId rvid;
+    prepareCurrentTimeRead(&rr, &rvid);
+    UA_UInt16 asyncCounter = 0;
+
+    retval = __UA_Client_AsyncService(
+        client, &rr, &UA_TYPES[UA_TYPES_READREQUEST],
+        (UA_ClientAsyncServiceCallback)asyncReadCallback,
+        &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(client->outstandingAsyncServiceCalls, 1);
+
+    UA_UInt32 requestId = 42;
+    retval = __UA_Client_AsyncService(
+        client, &rr, &UA_TYPES[UA_TYPES_READREQUEST],
+        (UA_ClientAsyncServiceCallback)asyncReadCallback,
+        &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, &requestId);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADTOOMANYOPERATIONS);
+    ck_assert_uint_eq(requestId, 42);
+    ck_assert_uint_eq(client->outstandingAsyncServiceCalls, 1);
+
+    /* Client-internal progress is not blocked by the application quota. */
+    lockClient(client);
+    retval = __Client_AsyncServiceInternal(
+        client, &rr, &UA_TYPES[UA_TYPES_READREQUEST],
+        (UA_ClientAsyncServiceCallback)asyncReadCallback,
+        &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, NULL);
+    unlockClient(client);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(client->outstandingAsyncServiceCalls, 1);
+
+    while(asyncCounter < 2)
+        ck_assert_uint_eq(UA_Client_run_iterate(client, 100), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(client->outstandingAsyncServiceCalls, 0);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(Client_async_limit_wait) {
+    const UA_RuleHandling rules[] = {
+        UA_RULEHANDLING_WARN, UA_RULEHANDLING_ACCEPT
+    };
+    for(size_t i = 0; i < 2; i++) {
+        UA_RuleHandling rule = rules[i];
+        UA_Client *client = UA_Client_newForUnitTest();
+        UA_ClientConfig *cc = UA_Client_getConfig(client);
+        cc->maxAsyncServiceCalls = 1;
+        cc->asyncServiceCallRule = rule;
+
+        UA_StatusCode retval =
+            UA_Client_connect(client, "opc.tcp://localhost:4840");
+        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+        UA_ReadRequest rr;
+        UA_ReadValueId rvid;
+        prepareCurrentTimeRead(&rr, &rvid);
+        UA_UInt16 asyncCounter = 0;
+
+        retval = __UA_Client_AsyncService(
+            client, &rr, &UA_TYPES[UA_TYPES_READREQUEST],
+            (UA_ClientAsyncServiceCallback)asyncReadCallback,
+            &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, NULL);
+        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+        /* The second submission waits for the first callback, then dispatches. */
+        retval = __UA_Client_AsyncService(
+            client, &rr, &UA_TYPES[UA_TYPES_READREQUEST],
+            (UA_ClientAsyncServiceCallback)asyncReadCallback,
+            &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, NULL);
+        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+        ck_assert_uint_ge(asyncCounter, 1);
+        ck_assert_uint_eq(client->outstandingAsyncServiceCalls, 1);
+
+        while(asyncCounter < 2)
+            ck_assert_uint_eq(UA_Client_run_iterate(client, 100),
+                              UA_STATUSCODE_GOOD);
+        ck_assert_uint_eq(client->outstandingAsyncServiceCalls, 0);
+
+        UA_Client_disconnect(client);
+        UA_Client_delete(client);
+    }
+} END_TEST
+
+static void
+asyncReadNodeClassAttributeCallback(UA_Client *client, void *userdata,
+                                    UA_UInt32 requestId, UA_StatusCode status,
+                                    UA_NodeClass *nodeClass) {
+    ck_assert_uint_eq(status, UA_STATUSCODE_GOOD);
+    UA_UInt16 *asyncCounter = (UA_UInt16*)userdata;
+    (*asyncCounter)++;
+}
+
+START_TEST(Client_readNodeClass_async) {
+    UA_Client *client = UA_Client_newForUnitTest();
+
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_UInt16 asyncCounter = 0;
+    UA_NodeId cTimeId = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
+    retval = UA_Client_readNodeClassAttribute_async(client, cTimeId,
+                                                    asyncReadNodeClassAttributeCallback,
+                                                    &asyncCounter, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    /* Process async responses during 1s */
+    while(asyncCounter == 0)
+        retval |= UA_Client_run_iterate(client, 999);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
 
 START_TEST(Client_read_async_timed) {
-        UA_Client *client = UA_Client_new();
+        UA_Client *client = UA_Client_newForUnitTest();
         UA_ClientConfig *clientConfig = UA_Client_getConfig(client);
-        UA_ClientConfig_setDefault(clientConfig);
 #ifdef UA_ENABLE_SUBSCRIPTIONS
         clientConfig->outStandingPublishRequests = 0;
 #endif
@@ -154,8 +299,8 @@ START_TEST(Client_read_async_timed) {
         UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
-        UA_Client_recv = client->connection.recv;
-        client->connection.recv = UA_Client_recvTesting;
+        /* To generate the namespace mapping table */
+        UA_Client_run_iterate(client, 1);
 
         UA_UInt16 asyncCounter = 0;
 
@@ -171,32 +316,37 @@ START_TEST(Client_read_async_timed) {
         rr.nodesToRead = &rvid;
         rr.nodesToReadSize = 1;
 
-        retval = __UA_Client_AsyncServiceEx(client, &rr,
-                &UA_TYPES[UA_TYPES_READREQUEST],
-                (UA_ClientAsyncServiceCallback) asyncReadCallback,
-                &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, NULL, 999);
+        rr.requestHeader.timeoutHint = 999;
+        retval = __UA_Client_AsyncService(client, &rr,
+                                          &UA_TYPES[UA_TYPES_READREQUEST],
+                                          (UA_ClientAsyncServiceCallback) asyncReadCallback,
+                                          &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, NULL);
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
-        /* Process async responses during 1s */
-        retval = UA_Client_run_iterate(client, 999 + 1);
+        /* Process event batches for up to 1s. A send-completion batch may
+         * legally make the EventLoop return before the response arrives. */
+        for(size_t i = 0; i < 100 && asyncCounter == 0; i++)
+            retval |= UA_Client_run_iterate(client, 10);
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
         ck_assert_uint_eq(asyncCounter, 1);
 
-        /* Simulate network cable unplugged (no response from server) */
-        UA_Client_recvTesting_result = UA_STATUSCODE_GOODNONCRITICALTIMEOUT;
+        /* Manually close the connection */
+        UA_ConnectionManager *cm = client->channel.connectionManager;
+        uintptr_t connId = client->channel.connectionId;
+        cm->closeConnection(cm, connId);
 
-        retval = __UA_Client_AsyncServiceEx(client, &rr,
-                &UA_TYPES[UA_TYPES_READREQUEST],
-                (UA_ClientAsyncServiceCallback) asyncReadCallback,
-                &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter, NULL, 100);
-        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
-        /* Process async responses during 1s */
-        UA_Client_run_iterate(client, 100 + 1);
-        ck_assert_uint_eq(asyncCounter, 9999);
+        rr.requestHeader.timeoutHint = 100;
+        retval = __UA_Client_AsyncService(client, &rr, &UA_TYPES[UA_TYPES_READREQUEST],
+                                          (UA_ClientAsyncServiceCallback) asyncReadCallback,
+                                          &UA_TYPES[UA_TYPES_READRESPONSE], &asyncCounter,
+                                          NULL);
+
+        /* Sending out the request failed */
+        ck_assert_uint_eq(retval, UA_STATUSCODE_BADCONNECTIONCLOSED);
 
         UA_Client_disconnect(client);
         UA_Client_delete(client);
-    }END_TEST
+} END_TEST
 
 static UA_Boolean inactivityCallbackTriggered = false;
 
@@ -205,9 +355,8 @@ static void inactivityCallback(UA_Client *client) {
 }
 
 START_TEST(Client_connectivity_check) {
-        UA_Client *client = UA_Client_new();
+        UA_Client *client = UA_Client_newForUnitTest();
         UA_ClientConfig *clientConfig = UA_Client_getConfig(client);
-        UA_ClientConfig_setDefault(clientConfig);
 #ifdef UA_ENABLE_SUBSCRIPTIONS
         clientConfig->outStandingPublishRequests = 0;
 #endif
@@ -217,9 +366,6 @@ START_TEST(Client_connectivity_check) {
         UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
         ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
-        UA_Client_recv = client->connection.recv;
-        client->connection.recv = UA_Client_recvTesting;
-
         inactivityCallbackTriggered = false;
 
         retval = UA_Client_run_iterate(client, 1000 + 1);
@@ -227,7 +373,7 @@ START_TEST(Client_connectivity_check) {
         ck_assert_uint_eq(inactivityCallbackTriggered, false);
 
         /* Simulate network cable unplugged (no response from server) */
-        running = false;
+        UA_atomic_store(&running, false);
         THREAD_JOIN(server_thread);
 
         UA_fakeSleep(1000 + 1 + clientConfig->connectivityCheckInterval);
@@ -240,18 +386,21 @@ START_TEST(Client_connectivity_check) {
         ck_assert_uint_eq(inactivityCallbackTriggered, true);
 
         /* Get the server back up */
-        running = true;
+        UA_atomic_store(&running, true);
         THREAD_CREATE(server_thread, serverloop);
 
         UA_Client_disconnect(client);
         UA_Client_delete(client);
-    }END_TEST
+}END_TEST
 
 static Suite* testSuite_Client(void) {
     Suite *s = suite_create("Client");
     TCase *tc_client = tcase_create("Client Basic");
     tcase_add_checked_fixture(tc_client, setup, teardown);
     tcase_add_test(tc_client, Client_read_async);
+    tcase_add_test(tc_client, Client_async_limit_abort);
+    tcase_add_test(tc_client, Client_async_limit_wait);
+    tcase_add_test(tc_client, Client_readNodeClass_async);
     tcase_add_test(tc_client, Client_read_async_timed);
     tcase_add_test(tc_client, Client_connectivity_check);
     tcase_add_test(tc_client, Client_highlevel_async_readValue);

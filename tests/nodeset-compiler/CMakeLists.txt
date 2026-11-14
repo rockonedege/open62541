@@ -4,106 +4,218 @@ include_directories("${PROJECT_BINARY_DIR}/src_generated/tests")
 # Test Companion Specs that need the full NS0 #
 ###############################################
 
+set(GENERATE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/src_generated/tests")
+
+# Generate datatypes directly from NodeSet2 Definition elements
+ua_generate_nodeset_and_datatypes(
+    NAME "typedescriptions"
+    NAMESPACE_MAP "2:http://model.o6-automation.com"
+    OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
+    FILE_NS "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/typedescriptions.xml"
+)
+
+ua_add_test(check_nodeset_typedescriptions.c EXTRASOURCES ${UA_NODESET_TYPEDESCRIPTIONS_SOURCES})
+add_dependencies(check_nodeset_typedescriptions open62541-generator-ns-typedescriptions)
+
 if(UA_NAMESPACE_ZERO STREQUAL "FULL")
+    set(runtime_namespace_map "2:urn:open62541:test:types-a"
+        "3:urn:open62541:test:encodings" "4:urn:open62541:test:types-b")
+    ua_generate_nodeset_and_datatypes(
+        NAME "runtime-a"
+        NAMESPACE_MAP ${runtime_namespace_map}
+        OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
+        FILE_NS "${CMAKE_CURRENT_SOURCE_DIR}/runtime_types_a.xml")
+    ua_generate_nodeset_and_datatypes(
+        NAME "runtime-b"
+        NAMESPACE_MAP ${runtime_namespace_map}
+        OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
+        FILE_NS "${CMAKE_CURRENT_SOURCE_DIR}/runtime_types_b.xml"
+        DEPENDS "runtime-a")
+    ua_generate_nodeset(
+        NAME "runtime-ab"
+        NAMESPACE_MAP ${runtime_namespace_map}
+        GENERATE_TYPES
+        OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
+        FILE "${CMAKE_CURRENT_SOURCE_DIR}/runtime_types_a.xml"
+             "${CMAKE_CURRENT_SOURCE_DIR}/runtime_types_b.xml"
+        DEPENDS_NS ${open62541_NS0_NODESETS}
+        DEPENDS_TYPES "UA_TYPES")
+    # Generate independent companion compilation units in one batch. Both use
+    # the same frozen source namespace plan, including imported member types.
+    set(runtime_batch_outputs "")
+    foreach(module runtime_unpinned runtime_unpinned_b)
+        string(TOUPPER "${module}" module_upper)
+        set(UA_NODESET_${module_upper}_SOURCES
+            "${GENERATE_OUTPUT_DIR}/namespace_${module}_generated.c"
+            "${GENERATE_OUTPUT_DIR}/types_${module}_generated.c")
+        list(APPEND runtime_batch_outputs ${UA_NODESET_${module_upper}_SOURCES}
+            "${GENERATE_OUTPUT_DIR}/namespace_${module}_generated.h"
+            "${GENERATE_OUTPUT_DIR}/types_${module}_generated.h"
+            "${GENERATE_OUTPUT_DIR}/types_${module}_generated_internal.h")
+    endforeach()
+    list(APPEND runtime_batch_outputs "${GENERATE_OUTPUT_DIR}/namespace_plan.json")
+    set(runtime_batch_existing "")
+    foreach(xml ${open62541_NS0_NODESETS})
+        list(APPEND runtime_batch_existing --existing "${xml}")
+    endforeach()
+    file(GLOB runtime_batch_scripts "${PROJECT_SOURCE_DIR}/tools/nodeset_compiler/*.py")
+    add_custom_command(OUTPUT ${runtime_batch_outputs}
+        COMMAND ${Python3_EXECUTABLE} "${PROJECT_SOURCE_DIR}/tools/nodeset_compiler/nodeset_compiler.py"
+            --batch "${CMAKE_CURRENT_SOURCE_DIR}/runtime_batch.json"
+            --types-schema "${open62541_SCHEMA_DIR}" --types-array UA_TYPES
+            ${runtime_batch_existing} "${GENERATE_OUTPUT_DIR}"
+        DEPENDS ${runtime_batch_scripts} ${open62541_NS0_NODESETS}
+            runtime_batch.json runtime_types_a.xml runtime_types_b.xml
+        VERBATIM)
+    add_custom_target(open62541-generator-ns-runtime-batch DEPENDS ${runtime_batch_outputs})
+    # The test includes this loader C file to exercise file-local support.
+    set(runtime_a_test_sources ${UA_NODESET_RUNTIME_A_SOURCES})
+    list(REMOVE_ITEM runtime_a_test_sources "${GENERATE_OUTPUT_DIR}/namespace_runtime_a_generated.c")
+    ua_add_test(check_nodeset_copy_types.c EXTRASOURCES
+        ${runtime_a_test_sources} ${UA_NODESET_RUNTIME_B_SOURCES}
+        ${UA_NODESET_RUNTIME_AB_SOURCES} ${UA_NODESET_RUNTIME_UNPINNED_SOURCES}
+        ${UA_NODESET_RUNTIME_UNPINNED_B_SOURCES})
+    add_dependencies(check_nodeset_copy_types open62541-generator-ns-runtime-a
+                     open62541-generator-ns-runtime-b open62541-generator-ns-runtime-ab
+                     open62541-generator-ns-runtime-batch)
 
-    set(GENERATE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/src_generated/tests")
+    # One const array containing two namespaces, used by nodesets with both
+    # a matching name and an independently chosen name.
+    ua_generate_datatypes(
+        NAME "types-tests-pinned-multi"
+        TARGET_SUFFIX "types-tests-pinned-multi"
+        FILE_CSV "${CMAKE_CURRENT_SOURCE_DIR}/pinned_namespaces.csv"
+        FILES_BSD "${CMAKE_CURRENT_SOURCE_DIR}/pinned_namespaces_a.bsd"
+                  "${CMAKE_CURRENT_SOURCE_DIR}/pinned_namespaces_b.bsd"
+        NAMESPACE_MAP "2:urn:open62541:test:pinned-a"
+                      "3:urn:open62541:test:pinned-b"
+        OUTPUT_DIR "${GENERATE_OUTPUT_DIR}")
+    foreach(name tests-pinned-multi tests-pinned-renamed)
+        ua_generate_nodeset(
+            NAME "${name}"
+            FILE "${CMAKE_CURRENT_SOURCE_DIR}/pinned_namespaces.xml"
+            TYPES_ARRAY "UA_TYPES_TESTS_PINNED_MULTI"
+            NAMESPACE_MAP "2:urn:open62541:test:pinned-a"
+                          "3:urn:open62541:test:pinned-b"
+            DEPENDS_NS ${open62541_NS0_NODESETS}
+            DEPENDS_TYPES "UA_TYPES"
+            OUTPUT_DIR "${GENERATE_OUTPUT_DIR}")
+    endforeach()
+    ua_add_test(check_nodeset_compiler_pinned_namespaces.c EXTRASOURCES
+                ${UA_TYPES_TESTS_PINNED_MULTI_SOURCES}
+                ${UA_NODESET_TESTS_PINNED_MULTI_SOURCES}
+                ${UA_NODESET_TESTS_PINNED_RENAMED_SOURCES})
 
-    # Generate types and namespace for DI
+    # Compile generated modules in one translation unit, as an amalgamation
+    # does. Shared type names and multiple loaders for one array must coexist.
+    foreach(module a b)
+        set(amalgamation_dependencies "")
+        if(module STREQUAL "b")
+            set(amalgamation_dependencies DEPENDS "amalgamation-a")
+        endif()
+        ua_generate_nodeset_and_datatypes(
+            NAME "amalgamation-${module}"
+            NAMESPACE_MAP "2:urn:open62541:test:amalgamation-a"
+                          "3:urn:open62541:test:amalgamation-b"
+            FILE_NS "${CMAKE_CURRENT_SOURCE_DIR}/amalgamation_${module}.xml"
+            OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
+            ${amalgamation_dependencies})
+    endforeach()
+    ua_add_test(check_nodeset_amalgamation.c)
+    add_dependencies(check_nodeset_amalgamation open62541-generator-ns-amalgamation-a
+        open62541-generator-ns-amalgamation-b open62541-generator-types-tests-pinned-multi
+        open62541-generator-ns-tests-pinned-multi open62541-generator-ns-tests-pinned-renamed)
+
+    # Generate types and namespace for DI. The namespace index is pinned via
+    # NAMESPACE_MAP, so the generated type array is const and the tests
+    # exercise the const type array path with matching server namespace
+    # baked indexes (DI is the first namespace added to the test servers,
+    # at index 2).
     ua_generate_nodeset_and_datatypes(
         NAME "tests-di"
-        FILE_CSV "${open62541_NODESET_DIR}/DI/OpcUaDiModel.csv"
-        FILE_BSD "${open62541_NODESET_DIR}/DI/Opc.Ua.Di.Types.bsd"
+        FILE_CSV "${UA_NODESET_DIR}/DI/Opc.Ua.Di.NodeIds.csv"
+        FILE_BSD "${UA_NODESET_DIR}/DI/Opc.Ua.Di.Types.bsd"
         NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"
         OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
-        FILE_NS "${open62541_NODESET_DIR}/DI/Opc.Ua.Di.NodeSet2.xml"
+        FILE_NS "${UA_NODESET_DIR}/DI/Opc.Ua.Di.NodeSet2.xml"
         INTERNAL
     )
+
+    # Cover direct registration at the baked index and copy-mode remapping:
+    ua_add_test(check_nodeset_compiler_di_pinned_ns.c EXTRASOURCES
+                ${UA_NODESET_TESTS_DI_SOURCES}
+                ${UA_TYPES_TESTS_DI_SOURCES})
+    add_dependencies(check_nodeset_compiler_di_pinned_ns open62541-generator-ns-tests-di)
 
     # Generate types and namespace for ADI
     ua_generate_nodeset_and_datatypes(
         NAME "tests-adi"
-        FILE_CSV "${open62541_NODESET_DIR}/ADI/OpcUaAdiModel.csv"
-        FILE_BSD "${open62541_NODESET_DIR}/ADI/Opc.Ua.Adi.Types.bsd"
-        NAMESPACE_MAP "3:http://opcfoundation.org/UA/ADI/"
+        NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"
+                      "3:http://opcfoundation.org/UA/ADI/"
         OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
-        FILE_NS "${open62541_NODESET_DIR}/ADI/Opc.Ua.Adi.NodeSet2.xml"
+        FILE_NS "${UA_NODESET_DIR}/ADI/Opc.Ua.Adi.NodeSet2.xml"
         DEPENDS "tests-di"
         INTERNAL
     )
 
-    add_executable(check_nodeset_compiler_adi check_nodeset_compiler_adi.c
-                   ${UA_NODESET_TESTS_DI_SOURCES}
-                   ${UA_NODESET_TESTS_ADI_SOURCES}
-                   ${UA_TYPES_TESTS_DI_SOURCES}
-                   ${UA_TYPES_TESTS_ADI_SOURCES}
-                   $<TARGET_OBJECTS:open62541-object> $<TARGET_OBJECTS:open62541-testplugins>)
+    ua_add_test(check_nodeset_compiler_adi.c EXTRASOURCES
+                ${UA_NODESET_TESTS_DI_SOURCES}
+                ${UA_NODESET_TESTS_ADI_SOURCES}
+                ${UA_TYPES_TESTS_DI_SOURCES}
+                ${UA_TYPES_TESTS_ADI_SOURCES})
     add_dependencies(check_nodeset_compiler_adi open62541-generator-ns-tests-adi)
-    target_link_libraries(check_nodeset_compiler_adi ${LIBS})
-    add_test_valgrind(nodeset_compiler_adi ${TESTS_BINARY_DIR}/check_nodeset_compiler_adi)
 
     # generate PLCopen namespace which is using DI
     ua_generate_nodeset_and_datatypes(
         NAME "tests-plc"
+        NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"
+                      "3:http://PLCopen.org/OpcUa/IEC61131-3/"
         # PLCopen does not define custom types. Only generate the nodeset
-        FILE_NS "${open62541_NODESET_DIR}/PLCopen/Opc.Ua.PLCopen.NodeSet2_V1.02.xml"
+        FILE_NS "${UA_NODESET_DIR}/PLCopen/Opc.Ua.PLCopen.NodeSet2_V1.02.xml"
         # PLCopen depends on the di nodeset, which must be generated before
         OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
         DEPENDS "tests-di"
         INTERNAL
     )
 
-    add_executable(check_nodeset_compiler_plc check_nodeset_compiler_plc.c
-                   ${UA_NODESET_TESTS_DI_SOURCES}
-                   ${UA_NODESET_TESTS_PLC_SOURCES}
-                   ${UA_TYPES_TESTS_DI_SOURCES}
-                   ${UA_TYPES_TESTS_PLC_SOURCES}
-                   $<TARGET_OBJECTS:open62541-object> $<TARGET_OBJECTS:open62541-testplugins>)
+    ua_add_test(check_nodeset_compiler_plc.c EXTRASOURCES
+                ${UA_NODESET_TESTS_DI_SOURCES}
+                ${UA_NODESET_TESTS_PLC_SOURCES}
+                ${UA_TYPES_TESTS_DI_SOURCES}
+                ${UA_TYPES_TESTS_PLC_SOURCES})
     add_dependencies(check_nodeset_compiler_plc open62541-generator-ns-tests-plc)
-    target_link_libraries(check_nodeset_compiler_plc ${LIBS})
-    add_test_valgrind(nodeset_compiler_plc ${TESTS_BINARY_DIR}/check_nodeset_compiler_plc)
+
+    ua_add_test(check_client_nsMapping.c EXTRASOURCES
+            ${UA_NODESET_TESTS_DI_SOURCES}
+            ${UA_NODESET_TESTS_PLC_SOURCES}
+            ${UA_TYPES_TESTS_DI_SOURCES}
+            ${UA_TYPES_TESTS_PLC_SOURCES})
+    add_dependencies(check_client_nsMapping open62541-generator-ns-tests-plc)
+
+    ua_add_test(check_client_get_remote_datatypes.c EXTRASOURCES
+            ${UA_NODESET_TESTS_DI_SOURCES}
+            ${UA_TYPES_TESTS_DI_SOURCES})
+    add_dependencies(check_client_get_remote_datatypes open62541-generator-ns-tests-di)
+
 
     # generate AutoID namespace which is using DI (test e.g. for structures with optional fields)
     ua_generate_nodeset_and_datatypes(
             NAME "tests-autoid"
-            FILE_CSV "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/Opc.Ua.AutoID.NodeIds.csv"
-            FILE_BSD "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/Opc.Ua.AutoID.Types.bsd"
-            NAMESPACE_MAP "3:http://opcfoundation.org/UA/AutoID/"
+            NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"
+                          "3:http://opcfoundation.org/UA/AutoID/"
             OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
-            FILE_NS "${open62541_NODESET_DIR}/AutoID/Opc.Ua.AutoID.NodeSet2.xml"
+            FILE_NS "${UA_NODESET_DIR}/AutoID/Opc.Ua.AutoID.NodeSet2.xml"
             DEPENDS "tests-di"
             INTERNAL
     )
 
-    add_executable(check_nodeset_compiler_autoid check_nodeset_compiler_autoid.c
-            ${UA_NODESET_TESTS_DI_SOURCES}
-            ${UA_NODESET_TESTS_AUTOID_SOURCES}
-            ${UA_TYPES_TESTS_DI_SOURCES}
-            ${UA_TYPES_TESTS_AUTOID_SOURCES}
-            $<TARGET_OBJECTS:open62541-object> $<TARGET_OBJECTS:open62541-testplugins>)
+    ua_add_test(check_nodeset_compiler_autoid.c EXTRASOURCES
+                ${UA_NODESET_TESTS_DI_SOURCES}
+                ${UA_NODESET_TESTS_AUTOID_SOURCES}
+                ${UA_TYPES_TESTS_DI_SOURCES}
+                ${UA_TYPES_TESTS_AUTOID_SOURCES})
     add_dependencies(check_nodeset_compiler_autoid open62541-generator-ns-tests-autoid)
-    target_link_libraries(check_nodeset_compiler_autoid ${LIBS})
-    add_test_valgrind(nodeset_compiler_autoid ${TESTS_BINARY_DIR}/check_nodeset_compiler_autoid)
-
-
 endif()
-
-#[[ua_generate_datatypes(
-        NAME "optstruct-union"
-        TARGET_SUFFIX "types-optstruct-union"
-        NAMESPACE_IDX 2
-        FILE_CSV "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/testnodeset.csv"
-        FILES_BSD "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/testtypes.bsd"
-)
-
-add_executable(check_nodeset_compiler_optstructs_union check_nodeset_compiler_optstructs_union.c
-        ${UA_NODESET_TESTS_DI_SOURCES}
-        ${UA_NODESET_TESTS_PLC_SOURCES}
-        ${UA_TYPES_TESTS_DI_SOURCES}
-        ${UA_TYPES_TESTS_PLC_SOURCES}
-        $<TARGET_OBJECTS:open62541-object> $<TARGET_OBJECTS:open62541-testplugins>)
-add_dependencies(check_nodeset_compiler_optstructs_union open62541-generator-types-optstruct-union)
-target_link_libraries(check_nodeset_compiler_optstructs_union ${LIBS})
-add_test_valgrind(check_nodeset_compiler_optstructs_union ${TESTS_BINARY_DIR}/check_nodeset_compiler_optstructs_union)]]
 
 #generate testnodeset
 if(UA_NAMESPACE_ZERO STREQUAL "FULL")
@@ -111,18 +223,86 @@ if(UA_NAMESPACE_ZERO STREQUAL "FULL")
     # Generate types and namespace for ADI
     ua_generate_nodeset_and_datatypes(
         NAME "tests-testnodeset"
-        FILE_CSV "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/testnodeset.csv"
-        FILE_BSD "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/testtypes.bsd"
-        NAMESPACE_MAP "2:http://yourorganisation.org/test/"
+        NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"
+                      "3:http://yourorganisation.org/test/"
         OUTPUT_DIR "${GENERATE_OUTPUT_DIR}"
         FILE_NS "${PROJECT_SOURCE_DIR}/tests/nodeset-compiler/testnodeset.xml"
+        DEPENDS "tests-di"
     )
 
-    add_executable(check_nodeset_compiler_testnodeset check_nodeset_compiler_testnodeset.c
-                   ${UA_NODESET_TESTS_TESTNODESET_SOURCES}
-                   ${UA_TYPES_TESTS_TESTNODESET_SOURCES}
-                $<TARGET_OBJECTS:open62541-object> $<TARGET_OBJECTS:open62541-testplugins>)
+    ua_add_test(check_nodeset_compiler_testnodeset.c EXTRASOURCES
+                ${UA_NODESET_TESTS_DI_SOURCES}
+                ${UA_NODESET_TESTS_TESTNODESET_SOURCES}
+                ${UA_TYPES_TESTS_DI_SOURCES}
+                ${UA_TYPES_TESTS_TESTNODESET_SOURCES})
     add_dependencies(check_nodeset_compiler_testnodeset open62541-generator-ns-tests-testnodeset)
-    target_link_libraries(check_nodeset_compiler_testnodeset ${LIBS})
-    add_test_valgrind(nodeset_compiler_testnodeset ${TESTS_BINARY_DIR}/check_nodeset_compiler_testnodeset)
 endif()
+# Test cross-namespace same-name type handling in generate_datatypes.py.
+# Does not require a full NS0 build - runs standalone against the tool.
+# find_package is called explicitly so that Python3_EXECUTABLE is available
+# in this directory's CMake scope (the top-level already calls it, but the
+# explicit call here makes the dependency clear).
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME test_generate_datatypes_cross_ns
+         COMMAND "${Python3_EXECUTABLE}"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test_cross_ns_types.py")
+
+add_test(NAME test_generate_datatypes_symbolic_names
+         COMMAND "${Python3_EXECUTABLE}"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test_symbolic_names.py")
+# Values from different input files keep their original namespace tables.
+set(mapping_output "${CMAKE_BINARY_DIR}/src_generated/tests")
+set(mapping_large "${mapping_output}/namespace_mapping_large.xml")
+add_custom_command(OUTPUT "${mapping_large}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/generate_namespace_mapping_fixture.py" "${mapping_large}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/generate_namespace_mapping_fixture.py")
+ua_generate_nodeset(NAME "tests-value-mapping" OUTPUT_DIR "${mapping_output}"
+    DEPENDS_NS ${open62541_NS0_NODESETS} "${CMAKE_CURRENT_SOURCE_DIR}/namespace_mapping_custom.xml"
+    DEPENDS_TYPES "UA_TYPES"
+    FILE "${CMAKE_CURRENT_SOURCE_DIR}/namespace_mapping_a.xml"
+         "${CMAKE_CURRENT_SOURCE_DIR}/namespace_mapping_b.xml" "${mapping_large}")
+ua_add_test(check_nodeset_value_mapping.c EXTRASOURCES ${UA_NODESET_TESTS_VALUE_MAPPING_SOURCES})
+add_dependencies(check_nodeset_value_mapping open62541-generator-ns-tests-value-mapping)
+add_test(NAME test_nodeset_compiler_regressions
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_compiler_regressions.py")
+
+# Exercise the existing BSD frontend with the generated loader's copy mode.
+if(UA_NAMESPACE_ZERO STREQUAL "FULL" AND UA_ENABLE_XML_ENCODING AND UA_ENABLE_TYPEDESCRIPTION)
+    ua_generate_datatypes(NAME "types-tests-compiler-fixes"
+        TARGET_SUFFIX "types-tests-compiler-fixes"
+        FILE_CSV "${CMAKE_CURRENT_SOURCE_DIR}/compiler_regressions.csv"
+        FILES_BSD "${CMAKE_CURRENT_SOURCE_DIR}/compiler_regressions.bsd"
+        IMPORT_BSD "UA_TYPES#${UA_NODESET_DIR}/Schema/Opc.Ua.Types.bsd"
+        OUTPUT_DIR "${GENERATE_OUTPUT_DIR}")
+    ua_generate_nodeset(NAME "compiler-fixes"
+        FILE "${CMAKE_CURRENT_SOURCE_DIR}/compiler_regressions.xml"
+        FILES_BSD "${CMAKE_CURRENT_SOURCE_DIR}/compiler_regressions.bsd"
+        TYPES_ARRAY "UA_TYPES_TESTS_COMPILER_FIXES"
+        DEPENDS_NS ${open62541_NS0_NODESETS}
+        DEPENDS_TYPES "UA_TYPES"
+        OUTPUT_DIR "${GENERATE_OUTPUT_DIR}")
+    ua_generate_nodeset(NAME "compiler-negative"
+        FILE "${CMAKE_CURRENT_SOURCE_DIR}/compiler_regressions_negative.xml"
+        FILES_BSD "${CMAKE_CURRENT_SOURCE_DIR}/compiler_regressions.bsd"
+        DEPENDS_NS ${open62541_NS0_NODESETS} "${CMAKE_CURRENT_SOURCE_DIR}/compiler_regressions.xml"
+        DEPENDS_TYPES "UA_TYPES" "UA_TYPES_TESTS_COMPILER_FIXES"
+        OUTPUT_DIR "${GENERATE_OUTPUT_DIR}")
+    ua_add_test(check_nodeset_compiler_regressions.c EXTRASOURCES
+        ${UA_TYPES_TESTS_COMPILER_FIXES_SOURCES}
+        ${UA_NODESET_COMPILER_FIXES_SOURCES}
+        ${UA_NODESET_COMPILER_NEGATIVE_SOURCES})
+    add_dependencies(check_nodeset_compiler_regressions open62541-generator-ns-compiler-fixes
+                     open62541-generator-ns-compiler-negative open62541-generator-types-tests-compiler-fixes)
+endif()
+add_test(NAME test_nodeset_datatype_definitions
+         COMMAND "${Python3_EXECUTABLE}"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test_nodeset_datatype_definitions.py")
+add_test(NAME test_datatype_definition_parser
+         COMMAND "${Python3_EXECUTABLE}"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test_datatype_definition_parser.py")
+add_test(NAME test_nodeset_bsd_equivalence
+         COMMAND "${Python3_EXECUTABLE}"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test_nodeset_bsd_equivalence.py")
+
+set_tests_properties(test_nodeset_bsd_equivalence PROPERTIES
+    ENVIRONMENT "UA_NODESET_DIR=${UA_NODESET_DIR}")

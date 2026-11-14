@@ -9,6 +9,10 @@
 #include "custom_memory_manager.h"
 
 #include <pthread.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include <open62541/plugin/log_stdout.h>
 #include <open62541/server_config_default.h>
@@ -61,12 +65,6 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                      "Could not create server instance using UA_Server_new");
         return EXIT_FAILURE;
     }
-
-    UA_ServerConfig *config = UA_Server_getConfig(server);
-
-    // Enable the mDNS announce and response functionality
-    config->mdnsEnabled = true;
-    config->mdnsConfig.mdnsServerName = UA_String_fromChars("Sample Multicast Server");
 
     retval = UA_Server_run_startup(server);
     if(retval != UA_STATUSCODE_GOOD) {

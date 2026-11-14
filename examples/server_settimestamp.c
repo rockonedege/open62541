@@ -30,11 +30,11 @@ addVariable(UA_Server *server) {
     /* Add the variable node to the information model */
     UA_NodeId myIntegerNodeId = UA_NODEID_STRING(1, "fake.source_timestamp");
     UA_QualifiedName myIntegerName = UA_QUALIFIEDNAME(1, "fake source_timestamp");
-    UA_NodeId parentNodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
-    UA_NodeId parentReferenceNodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES);
+    UA_NodeId parentNodeId = UA_NS0ID(OBJECTSFOLDER);
+    UA_NodeId parentReferenceNodeId = UA_NS0ID(ORGANIZES);
     UA_Server_addVariableNode(server, myIntegerNodeId, parentNodeId,
                               parentReferenceNodeId, myIntegerName,
-                              UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE), attr, NULL, NULL);
+                              UA_NS0ID(BASEDATAVARIABLETYPE), attr, NULL, NULL);
 }
 
 
@@ -51,7 +51,7 @@ writeVariable(UA_Server *server, UA_Int32 myInteger ) {
     UA_VariableAttributes Attr;
     UA_Variant_init(&Attr.value);
     UA_Variant_setScalar(&Attr.value, &myInteger, &UA_TYPES[UA_TYPES_INT32]);
-    
+
     // Use a more detailed write function than UA_Server_writeValue
     UA_WriteValue wv;
     UA_WriteValue_init(&wv);
@@ -73,7 +73,7 @@ writeVariable(UA_Server *server, UA_Int32 myInteger ) {
 
 static volatile UA_Boolean running = true;
 static void stopHandler(int sign) {
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "received ctrl-c");
+    (void)sign;
     running = false;
 }
 

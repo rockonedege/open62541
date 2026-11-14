@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
  *    Copyright 2018 (c) basysKom GmbH <opensource@basyskom.com> (Author: Peter Rustler)
+ *    Copyright 2021 (c) luibass92 <luibass92@live.it> (Author: Luigi Bassetta)
  */
 
 #include <open62541/client_subscriptions.h>
@@ -15,6 +16,7 @@ typedef struct {
     UA_NodeId nodeId;
     UA_HistorizingNodeIdSettings setting;
     UA_MonitoredItemCreateResult monitoredResult;
+    UA_Boolean paused;
 } UA_NodeIdStoreContextItem_gathering_default;
 
 typedef struct {
@@ -198,6 +200,8 @@ setValue_gathering_default(UA_Server *server,
     if (!item) {
         return;
     }
+    if(item->paused)
+        return;
     if (item->setting.historizingUpdateStrategy == UA_HISTORIZINGUPDATESTRATEGY_VALUESET) {
         item->setting.historizingBackend.serverSetHistoryData(server,
                                                               item->setting.historizingBackend.context,
@@ -222,9 +226,53 @@ UA_HistoryDataGathering_Default(size_t initialNodeIdStoreSize)
     gathering.deleteMembers = &deleteMembers_gathering_default;
     gathering.updateNodeIdSetting = &updateNodeIdSetting_gathering_default;
     UA_NodeIdStoreContext *context = (UA_NodeIdStoreContext*)UA_calloc(1, sizeof(UA_NodeIdStoreContext));
+    if (!context) {
+        memset(&gathering, 0, sizeof(UA_HistoryDataGathering));
+        return gathering;
+    }
     context->storeEnd = 0;
     context->storeSize = initialNodeIdStoreSize;
     context->dataStore = (UA_NodeIdStoreContextItem_gathering_default*)UA_calloc(initialNodeIdStoreSize, sizeof(UA_NodeIdStoreContextItem_gathering_default));
+    if (!context->dataStore) {
+        UA_free(context);
+        memset(&gathering, 0, sizeof(UA_HistoryDataGathering));
+        return gathering;
+    }
     gathering.context = context;
     return gathering;
 }
+
+/* Circular buffer implementation */
+
+static UA_StatusCode
+registerNodeId_gathering_circular(UA_Server *server, void *context,
+                                  const UA_NodeId *nodeId,
+                                  const UA_HistorizingNodeIdSettings setting) {
+    UA_NodeIdStoreContext *ctx = (UA_NodeIdStoreContext *)context;
+    if(getNodeIdStoreContextItem_gathering_default(ctx, nodeId)) {
+        return UA_STATUSCODE_BADNODEIDEXISTS;
+    }
+    if(ctx->storeEnd >= ctx->storeSize || !ctx->dataStore) {
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+    }
+    UA_NodeId_copy(nodeId, &ctx->dataStore[ctx->storeEnd].nodeId);
+    size_t current = ctx->storeEnd;
+    ctx->dataStore[current].setting = setting;
+    ++ctx->storeEnd;
+    return UA_STATUSCODE_GOOD;
+}
+
+UA_HistoryDataGathering
+UA_HistoryDataGathering_Circular(size_t initialNodeIdStoreSize) {
+    UA_HistoryDataGathering gathering = UA_HistoryDataGathering_Default(initialNodeIdStoreSize);
+    gathering.registerNodeId = &registerNodeId_gathering_circular;
+    return gathering;
+}
+
+void gathering_default_pauseRecording(UA_HistoryDataGathering *gathering, const UA_NodeId *nodeId, UA_Boolean pause) {
+    UA_NodeIdStoreContext *ctx = (UA_NodeIdStoreContext*)gathering->context;
+    UA_NodeIdStoreContextItem_gathering_default *item = getNodeIdStoreContextItem_gathering_default(ctx, nodeId);
+    if(item)
+        item->paused = pause;
+}
+

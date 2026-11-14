@@ -1,8 +1,8 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. 
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
- *    Copyright 2014-2018 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
+ *    Copyright 2014-2018, 2022 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
  *    Copyright 2016-2017 (c) Florian Palm
  *    Copyright 2015 (c) Chris Iatrou
  *    Copyright 2015-2016 (c) Sten Grüner
@@ -14,6 +14,8 @@
  *    Copyright 2017-2018 (c) Thomas Stalder, Blue Time Concept SA
  *    Copyright 2018 (c) Fabian Arndt, Root-Core
  *    Copyright 2017-2019 (c) HMS Industrial Networks AB (Author: Jonas Green)
+  *   Copyright 2026 (c) o6 Automation GmbH (Author: Andreas Ebner)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
  */
 
 #include "ua_server_internal.h"
@@ -29,11 +31,12 @@ setSubscriptionSettings(UA_Server *server, UA_Subscription *subscription,
                         UA_UInt32 requestedMaxKeepAliveCount,
                         UA_UInt32 maxNotificationsPerPublish,
                         UA_Byte priority) {
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* re-parameterize the subscription */
     UA_BOUNDEDVALUE_SETWBOUNDS(server->config.publishingIntervalLimits,
-                               requestedPublishingInterval, subscription->publishingInterval);
+                               requestedPublishingInterval,
+                               subscription->publishingInterval);
     /* check for nan*/
     if(requestedPublishingInterval != requestedPublishingInterval)
         subscription->publishingInterval = server->config.publishingIntervalLimits.min;
@@ -51,10 +54,59 @@ setSubscriptionSettings(UA_Server *server, UA_Subscription *subscription,
 }
 
 void
+notifySubscription(UA_Server *server, UA_Subscription *sub,
+                   UA_ApplicationNotificationType type) {
+    UA_STATIC_THREAD_LOCAL UA_KeyValuePair createSubData[8] = {
+        {{0, UA_STRING_STATIC("session-id")}, {0}},
+        {{0, UA_STRING_STATIC("subscription-id")}, {0}},
+        {{0, UA_STRING_STATIC("publishing-interval")}, {0}},
+        {{0, UA_STRING_STATIC("lifetime-count")}, {0}},
+        {{0, UA_STRING_STATIC("max-keepalive-count")}, {0}},
+        {{0, UA_STRING_STATIC("max-notifications-per-publish")}, {0}},
+        {{0, UA_STRING_STATIC("priority")}, {0}},
+        {{0, UA_STRING_STATIC("publishing-enabled")}, {0}}
+    };
+    UA_KeyValueMap createSubMap = {8, createSubData};
+
+    UA_NodeId sessionId = (sub->session) ? sub->session->sessionId : UA_NODEID_NULL;
+    UA_Boolean enabled = (sub->state == UA_SUBSCRIPTIONSTATE_ENABLED);
+
+    UA_Variant_setScalar(&createSubData[0].value, &sessionId,
+                         &UA_TYPES[UA_TYPES_NODEID]);
+    UA_Variant_setScalar(&createSubData[1].value, &sub->subscriptionId,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setScalar(&createSubData[2].value, &sub->publishingInterval,
+                         &UA_TYPES[UA_TYPES_DOUBLE]);
+    UA_Variant_setScalar(&createSubData[3].value, &sub->lifeTimeCount,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setScalar(&createSubData[4].value, &sub->maxKeepAliveCount,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setScalar(&createSubData[5].value, &sub->notificationsPerPublish,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setScalar(&createSubData[6].value, &sub->priority,
+                         &UA_TYPES[UA_TYPES_BYTE]);
+    UA_Variant_setScalar(&createSubData[7].value, &enabled,
+                         &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+    /* Notify the application */
+    notifyApplication(server, type, createSubMap);
+}
+
+UA_Boolean
 Service_CreateSubscription(UA_Server *server, UA_Session *session,
-                           const UA_CreateSubscriptionRequest *request,
-                           UA_CreateSubscriptionResponse *response) {
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+                           const void *request_, void *response_) {
+    const UA_CreateSubscriptionRequest *request = (const UA_CreateSubscriptionRequest*)request_;
+    UA_CreateSubscriptionResponse *response = (UA_CreateSubscriptionResponse*)response_;
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    /* Check with AccessControl if the creation is allowed */
+    if(server->config.accessControl.allowCreateSubscription &&
+       !server->config.accessControl.
+           allowCreateSubscription(server, &server->config.accessControl,
+                                   &session->sessionId, session->context)) {
+        response->responseHeader.serviceResult = UA_STATUSCODE_BADUSERACCESSDENIED;
+        return true;
+    }
 
     /* Check limits for the number of subscriptions */
     if(((server->config.maxSubscriptions != 0) &&
@@ -62,46 +114,65 @@ Service_CreateSubscription(UA_Server *server, UA_Session *session,
        ((server->config.maxSubscriptionsPerSession != 0) &&
         (session->subscriptionsSize >= server->config.maxSubscriptionsPerSession))) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADTOOMANYSUBSCRIPTIONS;
-        return;
+        return true;
     }
 
     /* Create the subscription */
-    UA_Subscription *sub= UA_Subscription_new();
+    UA_Subscription *sub = UA_Subscription_new();
     if(!sub) {
-        UA_LOG_DEBUG_SESSION(&server->config.logger, session,
+        UA_LOG_DEBUG_SESSION(server->config.logging, session,
                              "Processing CreateSubscriptionRequest failed");
         response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
-        return;
+        return true;
     }
 
     /* Set the subscription parameters */
     setSubscriptionSettings(server, sub, request->requestedPublishingInterval,
-                            request->requestedLifetimeCount, request->requestedMaxKeepAliveCount,
+                            request->requestedLifetimeCount,
+                            request->requestedMaxKeepAliveCount,
                             request->maxNotificationsPerPublish, request->priority);
-    sub->publishingEnabled = request->publishingEnabled;
-    sub->currentKeepAliveCount = sub->maxKeepAliveCount; /* set settings first */
-
-    /* Assign the SubscriptionId */
-    sub->subscriptionId = ++server->lastSubscriptionId;
-
-    /* Register the cyclic callback */
-    UA_StatusCode retval = Subscription_registerPublishCallback(server, sub);
-    if(retval != UA_STATUSCODE_GOOD) {
-        UA_LOG_DEBUG_SESSION(&server->config.logger, sub->session,
-                             "Subscription %" PRIu32 " | "
-                             "Could not register publish callback with error code %s",
-                             sub->subscriptionId, UA_StatusCode_name(retval));
-        response->responseHeader.serviceResult = retval;
-        UA_Subscription_delete(server, sub);
-        return;
-    }
+    sub->subscriptionId = ++server->lastSubscriptionId;  /* Assign the SubscriptionId */
 
     /* Register the subscription in the server */
     LIST_INSERT_HEAD(&server->subscriptions, sub, serverListEntry);
     server->subscriptionsSize++;
 
+    /* Update the server statistics */
+    server->serverDiagnosticsSummary.currentSubscriptionCount++;
+    server->serverDiagnosticsSummary.cumulatedSubscriptionCount++;
+
     /* Attach the Subscription to the session */
     UA_Session_attachSubscription(session, sub);
+
+    /* Create representation in the Session object */
+#ifdef UA_ENABLE_DIAGNOSTICS
+    createSubscriptionObject(server, session, sub);
+#endif
+
+    /* Set the subscription state. This also registers the callback.
+     * Note that also a disabled subscription publishes keepalives. */
+    UA_SubscriptionState sState = (request->publishingEnabled) ?
+        UA_SUBSCRIPTIONSTATE_ENABLED : UA_SUBSCRIPTIONSTATE_ENABLED_NOPUBLISH;
+    UA_StatusCode res = Subscription_setState(server, sub, sState);
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_LOG_DEBUG_SESSION(server->config.logging, sub->session,
+                             "Subscription %" PRIu32 " | Could not register "
+                             "publish callback with error code %s",
+                             sub->subscriptionId, UA_StatusCode_name(res));
+        response->responseHeader.serviceResult = res;
+        UA_Subscription_delete(server, sub, false);
+        return true;
+    }
+
+    /* Notify the application */
+    notifySubscription(server, sub,
+                       UA_APPLICATIONNOTIFICATIONTYPE_SUBSCRIPTION_CREATED);
+
+    UA_LOG_INFO_SUBSCRIPTION(server->config.logging, sub,
+                             "Subscription created (Publishing interval %.2fms, "
+                             "max %lu notifications per publish)",
+                             sub->publishingInterval,
+                             (long unsigned)sub->notificationsPerPublish);
 
     /* Prepare the response */
     response->subscriptionId = sub->subscriptionId;
@@ -109,225 +180,332 @@ Service_CreateSubscription(UA_Server *server, UA_Session *session,
     response->revisedLifetimeCount = sub->lifeTimeCount;
     response->revisedMaxKeepAliveCount = sub->maxKeepAliveCount;
 
-    UA_LOG_INFO_SUBSCRIPTION(&server->config.logger, sub,
-                             "Created the Subscription with a publishing interval of %.2f ms",
-                             sub->publishingInterval);
+    return true;
 }
 
-void
+struct UpdateSamplingContext {
+    UA_Server *server;
+    UA_Double oldPublishingInterval;
+};
+
+static void *
+updateSamplingIntervalVisitor(void *context, UA_MonitoredItem *mon) {
+    struct UpdateSamplingContext *ctx =
+        (struct UpdateSamplingContext*)context;
+
+    if(mon->parameters.samplingInterval == mon->subscription->publishingInterval ||
+       mon->parameters.samplingInterval == ctx->oldPublishingInterval) {
+        UA_MonitoredItem_unregisterSampling(ctx->server, mon);
+        UA_MonitoredItem_registerSampling(ctx->server, mon);
+    }
+
+    return NULL;
+}
+
+UA_Boolean
 Service_ModifySubscription(UA_Server *server, UA_Session *session,
-                           const UA_ModifySubscriptionRequest *request,
-                           UA_ModifySubscriptionResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Processing ModifySubscriptionRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+                           const void *request_, void *response_) {
+    const UA_ModifySubscriptionRequest *request = (const UA_ModifySubscriptionRequest*)request_;
+    UA_ModifySubscriptionResponse *response = (UA_ModifySubscriptionResponse*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                         "Processing ModifySubscriptionRequest");
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     UA_Subscription *sub = UA_Session_getSubscriptionById(session, request->subscriptionId);
     if(!sub) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
-        return;
+        return true;
     }
 
     /* Store the old publishing interval */
     UA_Double oldPublishingInterval = sub->publishingInterval;
+    UA_Byte oldPriority = sub->priority;
 
     /* Change the Subscription settings */
     setSubscriptionSettings(server, sub, request->requestedPublishingInterval,
-                            request->requestedLifetimeCount, request->requestedMaxKeepAliveCount,
+                            request->requestedLifetimeCount,
+                            request->requestedMaxKeepAliveCount,
                             request->maxNotificationsPerPublish, request->priority);
 
     /* Reset the subscription lifetime */
-    sub->currentLifetimeCount = 0;
+    Subscription_resetLifetime(sub);
 
-    /* Change the repeated callback to the new interval. This cannot fail as the
-     * CallbackId must exist. */
-    if(sub->publishCallbackId > 0 &&
-       sub->publishingInterval != oldPublishingInterval)
-        changeRepeatedCallbackInterval(server, sub->publishCallbackId, sub->publishingInterval);
+    /* The publish interval has changed */
+    if(sub->publishingInterval != oldPublishingInterval) {
+        /* Change the repeated callback to the new interval. This cannot fail as
+         * memory is reused. */
+        if(sub->publishCallbackId > 0)
+            Subscription_setPublishTimer(server, sub);
+
+        /* For each MonitoredItem check if it was/shall be attached to the
+         * publish interval. This ensures that we have less cyclic callbacks
+         * registered and that the notifications are fresh. */
+        struct UpdateSamplingContext ctx;
+        ctx.server = server;
+        ctx.oldPublishingInterval = oldPublishingInterval;
+
+        ZIP_ITER(UA_MonitoredItemIdTree, &sub->monitoredItemsById,
+                 updateSamplingIntervalVisitor, &ctx);
+    }
+
+    /* If the priority has changed, re-enter the subscription to the
+     * priority-ordered queue in the session. */
+    if(oldPriority != sub->priority) {
+        UA_Session_detachSubscription(server, session, sub, false);
+        UA_Session_attachSubscription(session, sub);
+    }
+
+    /* Notify the application */
+    notifySubscription(server, sub,
+                       UA_APPLICATIONNOTIFICATIONTYPE_SUBSCRIPTION_MODIFIED);
 
     /* Set the response */
     response->revisedPublishingInterval = sub->publishingInterval;
     response->revisedLifetimeCount = sub->lifeTimeCount;
     response->revisedMaxKeepAliveCount = sub->maxKeepAliveCount;
+
+    /* Update the diagnostics statistics */
+#ifdef UA_ENABLE_DIAGNOSTICS
+    sub->modifyCount++;
+#endif
+
+    return true;
 }
 
 static void
 Operation_SetPublishingMode(UA_Server *server, UA_Session *session,
-                            const UA_Boolean *publishingEnabled, const UA_UInt32 *subscriptionId,
-                            UA_StatusCode *result) {
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+                            const void *context /* UA_Boolean */,
+                            const void *request /* UA_UInt32 */,
+                            void *response /* UA_StatusCode */) {
+    const UA_Boolean *publishingEnabled = (const UA_Boolean*)context;
+    const UA_UInt32 *subscriptionId = (const UA_UInt32*)request;
+    UA_StatusCode *result = (UA_StatusCode*)response;
+    UA_LOCK_ASSERT(&server->serviceMutex);
     UA_Subscription *sub = UA_Session_getSubscriptionById(session, *subscriptionId);
     if(!sub) {
         *result = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
         return;
     }
 
-    sub->currentLifetimeCount = 0; /* Reset the subscription lifetime */
-    sub->publishingEnabled = *publishingEnabled; /* Set the publishing mode */
+    /* Enable/disable */
+    UA_SubscriptionState sState = (*publishingEnabled) ?
+        UA_SUBSCRIPTIONSTATE_ENABLED : UA_SUBSCRIPTIONSTATE_ENABLED_NOPUBLISH;
+    *result = Subscription_setState(server, sub, sState);
+
+    /* Reset the lifetime counter */
+    Subscription_resetLifetime(sub);
+
+    /* Notify the application */
+    notifySubscription(server, sub,
+                       UA_APPLICATIONNOTIFICATIONTYPE_SUBSCRIPTION_PUBLISHINGMODE);
 }
 
-void
+UA_Boolean
 Service_SetPublishingMode(UA_Server *server, UA_Session *session,
-                          const UA_SetPublishingModeRequest *request,
-                          UA_SetPublishingModeResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Processing SetPublishingModeRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+                          const void *request_, void *response_) {
+    const UA_SetPublishingModeRequest *request = (const UA_SetPublishingModeRequest*)request_;
+    UA_SetPublishingModeResponse *response = (UA_SetPublishingModeResponse*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                         "Processing SetPublishingModeRequest");
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     UA_Boolean publishingEnabled = request->publishingEnabled; /* request is const */
     response->responseHeader.serviceResult =
-        UA_Server_processServiceOperations(server, session, (UA_ServiceOperation)Operation_SetPublishingMode,
-                                           &publishingEnabled,
-                                           &request->subscriptionIdsSize, &UA_TYPES[UA_TYPES_UINT32],
-                                           &response->resultsSize, &UA_TYPES[UA_TYPES_STATUSCODE]);
+        allocProcessServiceOperations(server, session,
+                                      Operation_SetPublishingMode,
+                                      &publishingEnabled, &request->subscriptionIdsSize,
+                                      &UA_TYPES[UA_TYPES_UINT32], &response->resultsSize,
+                                      &UA_TYPES[UA_TYPES_STATUSCODE]);
+
+    return true;
 }
 
-void
+UA_Boolean
 Service_Publish(UA_Server *server, UA_Session *session,
-                const UA_PublishRequest *request, UA_UInt32 requestId) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Processing PublishRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+                const void *request_, void *response_) {
+    const UA_PublishRequest *request = (const UA_PublishRequest*)request_;
+    UA_PublishResponse *response = (UA_PublishResponse*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                         "Processing PublishRequest with response token %"
+                         PRIu64,
+                         server->asyncManager.currentResponseToken);
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* Return an error if the session has no subscription */
     if(TAILQ_EMPTY(&session->subscriptions)) {
-        sendServiceFault(session->header.channel, requestId, request->requestHeader.requestHandle,
-                         &UA_TYPES[UA_TYPES_PUBLISHRESPONSE], UA_STATUSCODE_BADNOSUBSCRIPTION);
-        return;
+        response->responseHeader.serviceResult = UA_STATUSCODE_BADNOSUBSCRIPTION;
+        return true;
     }
 
     /* Handle too many subscriptions to free resources before trying to allocate
      * resources for the new publish request. If the limit has been reached the
-     * oldest publish request shall be responded */
-    if((server->config.maxPublishReqPerSession != 0) &&
-       (session->numPublishReq >= server->config.maxPublishReqPerSession)) {
-        if(!UA_Session_reachedPublishReqLimit(server, session)) {
-            sendServiceFault(session->header.channel, requestId, request->requestHeader.requestHandle,
-                             &UA_TYPES[UA_TYPES_PUBLISHRESPONSE], UA_STATUSCODE_BADINTERNALERROR);
-            return;
-        }
-    }
+     * oldest publish request are returned with an error message. */
+    UA_Session_ensurePublishQueueSpace(server, session);
 
     /* Allocate the response to store it in the retransmission queue */
     UA_PublishResponseEntry *entry = (UA_PublishResponseEntry *)
         UA_malloc(sizeof(UA_PublishResponseEntry));
     if(!entry) {
-        sendServiceFault(session->header.channel, requestId, request->requestHeader.requestHandle,
-                         &UA_TYPES[UA_TYPES_PUBLISHRESPONSE], UA_STATUSCODE_BADOUTOFMEMORY);
-        return;
+        response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
+        return true;
     }
 
     /* Prepare the response */
-    entry->requestId = requestId;
-    UA_PublishResponse *response = &entry->response;
-    UA_PublishResponse_init(response);
-    response->responseHeader.requestHandle = request->requestHeader.requestHandle;
+    UA_PublishResponse *entry_response = &entry->response;
+    UA_PublishResponse_init(entry_response);
 
     /* Allocate the results array to acknowledge the acknowledge */
     if(request->subscriptionAcknowledgementsSize > 0) {
-        response->results = (UA_StatusCode *)
+        entry_response->results = (UA_StatusCode *)
             UA_Array_new(request->subscriptionAcknowledgementsSize,
                          &UA_TYPES[UA_TYPES_STATUSCODE]);
-        if(!response->results) {
+        if(!entry_response->results) {
             UA_free(entry);
-            sendServiceFault(session->header.channel, requestId, request->requestHeader.requestHandle,
-                             &UA_TYPES[UA_TYPES_PUBLISHRESPONSE], UA_STATUSCODE_BADOUTOFMEMORY);
-            return;
+            response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
+            return true;
         }
-        response->resultsSize = request->subscriptionAcknowledgementsSize;
+        entry_response->resultsSize = request->subscriptionAcknowledgementsSize;
     }
+
+    /* <--- Async response from here on ---> */
+
+    entry->responseToken = server->asyncManager.currentResponseToken;
+    entry_response->responseHeader.requestHandle = request->requestHeader.requestHandle;
 
     /* Delete Acknowledged Subscription Messages */
     for(size_t i = 0; i < request->subscriptionAcknowledgementsSize; ++i) {
         UA_SubscriptionAcknowledgement *ack = &request->subscriptionAcknowledgements[i];
         UA_Subscription *sub = UA_Session_getSubscriptionById(session, ack->subscriptionId);
         if(!sub) {
-            response->results[i] = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
-            UA_LOG_DEBUG_SESSION(&server->config.logger, session,
+            entry_response->results[i] = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
+            UA_LOG_DEBUG_SESSION(server->config.logging, session,
                                  "Cannot process acknowledgements subscription %u" PRIu32,
                                  ack->subscriptionId);
             continue;
         }
         /* Remove the acked transmission from the retransmission queue */
-        response->results[i] = UA_Subscription_removeRetransmissionMessage(sub, ack->sequenceNumber);
+        entry_response->results[i] =
+            UA_Subscription_removeRetransmissionMessage(sub, ack->sequenceNumber);
+    }
+
+    /* Set the maxTime if a timeout hint is defined */
+    entry->maxTime = UA_INT64_MAX;
+    if(request->requestHeader.timeoutHint > 0) {
+        UA_EventLoop *el = server->config.eventLoop;
+        entry->maxTime = el->dateTime_nowMonotonic(el) +
+            (request->requestHeader.timeoutHint * UA_DATETIME_MSEC);
     }
 
     /* Queue the publish response. It will be dequeued in a repeated publish
      * callback. This can also be triggered right now for a late
      * subscription. */
     UA_Session_queuePublishReq(session, entry, false);
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session, "Queued a publication message");
+    UA_LOG_DEBUG_SESSION(server->config.logging, session, "Queued a publication message");
 
     /* If there are late subscriptions, the new publish request is used to
-     * answer them immediately. However, a single subscription that generates
-     * many notifications must not "starve" other late subscriptions. Hence we
-     * move it to the end of the queue when a response was sent. */
-    UA_Subscription *late = NULL;
-    TAILQ_FOREACH(late, &session->subscriptions, sessionListEntry) {
-        if(late->state != UA_SUBSCRIPTIONSTATE_LATE)
+     * answer them immediately. Late subscriptions with higher priority are
+     * considered earlier. However, a single subscription that generates many
+     * notifications must not "starve" other late subscriptions. Hence we move
+     * it to the end of the queue for the subscriptions of that priority. */
+    UA_Subscription *late, *late_tmp;
+    TAILQ_FOREACH_SAFE(late, &session->subscriptions, sessionListEntry, late_tmp) {
+        /* Skip non-late subscriptions */
+        if(!late->late)
             continue;
 
-        UA_LOG_DEBUG_SUBSCRIPTION(&server->config.logger, late,
+        /* Call publish on the late subscription */
+        UA_LOG_DEBUG_SUBSCRIPTION(server->config.logging, late,
                                   "Send PublishResponse on a late subscription");
         UA_Subscription_publish(server, late);
-        /* If the subscription was not detached from the session during publish,
-         * enqueue at the end */
-        if(late->session) {
+
+        /* Skip re-insert if the subscription was deleted or deactivated during
+         * _publish */
+        if(late->state >= UA_SUBSCRIPTIONSTATE_ENABLED_NOPUBLISH) {
+            /* Find the first element with smaller priority and insert before
+             * that. If there is none, insert at the end of the queue. */
+            UA_Subscription *after = TAILQ_NEXT(late, sessionListEntry);
+            while(after && after->priority >= late->priority)
+                after = TAILQ_NEXT(after, sessionListEntry);
             TAILQ_REMOVE(&session->subscriptions, late, sessionListEntry);
-            TAILQ_INSERT_TAIL(&session->subscriptions, late, sessionListEntry);
+            if(after)
+                TAILQ_INSERT_BEFORE(after, late, sessionListEntry);
+            else
+                TAILQ_INSERT_TAIL(&session->subscriptions, late, sessionListEntry);
         }
-        break;
+
+        /* Responses left in the queue? */
+        if(session->responseQueueSize == 0)
+            break;
     }
+
+    return false;
 }
 
 static void
-Operation_DeleteSubscription(UA_Server *server, UA_Session *session, void *_,
-                             const UA_UInt32 *subscriptionId, UA_StatusCode *result) {
+Operation_DeleteSubscription(UA_Server *server, UA_Session *session,
+                             const void *context /* unused */,
+                             const void *request /* UA_UInt32 */,
+                             void *response /* UA_StatusCode */) {
+    const UA_UInt32 *subscriptionId = (const UA_UInt32*)request;
+    UA_StatusCode *result = (UA_StatusCode*)response;
+    (void)context;
+    /* Find the Subscription */
     UA_Subscription *sub = UA_Session_getSubscriptionById(session, *subscriptionId);
     if(!sub) {
         *result = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
-        UA_LOG_DEBUG_SESSION(&server->config.logger, session,
-                             "Deleting Subscription with Id %" PRIu32 " failed with error code %s",
+        UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                             "Deleting Subscription with Id %" PRIu32
+                             " failed with error code %s",
                              *subscriptionId, UA_StatusCode_name(*result));
         return;
     }
 
-    UA_Subscription_delete(server, sub);
+    /* Delete the Subscription */
+    UA_Subscription_delete(server, sub, true);
     *result = UA_STATUSCODE_GOOD;
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session,
-                         "Subscription %" PRIu32 " | Subscription deleted",
-                         *subscriptionId);
 }
 
-void
+UA_Boolean
 Service_DeleteSubscriptions(UA_Server *server, UA_Session *session,
-                            const UA_DeleteSubscriptionsRequest *request,
-                            UA_DeleteSubscriptionsResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session,
+                            const void *request_, void *response_) {
+    const UA_DeleteSubscriptionsRequest *request = (const UA_DeleteSubscriptionsRequest*)request_;
+    UA_DeleteSubscriptionsResponse *response = (UA_DeleteSubscriptionsResponse*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing DeleteSubscriptionsRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     response->responseHeader.serviceResult =
-        UA_Server_processServiceOperations(server, session,
-                  (UA_ServiceOperation)Operation_DeleteSubscription, NULL,
-                  &request->subscriptionIdsSize, &UA_TYPES[UA_TYPES_UINT32],
-                  &response->resultsSize, &UA_TYPES[UA_TYPES_STATUSCODE]);
+        allocProcessServiceOperations(server, session,
+                                      Operation_DeleteSubscription,
+                                      NULL, &request->subscriptionIdsSize,
+                                      &UA_TYPES[UA_TYPES_UINT32], &response->resultsSize,
+                                      &UA_TYPES[UA_TYPES_STATUSCODE]);
+    return true;
 }
 
-void
+UA_Boolean
 Service_Republish(UA_Server *server, UA_Session *session,
-                  const UA_RepublishRequest *request,
-                  UA_RepublishResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session,
+                  const void *request_, void *response_) {
+    const UA_RepublishRequest *request = (const UA_RepublishRequest*)request_;
+    UA_RepublishResponse *response = (UA_RepublishResponse*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing RepublishRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* Get the subscription */
     UA_Subscription *sub = UA_Session_getSubscriptionById(session, request->subscriptionId);
     if(!sub) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
-        return;
+        return true;
     }
 
-    /* Reset the subscription lifetime */
-    sub->currentLifetimeCount = 0;
+    /* Reset the lifetime counter */
+    Subscription_resetLifetime(sub);
+
+    /* Update the subscription statistics */
+#ifdef UA_ENABLE_DIAGNOSTICS
+    sub->republishRequestCount++;
+#endif
 
     /* Find the notification in the retransmission queue  */
     UA_NotificationMessageEntry *entry;
@@ -337,11 +515,18 @@ Service_Republish(UA_Server *server, UA_Session *session,
     }
     if(!entry) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADMESSAGENOTAVAILABLE;
-        return;
+        return true;
     }
 
     response->responseHeader.serviceResult =
         UA_NotificationMessage_copy(&entry->message, &response->notificationMessage);
+
+    /* Update the subscription statistics for the case where we return a message */
+#ifdef UA_ENABLE_DIAGNOSTICS
+    sub->republishMessageCount++;
+#endif
+
+    return true;
 }
 
 static UA_StatusCode
@@ -366,33 +551,81 @@ setTransferredSequenceNumbers(const UA_Subscription *sub, UA_TransferResult *res
     return UA_STATUSCODE_GOOD;
 }
 
+static void *
+setMonitoredItemSubscriptionVisitor(void *context, UA_MonitoredItem *mon) {
+    mon->subscription = (UA_Subscription*)context;
+    return NULL;
+}
+
+/* The Session has the identity of the Session the Subscription was detached
+ * from. Same rules as the default AccessControl for attached Subscriptions: The
+ * same user. For anonymous users the same client application, which is only
+ * verified (against the client certificate) on secure SecureChannels. */
+static UA_Boolean
+isDetachedSubscriptionOwner(const UA_Subscription *sub, const UA_Session *session) {
+    if(!sub->ownerKnown || sub->ownerTokenType != session->userTokenType ||
+       !UA_String_equal(&sub->ownerUserId, &session->clientUserIdOfSession))
+        return false;
+    if(sub->ownerUserId.length > 0)
+        return true;
+    UA_Boolean secure = session->channel &&
+        session->channel->securityMode != UA_MESSAGESECURITYMODE_NONE;
+    return sub->ownerSecure && secure && sub->ownerApplicationUri.length > 0 &&
+        UA_String_equal(&sub->ownerApplicationUri,
+                        &session->clientDescription.applicationUri);
+}
+
 static void
 Operation_TransferSubscription(UA_Server *server, UA_Session *session,
-                               const UA_Boolean *sendInitialValues,
-                               const UA_UInt32 *subscriptionId,
-                               UA_TransferResult *result) {
+                               const void *context /* UA_Boolean */,
+                               const void *request /* UA_UInt32 */,
+                               void *response /* UA_TransferResult */) {
+    const UA_Boolean *sendInitialValues = (const UA_Boolean*)context;
+    const UA_UInt32 *subscriptionId = (const UA_UInt32*)request;
+    UA_TransferResult *result = (UA_TransferResult*)response;
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
     /* Get the subscription. This requires a server-wide lookup instead of the
      * usual session-wide lookup. */
-    UA_Subscription *sub = UA_Server_getSubscriptionById(server, *subscriptionId);
+    UA_Subscription *sub = getSubscriptionById(server, *subscriptionId);
     if(!sub) {
         result->statusCode = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
         return;
     }
 
+    /* Update the diagnostics statistics */
+#ifdef UA_ENABLE_DIAGNOSTICS
+    sub->transferRequestCount++;
+#endif
+
     /* Is this the same session? Return the sequence numbers and do nothing else. */
     UA_Session *oldSession = sub->session;
     if(oldSession == session) {
         result->statusCode = setTransferredSequenceNumbers(sub, result);
+#ifdef UA_ENABLE_DIAGNOSTICS
+        sub->transferredToSameClientCount++;
+#endif
+        return;
+    }
+
+    /* A detached Subscription has no Session to compare against. Check the
+     * identity of the Session it was detached from. */
+    if(!oldSession && !isDetachedSubscriptionOwner(sub, session)) {
+        result->statusCode = UA_STATUSCODE_BADUSERACCESSDENIED;
         return;
     }
 
     /* Check with AccessControl if the transfer is allowed */
-    if(!server->config.accessControl.allowTransferSubscription ||
-       !server->config.accessControl.
-       allowTransferSubscription(server, &server->config.accessControl,
-                                 oldSession ? &oldSession->sessionId : NULL,
-                                 oldSession ? oldSession->sessionHandle : NULL,
-                                 &session->sessionId, session->sessionHandle)) {
+    if(server->config.accessControl.allowTransferSubscription) {
+        if(!server->config.accessControl.
+           allowTransferSubscription(server, &server->config.accessControl,
+                                     oldSession ? &oldSession->sessionId : NULL,
+                                     oldSession ? oldSession->context : NULL,
+                                     &session->sessionId, session->context)) {
+            result->statusCode = UA_STATUSCODE_BADUSERACCESSDENIED;
+            return;
+        }
+    } else {
         result->statusCode = UA_STATUSCODE_BADUSERACCESSDENIED;
         return;
     }
@@ -424,8 +657,14 @@ Operation_TransferSubscription(UA_Server *server, UA_Session *session,
      * that all backpointers are set correctly. */
     memcpy(newSub, sub, sizeof(UA_Subscription));
 
-    /* Register cyclic publish callback */
-    result->statusCode = Subscription_registerPublishCallback(server, newSub);
+    /* The owner identity remains with (and is freed by) the original */
+    newSub->ownerKnown = false;
+    UA_String_init(&newSub->ownerUserId);
+    UA_String_init(&newSub->ownerApplicationUri);
+
+    /* Set to the same state as the original subscription */
+    newSub->publishCallbackId = 0;
+    result->statusCode = Subscription_setState(server, newSub, sub->state);
     if(result->statusCode != UA_STATUSCODE_GOOD) {
         UA_Array_delete(result->availableSequenceNumbers,
                         sub->retransmissionQueueSize, &UA_TYPES[UA_TYPES_UINT32]);
@@ -437,27 +676,36 @@ Operation_TransferSubscription(UA_Server *server, UA_Session *session,
 
     /* <-- The point of no return --> */
 
+    /* Mark the old subscription as transferred to prevent incorrect
+     * diagnostic counter updates when it is deleted */
+    sub->wasTransferred = true;
+
     /* Move over the MonitoredItems and adjust the backpointers */
-    LIST_INIT(&newSub->monitoredItems);
-    UA_MonitoredItem *mon, *mon_tmp;
-    LIST_FOREACH_SAFE(mon, &sub->monitoredItems, listEntry, mon_tmp) {
-        LIST_REMOVE(mon, listEntry);
-        mon->subscription = newSub;
-        LIST_INSERT_HEAD(&newSub->monitoredItems, mon, listEntry);
-    }
+    newSub->monitoredItemsById = sub->monitoredItemsById;
+    ZIP_INIT(&sub->monitoredItemsById);
     sub->monitoredItemsSize = 0;
+    ZIP_ITER(UA_MonitoredItemIdTree, &newSub->monitoredItemsById,
+             setMonitoredItemSubscriptionVisitor, newSub);
+
+    /* Move over the samplingMonitoredItems and adjust the backpointers */
+    LIST_INIT(&newSub->samplingMonitoredItems);
+    UA_MonitoredItem *smon, *smon_tmp;
+    LIST_FOREACH_SAFE(smon, &sub->samplingMonitoredItems, sampling.subscriptionSampling, smon_tmp) {
+        LIST_REMOVE(smon, sampling.subscriptionSampling);
+        LIST_INSERT_HEAD(&newSub->samplingMonitoredItems, smon,
+                         sampling.subscriptionSampling);
+    }
 
     /* Move over the notification queue */
     TAILQ_INIT(&newSub->notificationQueue);
-    UA_Notification *nn;
-    TAILQ_FOREACH(nn, &sub->notificationQueue, globalEntry) {
-        TAILQ_REMOVE(&sub->notificationQueue, nn, globalEntry);
-        TAILQ_INSERT_TAIL(&newSub->notificationQueue, nn, globalEntry);
+    UA_Notification *nn, *nn_tmp;
+    TAILQ_FOREACH_SAFE(nn, &sub->notificationQueue, subEntry, nn_tmp) {
+        TAILQ_REMOVE(&sub->notificationQueue, nn, subEntry);
+        TAILQ_INSERT_TAIL(&newSub->notificationQueue, nn, subEntry);
     }
     sub->notificationQueueSize = 0;
     sub->dataChangeNotifications = 0;
     sub->eventNotifications = 0;
-    sub->readyNotifications = 0;
 
     TAILQ_INIT(&newSub->retransmissionQueue);
     UA_NotificationMessageEntry *nme, *nme_tmp;
@@ -479,58 +727,72 @@ Operation_TransferSubscription(UA_Server *server, UA_Session *session,
     /* Attach to the session */
     UA_Session_attachSubscription(session, newSub);
 
-    UA_LOG_INFO_SUBSCRIPTION(&server->config.logger, newSub, "Transferred to this Session");
+    /* Notify the application */
+    notifySubscription(server, newSub,
+                       UA_APPLICATIONNOTIFICATIONTYPE_SUBSCRIPTION_TRANSFERRED);
+
+    UA_LOG_INFO_SUBSCRIPTION(server->config.logging, newSub,
+                             "Transferred to this Session");
 
     /* Set StatusChange in the original subscription and force publish. This
      * also removes the Subscription, even if there was no PublishResponse
      * queued to send a StatusChangeNotification. */
+    UA_Boolean publishReqQueued = oldSession && oldSession->responseQueueSize > 0;
     sub->statusChange = UA_STATUSCODE_GOODSUBSCRIPTIONTRANSFERRED;
     UA_Subscription_publish(server, sub);
-    UA_assert(sub->publishCallbackId == 0);
 
-    /* Create notifications with the current values */
-    if(*sendInitialValues) {
-        LIST_FOREACH(mon, &newSub->monitoredItems, listEntry) {
-
-            /* Create only DataChange notifications */
-            if(mon->itemToMonitor.attributeId == UA_ATTRIBUTEID_EVENTNOTIFIER)
-                continue;
-
-            /* Only if the mode is monitoring */
-            if(mon->monitoringMode != UA_MONITORINGMODE_REPORTING)
-                continue;
-
-            /* If a value is queued for a data MonitoredItem, the next value in
-             * the queue is sent in the Publish response. */
-            if(mon->queueSize > 0)
-                continue;
-
-            /* Create a notification with the last sampled value */
-            UA_MonitoredItem_createDataChangeNotification(server, newSub, mon,
-                                                          &mon->lastValue);
-        }
+    /* No PublishRequest was queued on the old Session, so the original
+     * subscription remains until it can send the StatusChangeNotification.
+     * Mark it late and move it to the front of the Session's queue. Then the
+     * next PublishRequest of the old Session is answered with the
+     * StatusChangeNotification and not with the notifications (or keep-alive)
+     * of another late Subscription. */
+    if(oldSession && !publishReqQueued && sub->session == oldSession) {
+        sub->late = true;
+        TAILQ_REMOVE(&oldSession->subscriptions, sub, sessionListEntry);
+        TAILQ_INSERT_HEAD(&oldSession->subscriptions, sub, sessionListEntry);
     }
 
-    /* Immediately try to publish. If the notification was late, include the new
-     * sample in the "ready-list" and don't wait until the next cyclic
-     * timeout. */
-    newSub->readyNotifications = newSub->notificationQueueSize;
-    UA_Subscription_publish(server, newSub);
+    /* Re-create notifications with the current values for the new subscription */
+    if(*sendInitialValues)
+        UA_Subscription_resendData(server, newSub);
+
+    /* Do not update the statistics for the number of Subscriptions here. The
+     * fact that we duplicate the subscription and move over the content is just
+     * an implementtion detail.
+     * server->serverDiagnosticsSummary.currentSubscriptionCount++;
+     * server->serverDiagnosticsSummary.cumulatedSubscriptionCount++;
+     *
+     * Update the diagnostics statistics: */
+#ifdef UA_ENABLE_DIAGNOSTICS
+    if(oldSession &&
+       UA_equal(&oldSession->clientDescription, &session->clientDescription,
+                &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION]))
+        sub->transferredToSameClientCount++;
+    else
+        sub->transferredToAltClientCount++;
+#endif
 }
 
-void Service_TransferSubscriptions(UA_Server *server, UA_Session *session,
-                                   const UA_TransferSubscriptionsRequest *request,
-                                   UA_TransferSubscriptionsResponse *response) {
-    UA_LOG_DEBUG_SESSION(&server->config.logger, session,
+UA_Boolean
+Service_TransferSubscriptions(UA_Server *server, UA_Session *session,
+                              const void *request_, void *response_) {
+    const UA_TransferSubscriptionsRequest *request =
+        (const UA_TransferSubscriptionsRequest*)request_;
+    UA_TransferSubscriptionsResponse *response = (UA_TransferSubscriptionsResponse*)response_;
+    UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing TransferSubscriptionsRequest");
-    UA_LOCK_ASSERT(&server->serviceMutex, 1);
+    UA_LOCK_ASSERT(&server->serviceMutex);
 
     response->responseHeader.serviceResult =
-        UA_Server_processServiceOperations(server, session,
-                  (UA_ServiceOperation)Operation_TransferSubscription,
-                  &request->sendInitialValues,
-                  &request->subscriptionIdsSize, &UA_TYPES[UA_TYPES_UINT32],
-                  &response->resultsSize, &UA_TYPES[UA_TYPES_TRANSFERRESULT]);
+        allocProcessServiceOperations(server, session,
+                                      Operation_TransferSubscription,
+                                      &request->sendInitialValues,
+                                      &request->subscriptionIdsSize,
+                                      &UA_TYPES[UA_TYPES_UINT32],
+                                      &response->resultsSize,
+                                      &UA_TYPES[UA_TYPES_TRANSFERRESULT]);
+    return true;
 }
 
 #endif /* UA_ENABLE_SUBSCRIPTIONS */

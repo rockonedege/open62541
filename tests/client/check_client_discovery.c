@@ -1,0 +1,310 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
+ */
+
+#include <open62541/client_config_default.h>
+#include <open62541/server_config_default.h>
+
+#include "client/ua_client_internal.h"
+#include "server/ua_server_internal.h"
+
+#include <check.h>
+#include <stdlib.h>
+
+#include "thread_wrapper.h"
+#include "test_helpers.h"
+
+UA_Server *server;
+UA_atomic(uintptr_t) running;
+THREAD_HANDLE server_thread;
+
+
+THREAD_CALLBACK(serverloop) {
+    while(UA_atomic_load(&running))
+        UA_Server_run_iterate(server, true);
+    return 0;
+}
+
+static void setup(void) {
+    UA_atomic_store(&running, true);
+    server = UA_Server_newForUnitTest();
+    UA_Server_run_startup(server);
+    THREAD_CREATE(server_thread, serverloop);
+}
+
+static void teardown(void) {
+    UA_atomic_store(&running, false);
+    THREAD_JOIN(server_thread);
+    UA_Server_run_shutdown(server);
+    UA_Server_delete(server);
+}
+
+START_TEST(Client_connect_badEndpointUrl) {
+    UA_Client *client = UA_Client_newForUnitTest();
+
+    /* Use the internal API to force a bad DiscoveryUrl */
+    UA_String_clear(&client->config.endpointUrl);
+    UA_String_clear(&client->discoveryUrl);
+    client->config.endpointUrl = UA_STRING_ALLOC("opc.tcp://localhost:4840");
+    client->discoveryUrl = UA_STRING_ALLOC("abc://xxx:4840");
+
+    /* Open a Session when possible */
+    client->config.noSession = false;
+
+    lockClient(client);
+    connectSync(client);
+    unlockClient(client);
+    ck_assert_uint_eq(client->connectStatus, UA_STATUSCODE_GOOD);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_connect_keepsTransportAcrossDiscovery) {
+    /* Put an HTTPS URL first, as done by the .NET reference server. A client
+     * connected over opc.tcp must select the later TCP discovery URL. */
+    lockServer(server);
+    UA_ApplicationDescription *ad =
+        &UA_Server_getConfig(server)->applicationDescription;
+    size_t oldSize = ad->discoveryUrlsSize;
+    const UA_String httpsUrl =
+        UA_STRING_STATIC("opc.https://localhost:62540/discovery");
+    ck_assert_uint_eq(UA_Array_appendCopy(
+                          (void **)&ad->discoveryUrls,
+                          &ad->discoveryUrlsSize, &httpsUrl,
+                          &UA_TYPES[UA_TYPES_STRING]),
+                      UA_STATUSCODE_GOOD);
+    UA_String added = ad->discoveryUrls[oldSize];
+    memmove(&ad->discoveryUrls[1], &ad->discoveryUrls[0],
+            oldSize * sizeof(UA_String));
+    ad->discoveryUrls[0] = added;
+    unlockServer(server);
+
+    UA_Client *client = UA_Client_newForUnitTest();
+    ck_assert_uint_eq(UA_Client_connect(client, "opc.tcp://localhost:4840"),
+                      UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(client->channel.transport,
+                      UA_SECURECHANNEL_TRANSPORT_UACP);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_getEndpoints) {
+    UA_Client *client = UA_Client_newForUnitTest();
+
+    size_t endpointCount = 0;
+    UA_EndpointDescription *endpoints = NULL;
+    UA_StatusCode retval = UA_Client_getEndpoints(client,
+                                "opc.tcp://localhost:4840",
+                                &endpointCount, &endpoints);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert(endpointCount > 0);
+    ck_assert_ptr_ne(endpoints, NULL);
+
+    /* Verify each endpoint has a non-empty securityPolicyUri */
+    for(size_t i = 0; i < endpointCount; i++) {
+        ck_assert(endpoints[i].securityPolicyUri.length > 0);
+    }
+
+    UA_Array_delete(endpoints, endpointCount,
+                    &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_findServers) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    const char *serverUrl = "opc.tcp://127.0.0.1:4840";
+    const UA_String requestedUrl = UA_STRING((char*)(uintptr_t)serverUrl);
+
+    size_t serverCount = 0;
+    UA_ApplicationDescription *servers = NULL;
+    UA_StatusCode retval = UA_Client_findServers(client,
+                                serverUrl,
+                                0, NULL, 0, NULL,
+                                &serverCount, &servers);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert(serverCount > 0);
+    ck_assert_ptr_ne(servers, NULL);
+    ck_assert_uint_eq(servers[0].discoveryUrlsSize, 1);
+    ck_assert(UA_String_equal(&servers[0].discoveryUrls[0], &requestedUrl));
+
+    UA_Array_delete(servers, serverCount,
+                    &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION]);
+
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_getEndpoints_connected) {
+    /* Connect first, then getEndpoints on same URL — should succeed */
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = _i == 0 ?
+        UA_Client_connect(client, "opc.tcp://localhost:4840") :
+        UA_Client_connectSecureChannel(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    size_t endpointCount = 0;
+    UA_EndpointDescription *endpoints = NULL;
+    retval = UA_Client_getEndpoints(client, "opc.tcp://localhost:4840",
+                                    &endpointCount, &endpoints);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert(endpointCount > 0);
+
+    UA_Array_delete(endpoints, endpointCount,
+                    &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_findServers_connected) {
+    /* Connect first, then findServers on same URL — should succeed */
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = _i == 0 ?
+        UA_Client_connect(client, "opc.tcp://localhost:4840") :
+        UA_Client_connectSecureChannel(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    size_t serverCount = 0;
+    UA_ApplicationDescription *servers = NULL;
+    retval = UA_Client_findServers(client, "opc.tcp://localhost:4840",
+                                   0, NULL, 0, NULL,
+                                   &serverCount, &servers);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert(serverCount > 0);
+
+    UA_Array_delete(servers, serverCount,
+                    &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION]);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_findServersOnNetwork) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    size_t serverOnNetworkSize = 0;
+    UA_ServerOnNetwork *servers = NULL;
+
+    UA_StatusCode retval = UA_Client_findServersOnNetwork(client,
+        "opc.tcp://localhost:4840", 0, 0, 0, NULL,
+        &serverOnNetworkSize, &servers);
+
+    if(retval == UA_STATUSCODE_GOOD) {
+        if(serverOnNetworkSize > 0)
+            ck_assert_ptr_ne(servers, NULL);
+        UA_Array_delete(servers, serverOnNetworkSize,
+                        &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+    } else {
+        ck_assert_uint_eq(serverOnNetworkSize, 0);
+        ck_assert_ptr_eq(servers, NULL);
+    }
+
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_discovery_badUrl_connected) {
+    const char *urls[] = {
+        "opc.tcp://invalidhost:9999",
+        "opc.tcp://localhost:4840/other",
+        "opc.tcp://localhost:484"
+    };
+    UA_Client *client = UA_Client_newForUnitTest();
+    ck_assert_uint_eq(UA_Client_connect(client, "opc.tcp://localhost:4840"),
+                      UA_STATUSCODE_GOOD);
+
+    /* A different host, a longer URL and a shorter prefix must all be
+     * rejected before sending a request on the existing connection. */
+    size_t size = 123;
+    UA_EndpointDescription *endpoints = (UA_EndpointDescription*)(uintptr_t)0x1;
+    ck_assert_uint_eq(UA_Client_getEndpoints(client, urls[_i], &size, &endpoints),
+                      UA_STATUSCODE_BADINVALIDARGUMENT);
+    ck_assert_uint_eq(size, 0);
+    ck_assert_ptr_eq(endpoints, NULL);
+
+    size = 123;
+    UA_ApplicationDescription *servers = (UA_ApplicationDescription*)(uintptr_t)0x1;
+    ck_assert_uint_eq(UA_Client_findServers(client, urls[_i], 0, NULL, 0, NULL,
+                                           &size, &servers),
+                      UA_STATUSCODE_BADINVALIDARGUMENT);
+    ck_assert_uint_eq(size, 0);
+    ck_assert_ptr_eq(servers, NULL);
+
+    size = 123;
+    UA_ServerOnNetwork *network = (UA_ServerOnNetwork*)(uintptr_t)0x1;
+    ck_assert_uint_eq(UA_Client_findServersOnNetwork(client, urls[_i], 0, 0, 0, NULL,
+                                                    &size, &network),
+                      UA_STATUSCODE_BADINVALIDARGUMENT);
+    ck_assert_uint_eq(size, 0);
+    ck_assert_ptr_eq(network, NULL);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_findServersOnNetwork_paged) {
+    /* Test with maxRecordsToReturn to exercise paging code */
+    UA_Client *client = UA_Client_newForUnitTest();
+    size_t serverOnNetworkSize = 0;
+    UA_ServerOnNetwork *servers = NULL;
+    UA_StatusCode retval = UA_Client_findServersOnNetwork(client, "opc.tcp://localhost:4840",
+                                                            0, 1, 0, NULL,
+                                                            &serverOnNetworkSize, &servers);
+    /* Either success or error - both valid */
+    if(retval == UA_STATUSCODE_GOOD && servers)
+        UA_Array_delete(servers, serverOnNetworkSize,
+                        &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_findServersOnNetwork_disconnected) {
+    /* Test findServersOnNetwork without connecting first */
+    UA_Client *client = UA_Client_newForUnitTest();
+    size_t serverOnNetworkSize = 0;
+    UA_ServerOnNetwork *servers = NULL;
+    UA_StatusCode retval = UA_Client_findServersOnNetwork(client, "opc.tcp://localhost:4840",
+                                                            0, 0, 0, NULL,
+                                                            &serverOnNetworkSize, &servers);
+    if(retval == UA_STATUSCODE_GOOD && servers)
+        UA_Array_delete(servers, serverOnNetworkSize,
+                        &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+    UA_Client_delete(client);
+}
+END_TEST
+
+static Suite* testSuite_Client(void) {
+    Suite *s = suite_create("Client");
+    TCase *tc_client = tcase_create("Client Discovery");
+    tcase_add_checked_fixture(tc_client, setup, teardown);
+    tcase_add_test(tc_client, Client_connect_badEndpointUrl);
+    tcase_add_test(tc_client, Client_connect_keepsTransportAcrossDiscovery);
+    tcase_add_test(tc_client, Client_getEndpoints);
+    tcase_add_test(tc_client, Client_findServers);
+    tcase_add_loop_test(tc_client, Client_getEndpoints_connected, 0, 2);
+    tcase_add_loop_test(tc_client, Client_findServers_connected, 0, 2);
+    tcase_add_test(tc_client, Client_findServersOnNetwork);
+    tcase_add_loop_test(tc_client, Client_discovery_badUrl_connected, 0, 3);
+    tcase_add_test(tc_client, Client_findServersOnNetwork_paged);
+    tcase_add_test(tc_client, Client_findServersOnNetwork_disconnected);
+    suite_add_tcase(s,tc_client);
+    return s;
+}
+
+int main(void) {
+    Suite *s = testSuite_Client();
+    SRunner *sr = srunner_create(s);
+    srunner_set_fork_status(sr, CK_NOFORK);
+    srunner_run_all(sr,CK_NORMAL);
+    int number_failed = srunner_ntests_failed(sr);
+    srunner_free(sr);
+    return (number_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}

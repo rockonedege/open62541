@@ -1,0 +1,5 @@
+ServiceCounterDataType
+SubscriptionDiagnosticsDataType
+SessionDiagnosticsDataType
+SessionSecurityDiagnosticsDataType
+SamplingIntervalDiagnosticsDataType

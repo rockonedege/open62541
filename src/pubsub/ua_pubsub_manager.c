@@ -2,590 +2,977 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  *
- * Copyright (c) 2017-2019 Fraunhofer IOSB (Author: Andreas Ebner)
+ * Copyright (c) 2017-2025 Fraunhofer IOSB (Author: Andreas Ebner)
  * Copyright (c) 2018 Fraunhofer IOSB (Author: Julius Pfrommer)
+ * Copyright (c) 2021 Fraunhofer IOSB (Author: Jan Hermes)
+ * Copyright (c) 2022 Siemens AG (Author: Thomas Fischer)
+ * Copyright (c) 2022 Fraunhofer IOSB (Author: Noel Graf)
+ * Copyright (c) 2022 Linutronix GmbH (Author: Muddasir Shakil)
+ * Copyright 2025 (c) o6 Automation GmbH (Author: Julius Pfrommer)
+ * Copyright 2026 (c) o6 Automation GmbH (Author: Andreas Ebner)
  */
 
-#include "server/ua_server_internal.h"
-#include "ua_pubsub_ns0.h"
+#include "ua_pubsub_internal.h"
 
 #ifdef UA_ENABLE_PUBSUB /* conditional compilation */
 
-#ifdef UA_ENABLE_PUBSUB_MONITORING
-#include <open62541/server_pubsub.h>
-#endif /* UA_ENABLE_PUBSUB_MONITORING */
+#ifdef UA_ENABLE_PUBSUB_SKS
+#include "ua_pubsub_keystorage.h"
+#endif
 
 #define UA_DATETIMESTAMP_2000 125911584000000000
+#define UA_RESERVEID_FIRST_ID 0x8000
+
+static const char *pubSubStateNames[6] = {
+    "Disabled", "Paused", "Operational", "Error", "PreOperational", "Invalid"
+};
+
+static void
+UA_PubSubManager_stop(UA_Driver *drv);
+
+static UA_StatusCode
+UA_PubSubManager_start(UA_Driver *drv);
+
+const char *
+UA_PubSubState_name(UA_PubSubState state) {
+    if(state < UA_PUBSUBSTATE_DISABLED || state > UA_PUBSUBSTATE_PREOPERATIONAL)
+        return pubSubStateNames[5];
+    return pubSubStateNames[state];
+}
 
 UA_StatusCode
-UA_Server_addPubSubConnection(UA_Server *server,
-                              const UA_PubSubConnectionConfig *connectionConfig,
-                              UA_NodeId *connectionIdentifier) {
-    /* Find the matching UA_PubSubTransportLayers */
-    UA_PubSubTransportLayer *tl = NULL;
-    for(size_t i = 0; i < server->config.pubSubConfig.transportLayersSize; i++) {
-        if(connectionConfig &&
-           UA_String_equal(&server->config.pubSubConfig.transportLayers[i].transportProfileUri,
-                           &connectionConfig->transportProfileUri)) {
-            tl = &server->config.pubSubConfig.transportLayers[i];
-        }
+UA_PubSubComponent_setPubSubState(UA_PubSubManager *psm, void *component,
+                                  UA_PubSubComponentType componentType,
+                                  UA_PubSubState targetState,
+                                  UA_StatusCode errorReason) {
+    switch(componentType) {
+    case UA_PUBSUBCOMPONENT_CONNECTION:
+        return UA_PubSubConnection_setPubSubState(
+            psm, (UA_PubSubConnection*)component, targetState);
+    case UA_PUBSUBCOMPONENT_WRITERGROUP:
+        return UA_WriterGroup_setPubSubState(
+            psm, (UA_WriterGroup*)component, targetState);
+    case UA_PUBSUBCOMPONENT_READERGROUP:
+        return UA_ReaderGroup_setPubSubState(
+            psm, (UA_ReaderGroup*)component, targetState);
+    case UA_PUBSUBCOMPONENT_DATASETREADER:
+        return UA_DataSetReader_setPubSubState(
+            psm, (UA_DataSetReader*)component, targetState, errorReason);
+    case UA_PUBSUBCOMPONENT_DATASETWRITER:
+        return UA_DataSetWriter_setPubSubState(
+            psm, (UA_DataSetWriter*)component, targetState);
+    default:
+        return UA_STATUSCODE_BADNOTSUPPORTED;
     }
-    if(!tl) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PubSub Connection creation failed. Requested transport layer not found.");
-        return UA_STATUSCODE_BADNOTFOUND;
+}
+
+void
+UA_PubSubComponentHead_clear(UA_PubSubComponentHead *psch) {
+    UA_NodeId_clear(&psch->identifier);
+    UA_String_clear(&psch->logIdString);
+    memset(psch, 0, sizeof(UA_PubSubComponentHead));
+}
+
+/* See declaration in ua_pubsub_internal.h for full documentation. */
+void
+UA_PubSubComponent_freeWithoutLifecycleCallback(UA_PubSubManager *psm,
+                                                void *component,
+                                                UA_PubSubComponentType type) {
+    /* Suppress application lifecycle vetoes while rolling back partial
+     * creation, then restore the callback after releasing the component. */
+    UA_Server *server = psm->drv.server;
+    UA_StatusCode (*savedCb)(UA_Server*, const UA_NodeId,
+                             const UA_PubSubComponentType, UA_Boolean) =
+        server->config.pubSubConfig.componentLifecycleCallback;
+    server->config.pubSubConfig.componentLifecycleCallback = NULL;
+    switch(type) {
+    case UA_PUBSUBCOMPONENT_CONNECTION:
+        UA_PubSubConnection_delete(psm, (UA_PubSubConnection*)component);
+        break;
+    case UA_PUBSUBCOMPONENT_WRITERGROUP:
+        UA_WriterGroup_remove(psm, (UA_WriterGroup*)component);
+        break;
+    case UA_PUBSUBCOMPONENT_READERGROUP:
+        UA_ReaderGroup_remove(psm, (UA_ReaderGroup*)component);
+        break;
+    case UA_PUBSUBCOMPONENT_DATASETWRITER:
+        UA_DataSetWriter_remove(psm, (UA_DataSetWriter*)component);
+        break;
+    case UA_PUBSUBCOMPONENT_DATASETREADER:
+        UA_DataSetReader_remove(psm, (UA_DataSetReader*)component);
+        break;
+    default:
+        break;
     }
+    server->config.pubSubConfig.componentLifecycleCallback = savedCb;
+}
 
-    /* Create a copy of the connection config */
-    UA_PubSubConnectionConfig *tmpConnectionConfig = (UA_PubSubConnectionConfig *)
-        UA_calloc(1, sizeof(UA_PubSubConnectionConfig));
-    if(!tmpConnectionConfig){
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PubSub Connection creation failed. Out of Memory.");
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    }
+UA_StatusCode
+UA_PublisherId_copy(const UA_PublisherId *src,
+                    UA_PublisherId *dst) {
+    memcpy(dst, src, sizeof(UA_PublisherId));
+    if(src->idType == UA_PUBLISHERIDTYPE_STRING)
+        return UA_String_copy(&src->id.string, &dst->id.string);
+    return UA_STATUSCODE_GOOD;
+}
 
-    UA_StatusCode retval = UA_PubSubConnectionConfig_copy(connectionConfig, tmpConnectionConfig);
-    if(retval != UA_STATUSCODE_GOOD){
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PubSub Connection creation failed. Could not copy the config.");
-        return retval;
-    }
+void
+UA_PublisherId_clear(UA_PublisherId *p) {
+    if(p->idType == UA_PUBLISHERIDTYPE_STRING)
+        UA_String_clear(&p->id.string);
+    memset(p, 0, sizeof(UA_PublisherId));
+}
 
-    /* Create new connection and add to UA_PubSubManager */
-    UA_PubSubConnection *newConnectionsField = (UA_PubSubConnection *)
-        UA_calloc(1, sizeof(UA_PubSubConnection));
-    if(!newConnectionsField) {
-        UA_PubSubConnectionConfig_clear(tmpConnectionConfig);
-        UA_free(tmpConnectionConfig);
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PubSub Connection creation failed. Out of Memory.");
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    }
-    newConnectionsField->componentType = UA_PUBSUB_COMPONENT_CONNECTION;
-    if (server->pubSubManager.connectionsSize != 0)
-        TAILQ_INSERT_TAIL(&server->pubSubManager.connections, newConnectionsField, listEntry);
-    else {
-        TAILQ_INIT(&server->pubSubManager.connections);
-        TAILQ_INSERT_HEAD(&server->pubSubManager.connections, newConnectionsField, listEntry);
-    }
+UA_StatusCode
+UA_PublisherId_fromVariant(UA_PublisherId *p, const UA_Variant *src) {
+    if(!UA_Variant_isScalar(src))
+        return UA_STATUSCODE_BADINTERNALERROR;
 
-    server->pubSubManager.connectionsSize++;
+    memset(p, 0, sizeof(UA_PublisherId));
 
-    LIST_INIT(&newConnectionsField->writerGroups);
-    newConnectionsField->config = tmpConnectionConfig;
-
-    /* Open the channel */
-    newConnectionsField->channel = tl->createPubSubChannel(newConnectionsField->config);
-    if(!newConnectionsField->channel) {
-        UA_PubSubConnection_clear(server, newConnectionsField);
-        TAILQ_REMOVE(&server->pubSubManager.connections, newConnectionsField, listEntry);
-        server->pubSubManager.connectionsSize--;
-        UA_free(newConnectionsField);
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PubSub Connection creation failed. Transport layer creation problem.");
+    const void *data = (const void*)src->data;
+    if(src->type == &UA_TYPES[UA_TYPES_BYTE]) {
+        p->idType = UA_PUBLISHERIDTYPE_BYTE;
+        p->id.byte = *(const UA_Byte*)data;
+    } else if(src->type == &UA_TYPES[UA_TYPES_UINT16]) {
+        p->idType  = UA_PUBLISHERIDTYPE_UINT16;
+        p->id.uint16 = *(const UA_UInt16*)data;
+    } else if(src->type == &UA_TYPES[UA_TYPES_UINT32]) {
+        p->idType  = UA_PUBLISHERIDTYPE_UINT32;
+        p->id.uint32 = *(const UA_UInt32*)data;
+    } else if(src->type == &UA_TYPES[UA_TYPES_UINT64]) {
+        p->idType  = UA_PUBLISHERIDTYPE_UINT64;
+        p->id.uint64 = *(const UA_UInt64*)data;
+    } else if(src->type == &UA_TYPES[UA_TYPES_STRING]) {
+        p->idType  = UA_PUBLISHERIDTYPE_STRING;
+        return UA_String_copy((const UA_String *)data, &p->id.string);
+    } else {
         return UA_STATUSCODE_BADINTERNALERROR;
     }
-
-    UA_PubSubManager_generateUniqueNodeId(server, &newConnectionsField->identifier);
-
-    if(connectionIdentifier)
-        UA_NodeId_copy(&newConnectionsField->identifier, connectionIdentifier);
-
-#ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    addPubSubConnectionRepresentation(server, newConnectionsField);
-#endif
     return UA_STATUSCODE_GOOD;
 }
 
-UA_StatusCode
-UA_Server_removePubSubConnection(UA_Server *server, const UA_NodeId connection) {
-    //search the identified Connection and store the Connection index
-    UA_PubSubConnection *currentConnection = UA_PubSubConnection_findConnectionbyId(server, connection);
-    if(!currentConnection)
-        return UA_STATUSCODE_BADNOTFOUND;
-
-#ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    removePubSubConnectionRepresentation(server, currentConnection);
-#endif
-    server->pubSubManager.connectionsSize--;
-
-    UA_PubSubConnection_clear(server, currentConnection);
-    TAILQ_REMOVE(&server->pubSubManager.connections, currentConnection, listEntry);
-    UA_free(currentConnection);
-    return UA_STATUSCODE_GOOD;
+void
+UA_PublisherId_toVariant(const UA_PublisherId *p, UA_Variant *dst) {
+    UA_PublisherId *p2 = (UA_PublisherId*)(uintptr_t)p;
+    switch(p->idType) {
+    case UA_PUBLISHERIDTYPE_BYTE:
+        UA_Variant_setScalar(dst, &p2->id.byte, &UA_TYPES[UA_TYPES_BYTE]); break;
+    case UA_PUBLISHERIDTYPE_UINT16:
+        UA_Variant_setScalar(dst, &p2->id.uint16, &UA_TYPES[UA_TYPES_UINT16]); break;
+    case UA_PUBLISHERIDTYPE_UINT32:
+        UA_Variant_setScalar(dst, &p2->id.uint32, &UA_TYPES[UA_TYPES_UINT32]); break;
+    case UA_PUBLISHERIDTYPE_UINT64:
+        UA_Variant_setScalar(dst, &p2->id.uint64, &UA_TYPES[UA_TYPES_UINT64]); break;
+    case UA_PUBLISHERIDTYPE_STRING:
+        UA_Variant_setScalar(dst, &p2->id.string, &UA_TYPES[UA_TYPES_STRING]); break;
+    default: break; /* This is not possible if the PublisherId is well-defined */
+    }
 }
 
-UA_StatusCode
-UA_PubSubConnection_regist(UA_Server *server, UA_NodeId *connectionIdentifier) {
-    UA_PubSubConnection *connection =
-        UA_PubSubConnection_findConnectionbyId(server, *connectionIdentifier);
-    if(!connection)
-        return UA_STATUSCODE_BADNOTFOUND;
-
-    if(connection->isRegistered) {
-        UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_SERVER, "Connection already registered");
-        return UA_STATUSCODE_GOOD;
+UA_ConnectionManager *
+getCM(UA_EventLoop *el, UA_String protocol) {
+    for(UA_EventSource *es = el->eventSources; es != NULL; es = es->next) {
+        if(es->eventSourceType != UA_EVENTSOURCETYPE_CONNECTIONMANAGER)
+            continue;
+        UA_ConnectionManager *cm = (UA_ConnectionManager*)es;
+        if(UA_String_equal(&protocol, &cm->protocol))
+            return cm;
     }
-
-    UA_StatusCode retval = connection->channel->regist(connection->channel, NULL, NULL);
-    if(retval != UA_STATUSCODE_GOOD)
-        UA_LOG_WARNING(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                       "register channel failed: 0x%" PRIx32 "!", retval);
-
-    connection->isRegistered = UA_TRUE;
-    return retval;
+    return NULL;
 }
 
-UA_AddPublishedDataSetResult
-UA_Server_addPublishedDataSet(UA_Server *server, const UA_PublishedDataSetConfig *publishedDataSetConfig,
-                              UA_NodeId *pdsIdentifier) {
-    UA_AddPublishedDataSetResult result = {UA_STATUSCODE_BADINVALIDARGUMENT, 0, NULL, {0, 0}};
-    if(!publishedDataSetConfig){
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PublishedDataSet creation failed. No config passed in.");
-        return result;
-    }
-    if(publishedDataSetConfig->publishedDataSetType != UA_PUBSUB_DATASET_PUBLISHEDITEMS){
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PublishedDataSet creation failed. Unsupported PublishedDataSet type.");
-        return result;
-    }
-    //deep copy the given connection config
-    UA_PublishedDataSetConfig tmpPublishedDataSetConfig;
-    memset(&tmpPublishedDataSetConfig, 0, sizeof(UA_PublishedDataSetConfig));
-    if(UA_PublishedDataSetConfig_copy(publishedDataSetConfig, &tmpPublishedDataSetConfig) != UA_STATUSCODE_GOOD){
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PublishedDataSet creation failed. Configuration copy failed.");
-        result.addResult = UA_STATUSCODE_BADINTERNALERROR;
-        return result;
-    }
-    //create new PDS and add to UA_PubSubManager
-    UA_PublishedDataSet *newPubSubDataSetField = (UA_PublishedDataSet *)
-            UA_calloc(1, sizeof(UA_PublishedDataSet));
-    if(!newPubSubDataSetField) {
-        UA_PublishedDataSetConfig_clear(&tmpPublishedDataSetConfig);
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                     "PublishedDataSet creation failed. Out of Memory.");
-        result.addResult = UA_STATUSCODE_BADOUTOFMEMORY;
-        return result;
-    }
-    memset(newPubSubDataSetField, 0, sizeof(UA_PublishedDataSet));
-    TAILQ_INIT(&newPubSubDataSetField->fields);
-    newPubSubDataSetField->config = tmpPublishedDataSetConfig;
-
-    if (server->pubSubManager.publishedDataSetsSize != 0)
-        TAILQ_INSERT_TAIL(&server->pubSubManager.publishedDataSets, newPubSubDataSetField, listEntry);
-    else {
-        TAILQ_INIT(&server->pubSubManager.publishedDataSets);
-        TAILQ_INSERT_HEAD(&server->pubSubManager.publishedDataSets, newPubSubDataSetField, listEntry);
-    }
-    if(tmpPublishedDataSetConfig.publishedDataSetType == UA_PUBSUB_DATASET_PUBLISHEDITEMS_TEMPLATE){
-        //parse template config and add fields (later PubSub batch)
-    }
-    //generate unique nodeId
-    UA_PubSubManager_generateUniqueNodeId(server, &newPubSubDataSetField->identifier);
-    if(pdsIdentifier != NULL){
-        UA_NodeId_copy(&newPubSubDataSetField->identifier, pdsIdentifier);
-    }
-
-    result.addResult = UA_STATUSCODE_GOOD;
-    result.fieldAddResults = NULL;
-    result.fieldAddResultsSize = 0;
-
-    //fill the DataSetMetaData
-    switch(tmpPublishedDataSetConfig.publishedDataSetType){
-        case UA_PUBSUB_DATASET_PUBLISHEDITEMS_TEMPLATE:
-            if(UA_DataSetMetaDataType_copy(&tmpPublishedDataSetConfig.config.itemsTemplate.metaData,
-                    &newPubSubDataSetField->dataSetMetaData) != UA_STATUSCODE_GOOD){
-                UA_Server_removeDataSetField(server, newPubSubDataSetField->identifier);
-                result.addResult = UA_STATUSCODE_BADINTERNALERROR;
-            }
-            break;
-        case UA_PUBSUB_DATASET_PUBLISHEDEVENTS_TEMPLATE:
-            if(UA_DataSetMetaDataType_copy(&tmpPublishedDataSetConfig.config.eventTemplate.metaData,
-                    &newPubSubDataSetField->dataSetMetaData) != UA_STATUSCODE_GOOD){
-                UA_Server_removeDataSetField(server, newPubSubDataSetField->identifier);
-                result.addResult = UA_STATUSCODE_BADINTERNALERROR;
-            }
-            break;
-        case UA_PUBSUB_DATASET_PUBLISHEDEVENTS:
-            newPubSubDataSetField->dataSetMetaData.configurationVersion.majorVersion = UA_PubSubConfigurationVersionTimeDifference();
-            newPubSubDataSetField->dataSetMetaData.configurationVersion.minorVersion = UA_PubSubConfigurationVersionTimeDifference();
-            newPubSubDataSetField->dataSetMetaData.dataSetClassId = UA_GUID_NULL;
-            if(UA_String_copy(&tmpPublishedDataSetConfig.name, &newPubSubDataSetField->dataSetMetaData.name) != UA_STATUSCODE_GOOD){
-                UA_Server_removeDataSetField(server, newPubSubDataSetField->identifier);
-                result.addResult = UA_STATUSCODE_BADINTERNALERROR;
-            }
-            newPubSubDataSetField->dataSetMetaData.description = UA_LOCALIZEDTEXT_ALLOC("", "");
-            break;
-        case UA_PUBSUB_DATASET_PUBLISHEDITEMS:
-            newPubSubDataSetField->dataSetMetaData.configurationVersion.majorVersion = UA_PubSubConfigurationVersionTimeDifference();
-            newPubSubDataSetField->dataSetMetaData.configurationVersion.minorVersion = UA_PubSubConfigurationVersionTimeDifference();
-            if(UA_String_copy(&tmpPublishedDataSetConfig.name, &newPubSubDataSetField->dataSetMetaData.name) != UA_STATUSCODE_GOOD){
-                UA_Server_removeDataSetField(server, newPubSubDataSetField->identifier);
-                result.addResult = UA_STATUSCODE_BADINTERNALERROR;
-            }
-            newPubSubDataSetField->dataSetMetaData.description = UA_LOCALIZEDTEXT_ALLOC("", "");
-            newPubSubDataSetField->dataSetMetaData.dataSetClassId = UA_GUID_NULL;
-            break;
-    }
-
-    server->pubSubManager.publishedDataSetsSize++;
-    result.configurationVersion.majorVersion = UA_PubSubConfigurationVersionTimeDifference();
-    result.configurationVersion.minorVersion = UA_PubSubConfigurationVersionTimeDifference();
-#ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    addPublishedDataItemsRepresentation(server, newPubSubDataSetField);
-#endif
-    return result;
+static enum ZIP_CMP
+cmpReserveId(const void *a, const void *b) {
+    const UA_ReserveId *aa = (const UA_ReserveId*)a;
+    const UA_ReserveId *bb = (const UA_ReserveId*)b;
+    if(aa->id != bb->id)
+        return (aa->id < bb->id) ? ZIP_CMP_LESS : ZIP_CMP_MORE;
+    if(aa->reserveIdType != bb->reserveIdType)
+        return (aa->reserveIdType < bb->reserveIdType) ? ZIP_CMP_LESS : ZIP_CMP_MORE;
+    return (enum ZIP_CMP)UA_order(&aa->transportProfileUri,
+                                  &bb->transportProfileUri, &UA_TYPES[UA_TYPES_STRING]);
 }
 
-UA_StatusCode
-UA_Server_removePublishedDataSet(UA_Server *server, const UA_NodeId pds) {
-    //search the identified PublishedDataSet and store the PDS index
-    UA_PublishedDataSet *publishedDataSet = UA_PublishedDataSet_findPDSbyId(server, pds);
-    if(!publishedDataSet){
-        return UA_STATUSCODE_BADNOTFOUND;
-    }
-    if(publishedDataSet->configurationFrozen){
-        UA_LOG_WARNING(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                       "Remove PublishedDataSet failed. PublishedDataSet is frozen.");
-        return UA_STATUSCODE_BADCONFIGURATIONERROR;
-    }
+ZIP_FUNCTIONS(UA_ReserveIdTree, UA_ReserveId, treeEntry, UA_ReserveId, id, cmpReserveId)
 
-    //search for referenced writers -> delete this writers. (Standard: writer must be connected with PDS)
-    UA_PubSubConnection *tmpConnectoin;
-    TAILQ_FOREACH(tmpConnectoin, &server->pubSubManager.connections, listEntry){
+static UA_ReserveId *
+UA_ReserveId_new(UA_UInt16 id, UA_String transportProfileUri,
+                 UA_ReserveIdType reserveIdType, UA_NodeId sessionId) {
+    UA_ReserveId *reserveId = (UA_ReserveId *)UA_calloc(1, sizeof(UA_ReserveId));
+    if(!reserveId)
+        return NULL;
+    reserveId->id = id;
+    reserveId->reserveIdType = reserveIdType;
+    UA_String_copy(&transportProfileUri, &reserveId->transportProfileUri);
+    reserveId->sessionId = sessionId;
+    return reserveId;
+}
+
+static UA_Boolean
+UA_ReserveId_isFree(UA_PubSubManager *psm, UA_UInt16 id, UA_String transportProfileUri,
+                    UA_ReserveIdType reserveIdType) {
+    /* Is the id already in use? */
+    UA_ReserveId compare;
+    compare.id = id;
+    compare.reserveIdType = reserveIdType;
+    compare.transportProfileUri = transportProfileUri;
+    if(ZIP_FIND(UA_ReserveIdTree, &psm->reserveIds, &compare))
+        return false;
+
+    UA_PubSubConnection *tmpConnection;
+    TAILQ_FOREACH(tmpConnection, &psm->connections, listEntry) {
         UA_WriterGroup *writerGroup;
-        LIST_FOREACH(writerGroup, &tmpConnectoin->writerGroups, listEntry){
-            UA_DataSetWriter *currentWriter, *tmpWriterGroup;
-            LIST_FOREACH_SAFE(currentWriter, &writerGroup->writers, listEntry, tmpWriterGroup){
-                if(UA_NodeId_equal(&currentWriter->connectedDataSet, &publishedDataSet->identifier)){
-                    UA_Server_removeDataSetWriter(server, currentWriter->identifier);
+        LIST_FOREACH(writerGroup, &tmpConnection->writerGroups, listEntry) {
+            if(reserveIdType == UA_WRITER_GROUP) {
+                if(UA_String_equal(&tmpConnection->config.transportProfileUri,
+                                   &transportProfileUri) &&
+                   writerGroup->config.writerGroupId == id)
+                    return false;
+            /* reserveIdType == UA_DATA_SET_WRITER */
+            } else {
+                UA_DataSetWriter *currentWriter;
+                LIST_FOREACH(currentWriter, &writerGroup->writers, listEntry) {
+                    if(UA_String_equal(&tmpConnection->config.transportProfileUri,
+                                       &transportProfileUri) &&
+                       currentWriter->config.dataSetWriterId == id)
+                        return false;
                 }
             }
         }
     }
-#ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    removePublishedDataSetRepresentation(server, publishedDataSet);
-#endif
-    UA_PublishedDataSet_clear(server, publishedDataSet);
-    server->pubSubManager.publishedDataSetsSize--;
+    return true;
+}
 
-    TAILQ_REMOVE(&server->pubSubManager.publishedDataSets, publishedDataSet, listEntry);
-    UA_free(publishedDataSet);
+static UA_UInt16
+UA_ReserveId_createId(UA_PubSubManager *psm,  UA_NodeId sessionId,
+                      UA_String transportProfileUri, UA_ReserveIdType reserveIdType) {
+    /* Total number of possible Ids */
+    UA_UInt16 numberOfIds = 0x8000;
+    /* Contains next possible free Id */
+    static UA_UInt16 next_id_writerGroup = UA_RESERVEID_FIRST_ID;
+    static UA_UInt16 next_id_writer = UA_RESERVEID_FIRST_ID;
+    UA_UInt16 next_id;
+    UA_Boolean is_free = false;
+
+    if(reserveIdType == UA_WRITER_GROUP)
+        next_id = next_id_writerGroup;
+    else
+        next_id = next_id_writer;
+
+    for(;numberOfIds > 0;numberOfIds--) {
+        if(next_id < UA_RESERVEID_FIRST_ID)
+            next_id = UA_RESERVEID_FIRST_ID;
+        is_free = UA_ReserveId_isFree(psm, next_id, transportProfileUri, reserveIdType);
+        if(is_free)
+            break;
+        next_id++;
+    }
+    if(!is_free) {
+        UA_LOG_ERROR(psm->logging, UA_LOGCATEGORY_PUBSUB,
+                     "PubSub ReserveId creation failed. No free ID could be found.");
+        return 0;
+    }
+
+    if(reserveIdType == UA_WRITER_GROUP)
+        next_id_writerGroup = (UA_UInt16)(next_id + 1);
+    else
+        next_id_writer = (UA_UInt16)(next_id + 1);
+
+    UA_ReserveId *reserveId =
+        UA_ReserveId_new(next_id, transportProfileUri, reserveIdType, sessionId);
+    if(!reserveId)
+        return 0;
+
+    ZIP_INSERT(UA_ReserveIdTree, &psm->reserveIds, reserveId);
+    psm->reserveIdsSize++;
+    return next_id;
+}
+
+static void *
+removeReserveId(void *context, UA_ReserveId *elem) {
+    UA_String_clear(&elem->transportProfileUri);
+    UA_free(elem);
+    return NULL;
+}
+
+struct RemoveInactiveReserveIdContext {
+    UA_PubSubManager *psm;
+    UA_ReserveIdTree newTree;
+};
+
+/* Remove ReserveIds that are not attached to any session */
+static void *
+removeInactiveReserveId(void *context, UA_ReserveId *elem) {
+    struct RemoveInactiveReserveIdContext *ctx =
+        (struct RemoveInactiveReserveIdContext*)context;
+
+    if(UA_NodeId_equal(&ctx->psm->drv.server->adminSession.sessionId, &elem->sessionId))
+        goto still_active;
+
+    session_list_entry *session;
+    LIST_FOREACH(session, &ctx->psm->drv.server->sessions, pointers) {
+        if(UA_NodeId_equal(&session->session.sessionId, &elem->sessionId))
+            goto still_active;
+    }
+
+    ctx->psm->reserveIdsSize--;
+    UA_String_clear(&elem->transportProfileUri);
+    UA_free(elem);
+    return NULL;
+
+ still_active:
+    ZIP_INSERT(UA_ReserveIdTree, &ctx->newTree, elem);
+    return NULL;
+}
+
+void
+UA_PubSubManager_freeIds(UA_PubSubManager *psm) {
+    struct RemoveInactiveReserveIdContext removeCtx;
+    removeCtx.psm = psm;
+    removeCtx.newTree.root = NULL;
+    ZIP_ITER(UA_ReserveIdTree, &psm->reserveIds,
+             removeInactiveReserveId, &removeCtx);
+    psm->reserveIds = removeCtx.newTree;
+}
+
+UA_StatusCode
+UA_PubSubManager_reserveIds(UA_PubSubManager *psm, UA_NodeId sessionId, UA_UInt16 numRegWriterGroupIds,
+                            UA_UInt16 numRegDataSetWriterIds, UA_String transportProfileUri,
+                            UA_UInt16 **writerGroupIds, UA_UInt16 **dataSetWriterIds) {
+    UA_PubSubManager_freeIds(psm);
+
+    /* Check the validation of the transportProfileUri */
+    UA_String profile_1 = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-mqtt-uadp");
+    UA_String profile_2 = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-mqtt-json");
+    UA_String profile_3 = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+    if(!UA_String_equal(&transportProfileUri, &profile_1) &&
+       !UA_String_equal(&transportProfileUri, &profile_2) &&
+       !UA_String_equal(&transportProfileUri, &profile_3)) {
+        UA_LOG_ERROR(psm->logging, UA_LOGCATEGORY_PUBSUB,
+                     "PubSub ReserveId creation failed. No valid transport profile uri.");
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    }
+    *writerGroupIds = (UA_UInt16*)UA_Array_new(numRegWriterGroupIds, &UA_TYPES[UA_TYPES_UINT16]);
+    *dataSetWriterIds = (UA_UInt16*)UA_Array_new(numRegDataSetWriterIds, &UA_TYPES[UA_TYPES_UINT16]);
+
+    for(int i = 0; i < numRegWriterGroupIds; i++) {
+        (*writerGroupIds)[i] =
+            UA_ReserveId_createId(psm, sessionId, transportProfileUri, UA_WRITER_GROUP);
+    }
+    for(int i = 0; i < numRegDataSetWriterIds; i++) {
+        (*dataSetWriterIds)[i] =
+            UA_ReserveId_createId(psm, sessionId, transportProfileUri, UA_DATA_SET_WRITER);
+    }
     return UA_STATUSCODE_GOOD;
 }
 
 /* Calculate the time difference between current time and UTC (00:00) on January
  * 1, 2000. */
 UA_UInt32
-UA_PubSubConfigurationVersionTimeDifference() {
-    UA_UInt32 timeDiffSince2000 = (UA_UInt32) (UA_DateTime_now() - UA_DATETIMESTAMP_2000);
+UA_PubSubConfigurationVersionTimeDifference(UA_DateTime now) {
+    UA_UInt32 timeDiffSince2000 = (UA_UInt32)(now - UA_DATETIMESTAMP_2000);
     return timeDiffSince2000;
+}
+
+UA_StatusCode
+UA_PubSubSecurityPolicy_validate(const UA_PubSubSecurityPolicy *policy,
+                                 UA_MessageSecurityMode securityMode) {
+    if(securityMode != UA_MESSAGESECURITYMODE_SIGN &&
+       securityMode != UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
+        return UA_STATUSCODE_GOOD;
+
+    if(!policy || !policy->newGroupContext || !policy->deleteGroupContext ||
+       !policy->verify || !policy->sign || !policy->getSignatureSize ||
+       !policy->getSignatureKeyLength || !policy->getEncryptionKeyLength ||
+       !policy->setSecurityKeys ||
+       !policy->generateNonce || !policy->clear ||
+       policy->keyMaterialLength == 0)
+        return UA_STATUSCODE_BADSECURITYPOLICYREJECTED;
+
+    if(securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT) {
+        size_t nonceLength = policy->messageNonceLength;
+        if(!policy->encrypt || !policy->decrypt || !policy->setMessageNonce ||
+           nonceLength < sizeof(UA_UInt32) ||
+           nonceLength > UA_NETWORKMESSAGE_MAX_NONCE_LENGTH)
+            return UA_STATUSCODE_BADSECURITYPOLICYREJECTED;
+    }
+
+    return UA_STATUSCODE_GOOD;
 }
 
 /* Generate a new unique NodeId. This NodeId will be used for the information
  * model representation of PubSub entities. */
+#ifndef UA_ENABLE_PUBSUB_INFORMATIONMODEL
 void
-UA_PubSubManager_generateUniqueNodeId(UA_Server *server, UA_NodeId *nodeId) {
-    UA_NodeId newNodeId = UA_NODEID_NUMERIC(0, 0);
-    UA_Node *newNode = UA_NODESTORE_NEW(server, UA_NODECLASS_OBJECT);
-    UA_NODESTORE_INSERT(server, newNode, &newNodeId);
-    UA_NodeId_copy(&newNodeId, nodeId);
+UA_PubSubManager_generateUniqueNodeId(UA_PubSubManager *psm, UA_NodeId *nodeId) {
+    *nodeId = UA_NODEID_NUMERIC(1, ++psm->uniqueIdCount);
 }
+#endif
 
-/* Delete the current PubSub configuration including all nested members. This
- * action also delete the configured PubSub transport Layers. */
-void
-UA_PubSubManager_delete(UA_Server *server, UA_PubSubManager *pubSubManager) {
-    UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_SERVER, "PubSub cleanup was called.");
-
-    /* Stop and unfreeze all WriterGroups */
-    UA_PubSubConnection *tmpConnection;
-    TAILQ_FOREACH(tmpConnection, &server->pubSubManager.connections, listEntry){
-        for(size_t i = 0; i < pubSubManager->connectionsSize; i++) {
-            UA_WriterGroup *writerGroup;
-            LIST_FOREACH(writerGroup, &tmpConnection->writerGroups, listEntry) {
-                UA_WriterGroup_setPubSubState(server, UA_PUBSUBSTATE_DISABLED, writerGroup);
-                UA_Server_unfreezeWriterGroupConfiguration(server, writerGroup->identifier);
-            }
-        }
-    }
-
-    //free the currently configured transport layers
-    if(server->config.pubSubConfig.transportLayersSize > 0) {
-        UA_free(server->config.pubSubConfig.transportLayers);
-        server->config.pubSubConfig.transportLayersSize = 0;
-    }
-
-    //remove Connections and WriterGroups
-    UA_PubSubConnection *tmpConnection1, *tmpConnection2;
-    TAILQ_FOREACH_SAFE(tmpConnection1, &server->pubSubManager.connections, listEntry, tmpConnection2){
-        UA_Server_removePubSubConnection(server, tmpConnection1->identifier);
-    }
-    UA_PublishedDataSet *tmpPDS1, *tmpPDS2;
-    TAILQ_FOREACH_SAFE(tmpPDS1, &server->pubSubManager.publishedDataSets, listEntry, tmpPDS2){
-        UA_Server_removePublishedDataSet(server, tmpPDS1->identifier);
+UA_Guid
+UA_PubSubManager_generateUniqueGuid(UA_PubSubManager *psm) {
+    while(true) {
+        UA_NodeId testId = UA_NODEID_GUID(1, UA_Guid_random());
+        const UA_Node *testNode = UA_NODESTORE_GET(psm->drv.server, &testId);
+        if(!testNode)
+            return testId.identifier.guid;
+        UA_NODESTORE_RELEASE(psm->drv.server, testNode);
     }
 }
 
-/***********************************/
-/*      PubSub Jobs abstraction    */
-/***********************************/
+static UA_UInt64
+generateRandomUInt64(void) {
+    UA_UInt64 id = 0;
+    UA_Guid ident = UA_Guid_random();
 
-/* Default Timer based PubSub Callbacks */
-
-UA_StatusCode
-UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callback,
-                                     void *data, UA_Double interval_ms, UA_DateTime *baseTime,
-                                     UA_TimerPolicy timerPolicy, UA_UInt64 *callbackId) {
-    return UA_Timer_addRepeatedCallback(&server->timer, (UA_ApplicationCallback)callback,
-                                        server, data, interval_ms, baseTime, timerPolicy, callbackId);
+    id = id + ident.data1;
+    id = (id << 32) + ident.data2;
+    id = (id << 16) + ident.data3;
+    return id;
 }
 
 UA_StatusCode
-UA_PubSubManager_changeRepeatedCallback(UA_Server *server, UA_UInt64 callbackId,
-                                        UA_Double interval_ms, UA_DateTime *baseTime,
-                                        UA_TimerPolicy timerPolicy) {
-    return UA_Timer_changeRepeatedCallback(&server->timer, callbackId, interval_ms, baseTime, timerPolicy);
+UA_Server_enableAllPubSubComponents(UA_Server *server) {
+    lockServer(server);
+    UA_PubSubManager *psm = getPSM(server);
+    if(!psm) {
+        unlockServer(server);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    /* Start the PubSubManager only if the server is running. Before startup the
+     * EventLoop and its ConnectionManagers are not started, so the components
+     * go to PAUSED here and to OPERATIONAL when the server startup starts the
+     * PubSubManager. Starting it here would make the connections open their
+     * transport on a ConnectionManager that is not started. */
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    if(server->state == UA_LIFECYCLESTATE_STARTED) {
+        res = UA_PubSubManager_start(&psm->drv);
+        if(res != UA_STATUSCODE_GOOD) {
+            unlockServer(server);
+            return res;
+        }
+    }
+
+    /* Enable children before their parent groups and connections. Their state
+     * machines wait for the parent to become operational. */
+    UA_PubSubConnection *c;
+    TAILQ_FOREACH(c, &psm->connections, listEntry) {
+        UA_WriterGroup *wg;
+        LIST_FOREACH(wg, &c->writerGroups, listEntry) {
+            UA_DataSetWriter *dsw;
+            LIST_FOREACH(dsw, &wg->writers, listEntry) {
+                res |= UA_DataSetWriter_setPubSubState(psm, dsw, UA_PUBSUBSTATE_OPERATIONAL);
+            }
+            res |= UA_WriterGroup_setPubSubState(psm, wg, UA_PUBSUBSTATE_OPERATIONAL);
+        }
+
+        UA_ReaderGroup *rg;
+        LIST_FOREACH(rg, &c->readerGroups, listEntry) {
+            UA_DataSetReader *dsr;
+            LIST_FOREACH(dsr, &rg->readers, listEntry) {
+                UA_DataSetReader_setPubSubState(psm, dsr, UA_PUBSUBSTATE_OPERATIONAL,
+                                                UA_STATUSCODE_GOOD);
+            }
+            res |= UA_ReaderGroup_setPubSubState(psm, rg, UA_PUBSUBSTATE_OPERATIONAL);
+        }
+
+        res |= UA_PubSubConnection_setPubSubState(psm, c, UA_PUBSUBSTATE_OPERATIONAL);
+    }
+
+    unlockServer(server);
+    return res;
+}
+
+static void
+disableAllPubSubComponents(UA_PubSubManager *psm) {
+    /* Disable readers and writers before shutting down their groups and
+     * connections so target updates and publish timers stop first. */
+    UA_PubSubConnection *c;
+    TAILQ_FOREACH(c, &psm->connections, listEntry) {
+        UA_ReaderGroup *rg;
+        LIST_FOREACH(rg, &c->readerGroups, listEntry) {
+            UA_DataSetReader *dsr;
+            LIST_FOREACH(dsr, &rg->readers, listEntry) {
+                UA_DataSetReader_setPubSubState(psm, dsr, UA_PUBSUBSTATE_DISABLED,
+                                                UA_STATUSCODE_BADSHUTDOWN);
+            }
+            UA_ReaderGroup_setPubSubState(psm, rg, UA_PUBSUBSTATE_DISABLED);
+        }
+
+        UA_WriterGroup *wg;
+        LIST_FOREACH(wg, &c->writerGroups, listEntry) {
+            UA_DataSetWriter *dsw;
+            LIST_FOREACH(dsw, &wg->writers, listEntry) {
+                UA_DataSetWriter_setPubSubState(psm, dsw, UA_PUBSUBSTATE_DISABLED);
+            }
+            UA_WriterGroup_setPubSubState(psm, wg, UA_PUBSUBSTATE_DISABLED);
+        }
+
+        UA_PubSubConnection_setPubSubState(psm, c, UA_PUBSUBSTATE_DISABLED);
+    }
 }
 
 void
-UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callbackId) {
-    UA_Timer_removeCallback(&server->timer, callbackId);
+UA_Server_disableAllPubSubComponents(UA_Server *server) {
+    lockServer(server);
+    UA_PubSubManager *psm = getPSM(server);
+    if(psm)
+        UA_PubSubManager_stop(&psm->drv); /* Calls disableAll internally */
+    unlockServer(server);
 }
 
-
-#ifdef UA_ENABLE_PUBSUB_MONITORING
-
 static UA_StatusCode
-UA_PubSubComponent_createMonitoring(UA_Server *server, UA_NodeId Id, UA_PubSubComponentEnumType eComponentType, 
-                                    UA_PubSubMonitoringType eMonitoringType, void *data, UA_ServerCallback callback) {
-    
-    if ((!server) || (!data)) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "Error UA_PubSubComponent_createMonitoring(): "
-            "null pointer param");
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-    UA_StatusCode ret = UA_STATUSCODE_GOOD;
-    switch (eComponentType) {
-        case UA_PUBSUB_COMPONENT_DATASETREADER: {
-            UA_DataSetReader *reader = (UA_DataSetReader*) data;
-            switch (eMonitoringType) {
-                case UA_PUBSUB_MONITORING_MESSAGE_RECEIVE_TIMEOUT:
-                    UA_LOG_DEBUG(&server->config.logger, UA_LOGCATEGORY_SERVER, "UA_PubSubComponent_createMonitoring(): DataSetReader '%.*s' "
-                        "- MessageReceiveTimeout", (UA_Int32) reader->config.name.length, reader->config.name.data);
-                    reader->msgRcvTimeoutTimerCallback = callback;
-                    break;
-                default:
-                    UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "UA_PubSubComponent_createMonitoring(): DataSetReader '%.*s' "
-                        "DataSetReader does not support timeout type '%i'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                        eMonitoringType);
-                    ret = UA_STATUSCODE_BADNOTSUPPORTED;
-                    break;
-            }
-            break;
+getPubSubComponentType(UA_PubSubManager *psm, UA_NodeId componentId,
+                       UA_PubSubComponentType *outType) {
+    /* Walk the connection hierarchy and return the type of the matching
+     * connection, group, reader or writer. */
+    UA_PubSubConnection *c;
+    TAILQ_FOREACH(c, &psm->connections, listEntry) {
+        if(UA_NodeId_equal(&componentId, &c->head.identifier)) {
+            *outType = c->head.componentType;
+            return UA_STATUSCODE_GOOD;
         }
-        default:
-            UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                "Error UA_PubSubComponent_createMonitoring(): PubSub component type '%i' is not supported", eComponentType);
-            ret = UA_STATUSCODE_BADNOTSUPPORTED;
-            break;
-    }
-    return ret;
-}
 
-static UA_StatusCode
-UA_PubSubComponent_startMonitoring(UA_Server *server, UA_NodeId Id, UA_PubSubComponentEnumType eComponentType, 
-                                   UA_PubSubMonitoringType eMonitoringType, void *data) {
+        UA_WriterGroup *wg;
+        LIST_FOREACH(wg, &c->writerGroups, listEntry) {
+            if(UA_NodeId_equal(&componentId, &wg->head.identifier)) {
+                *outType = wg->head.componentType;
+                return UA_STATUSCODE_GOOD;
+            }
 
-    if ((!server) || (!data)) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "Error UA_PubSubComponent_startMonitoring(): "
-            "null pointer param");
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-
-    UA_StatusCode ret = UA_STATUSCODE_GOOD;
-    switch (eComponentType) {
-        case UA_PUBSUB_COMPONENT_DATASETREADER: {
-            UA_DataSetReader *reader = (UA_DataSetReader*) data;
-            switch (eMonitoringType) {
-                case UA_PUBSUB_MONITORING_MESSAGE_RECEIVE_TIMEOUT: {
-                    /* use a timed callback, because one notification is enough, 
-                    we assume that MessageReceiveTimeout configuration is in [ms], we do not handle or check fractions */
-                    UA_UInt64 interval = (UA_UInt64)(reader->config.messageReceiveTimeout * UA_DATETIME_MSEC);
-                    ret = UA_Timer_addTimedCallback(&server->timer, (UA_ApplicationCallback) reader->msgRcvTimeoutTimerCallback, 
-                        server, reader, UA_DateTime_nowMonotonic() + (UA_DateTime) interval, &(reader->msgRcvTimeoutTimerId));
-                    if (ret == UA_STATUSCODE_GOOD) {
-                        UA_LOG_DEBUG(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                            "UA_PubSubComponent_startMonitoring(): DataSetReader '%.*s'- MessageReceiveTimeout: MessageReceiveTimeout = '%f' "
-                            "Timer Id = '%u'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                                reader->config.messageReceiveTimeout, (UA_UInt32) reader->msgRcvTimeoutTimerId);
-                    } else {
-                        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                            "Error UA_PubSubComponent_startMonitoring(): DataSetReader '%.*s' - MessageReceiveTimeout: start timer failed", 
-                                (UA_Int32) reader->config.name.length, reader->config.name.data);
-                    }
-                    break;
+            UA_DataSetWriter *dsw;
+            LIST_FOREACH(dsw, &wg->writers, listEntry) {
+                if(UA_NodeId_equal(&componentId, &dsw->head.identifier)) {
+                    *outType = dsw->head.componentType;
+                    return UA_STATUSCODE_GOOD;
                 }
-                default:
-                    UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "UA_PubSubComponent_startMonitoring(): DataSetReader '%.*s' "
-                        "DataSetReader does not support timeout type '%i'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                            eMonitoringType);
-                    ret = UA_STATUSCODE_BADNOTSUPPORTED;
-                    break;
             }
-            break;
         }
-        default:
-            UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                "Error UA_PubSubComponent_startMonitoring(): PubSub component type '%i' is not supported", eComponentType);
-            ret = UA_STATUSCODE_BADNOTSUPPORTED;
-            break;
-    }
-    return ret;
-}
 
-static UA_StatusCode
-UA_PubSubComponent_stopMonitoring(UA_Server *server, UA_NodeId Id, UA_PubSubComponentEnumType eComponentType, 
-                                  UA_PubSubMonitoringType eMonitoringType, void *data) {
+        UA_ReaderGroup *rg;
+        LIST_FOREACH(rg, &c->readerGroups, listEntry) {
+            if(UA_NodeId_equal(&componentId, &rg->head.identifier)) {
+                *outType = rg->head.componentType;
+                return UA_STATUSCODE_GOOD;
+            }
 
-    if ((!server) || (!data)) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "Error UA_PubSubComponent_stopMonitoring(): "
-            "null pointer param");
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-
-    UA_StatusCode ret = UA_STATUSCODE_GOOD;
-    switch (eComponentType) {
-        case UA_PUBSUB_COMPONENT_DATASETREADER: {
-            UA_DataSetReader *reader = (UA_DataSetReader*) data;
-            switch (eMonitoringType) {
-                case UA_PUBSUB_MONITORING_MESSAGE_RECEIVE_TIMEOUT: {
-                    UA_Timer_removeCallback(&server->timer, reader->msgRcvTimeoutTimerId);
-                    UA_LOG_DEBUG(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                        "UA_PubSubComponent_stopMonitoring(): DataSetReader '%.*s' - MessageReceiveTimeout: MessageReceiveTimeout = '%f' "
-                            "Timer Id = '%u'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                                reader->config.messageReceiveTimeout, (UA_UInt32) reader->msgRcvTimeoutTimerId);
-                    break;
+            UA_DataSetReader *dsr;
+            LIST_FOREACH(dsr, &rg->readers, listEntry) {
+                if(UA_NodeId_equal(&componentId, &dsr->head.identifier)) {
+                    *outType = dsr->head.componentType;
+                    return UA_STATUSCODE_GOOD;
                 }
-                default:
-                    UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "UA_PubSubComponent_stopMonitoring(): DataSetReader '%.*s' "
-                        "DataSetReader does not support timeout type '%i'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                        eMonitoringType);
-                    ret = UA_STATUSCODE_BADNOTSUPPORTED;
-                    break;
             }
-            break;
         }
-        default:
-            UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                "Error UA_PubSubComponent_stopMonitoring(): PubSub component type '%i' is not supported", eComponentType);
-            ret = UA_STATUSCODE_BADNOTSUPPORTED;
-            break;
     }
-    return ret;
-}
 
-static UA_StatusCode
-UA_PubSubComponent_updateMonitoringInterval(UA_Server *server, UA_NodeId Id, UA_PubSubComponentEnumType eComponentType, 
-                                            UA_PubSubMonitoringType eMonitoringType, void *data)
-{
-    if ((!server) || (!data)) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "Error UA_PubSubComponent_updateMonitoringInterval(): "
-            "null pointer param");
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-    UA_StatusCode ret = UA_STATUSCODE_GOOD;
-    switch (eComponentType) {
-        case UA_PUBSUB_COMPONENT_DATASETREADER: {
-            UA_DataSetReader *reader = (UA_DataSetReader*) data;
-            switch (eMonitoringType) {
-                case UA_PUBSUB_MONITORING_MESSAGE_RECEIVE_TIMEOUT: {
-                    ret = UA_Timer_changeRepeatedCallback(&server->timer, reader->msgRcvTimeoutTimerId,
-                                                          reader->config.messageReceiveTimeout, NULL,
-                                                          UA_TIMER_HANDLE_CYCLEMISS_WITH_CURRENTTIME);
-                    if (ret == UA_STATUSCODE_GOOD) {
-                        UA_LOG_DEBUG(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                            "UA_PubSubComponent_updateMonitoringInterval(): DataSetReader '%.*s' - MessageReceiveTimeout: new MessageReceiveTimeout = '%f' "
-                            "Timer Id = '%u'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                                reader->config.messageReceiveTimeout, (UA_UInt32) reader->msgRcvTimeoutTimerId);
-                    } else {
-                        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                            "Error UA_PubSubComponent_updateMonitoringInterval(): DataSetReader '%.*s': update timer interval failed", 
-                                (UA_Int32) reader->config.name.length, reader->config.name.data);
-                    }
-                    break;
-                }
-                default:
-                    UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "UA_PubSubComponent_createMonitoring(): DataSetReader '%.*s' "
-                        "DataSetReader does not support timeout type '%i'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                        eMonitoringType);
-                    ret = UA_STATUSCODE_BADNOTSUPPORTED;
-                    break;
-            }
-            break;
-        }
-        default:
-            UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                "Error UA_PubSubComponent_updateMonitoringInterval(): PubSub component type '%i' is not supported", eComponentType);
-            ret = UA_STATUSCODE_BADNOTSUPPORTED;
-            break;
-    }
-    return ret;
-}
-
-static UA_StatusCode
-UA_PubSubComponent_deleteMonitoring(UA_Server *server, UA_NodeId Id, UA_PubSubComponentEnumType eComponentType, 
-                                    UA_PubSubMonitoringType eMonitoringType, void *data) {
-
-    if ((!server) || (!data)) {
-        UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "Error UA_PubSubComponent_deleteMonitoring(): "
-            "null pointer param");
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-    UA_StatusCode ret = UA_STATUSCODE_GOOD;
-    switch (eComponentType) {
-        case UA_PUBSUB_COMPONENT_DATASETREADER: {
-            UA_DataSetReader *reader = (UA_DataSetReader*) data;
-            switch (eMonitoringType) {
-                case UA_PUBSUB_MONITORING_MESSAGE_RECEIVE_TIMEOUT:
-                    UA_LOG_DEBUG(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                        "UA_PubSubComponent_deleteMonitoring(): DataSetReader '%.*s' - MessageReceiveTimeout: Timer Id = '%u'", 
-                        (UA_Int32) reader->config.name.length, reader->config.name.data, (UA_UInt32) reader->msgRcvTimeoutTimerId);
-                    break;
-                default:
-                    UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER, "UA_PubSubComponent_deleteMonitoring(): DataSetReader '%.*s' "
-                        "DataSetReader does not support timeout type '%i'", (UA_Int32) reader->config.name.length, reader->config.name.data, 
-                        eMonitoringType);
-                    ret = UA_STATUSCODE_BADNOTSUPPORTED;
-                    break;
-            }
-            break;
-        }
-        default:
-            UA_LOG_ERROR(&server->config.logger, UA_LOGCATEGORY_SERVER,
-                "Error UA_PubSubComponent_deleteMonitoring(): PubSub component type '%i' is not supported", eComponentType);
-            ret = UA_STATUSCODE_BADNOTSUPPORTED;
-            break;
-    }
-    return ret;
+    return UA_STATUSCODE_BADNOTFOUND;
 }
 
 UA_StatusCode
-UA_PubSubManager_setDefaultMonitoringCallbacks(UA_PubSubMonitoringInterface *monitoringInterface) {
-    if (monitoringInterface == NULL) {
+UA_Server_getPubSubComponentType(UA_Server *server, UA_NodeId componentId,
+                                 UA_PubSubComponentType *outType) {
+    if(!outType)
         return UA_STATUSCODE_BADINVALIDARGUMENT;
+    lockServer(server);
+    UA_PubSubManager *psm = getPSM(server);
+    UA_StatusCode res = (psm) ?
+        getPubSubComponentType(psm, componentId, outType) : UA_STATUSCODE_BADINTERNALERROR;
+    unlockServer(server);
+    return res;
+}
+
+static UA_StatusCode
+getPubSubComponentParent(UA_PubSubManager *psm, UA_NodeId componentId,
+                         UA_NodeId *outParent) {
+    /* Resolve the parent from the containing list. Connections have no parent
+     * within this component hierarchy. */
+    UA_PubSubConnection *c;
+    TAILQ_FOREACH(c, &psm->connections, listEntry) {
+        if(UA_NodeId_equal(&componentId, &c->head.identifier))
+            return UA_STATUSCODE_BADNOTSUPPORTED;
+
+        UA_WriterGroup *wg;
+        LIST_FOREACH(wg, &c->writerGroups, listEntry) {
+            if(UA_NodeId_equal(&componentId, &wg->head.identifier))
+                return UA_NodeId_copy(&c->head.identifier, outParent);
+
+            UA_DataSetWriter *dsw;
+            LIST_FOREACH(dsw, &wg->writers, listEntry) {
+                if(UA_NodeId_equal(&componentId, &dsw->head.identifier))
+                    return UA_NodeId_copy(&wg->head.identifier, outParent);
+            }
+        }
+
+        UA_ReaderGroup *rg;
+        LIST_FOREACH(rg, &c->readerGroups, listEntry) {
+            if(UA_NodeId_equal(&componentId, &rg->head.identifier))
+                return UA_NodeId_copy(&c->head.identifier, outParent);
+
+            UA_DataSetReader *dsr;
+            LIST_FOREACH(dsr, &rg->readers, listEntry) {
+                if(UA_NodeId_equal(&componentId, &dsr->head.identifier))
+                    return UA_NodeId_copy(&rg->head.identifier, outParent);
+            }
+        }
     }
-    monitoringInterface->createMonitoring = UA_PubSubComponent_createMonitoring;
-    monitoringInterface->startMonitoring = UA_PubSubComponent_startMonitoring;
-    monitoringInterface->stopMonitoring = UA_PubSubComponent_stopMonitoring;
-    monitoringInterface->updateMonitoringInterval = UA_PubSubComponent_updateMonitoringInterval;
-    monitoringInterface->deleteMonitoring = UA_PubSubComponent_deleteMonitoring;
+
+    return UA_STATUSCODE_BADNOTFOUND;
+}
+
+UA_StatusCode
+UA_Server_getPubSubComponentParent(UA_Server *server, UA_NodeId componentId,
+                                   UA_NodeId *outParent) {
+    if(!outParent)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    lockServer(server);
+    UA_PubSubManager *psm = getPSM(server);
+    UA_StatusCode res = (psm) ?
+        getPubSubComponentParent(psm, componentId, outParent) : UA_STATUSCODE_BADINTERNALERROR;
+    unlockServer(server);
+    return res;
+}
+
+static UA_StatusCode
+getPubSubComponentChildren(UA_PubSubManager *psm, UA_NodeId componentId,
+                           size_t *outChildrenSize, UA_NodeId **outChildren) {
+    UA_WriterGroup *wg;
+    UA_ReaderGroup *rg;
+    UA_DataSetWriter *dsw;
+    UA_DataSetReader *dsr;
+    UA_PubSubConnection *c;
+
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    TAILQ_FOREACH(c, &psm->connections, listEntry) {
+        if(UA_NodeId_equal(&componentId, &c->head.identifier)) {
+            /* Count the children */
+            size_t children = 0;
+            LIST_FOREACH(wg, &c->writerGroups, listEntry)
+                children++;
+            LIST_FOREACH(rg, &c->readerGroups, listEntry)
+                children++;
+
+            /* Empty array? */
+            if(children == 0) {
+                *outChildren = NULL;
+                *outChildrenSize = 0;
+                return UA_STATUSCODE_GOOD;
+            }
+
+            /* Allocate the array */
+            *outChildren = (UA_NodeId*)UA_calloc(children, sizeof(UA_NodeId));
+            if(!*outChildren)
+                return UA_STATUSCODE_BADOUTOFMEMORY;
+            *outChildrenSize = children;
+
+            /* Copy the NodeIds */
+            size_t pos = 0;
+            LIST_FOREACH(wg, &c->writerGroups, listEntry) {
+                res |= UA_NodeId_copy(&wg->head.identifier, (*outChildren) + pos);
+                pos++;
+            }
+            LIST_FOREACH(rg, &c->readerGroups, listEntry) {
+                res |= UA_NodeId_copy(&rg->head.identifier, (*outChildren) + pos);
+                pos++;
+            }
+            goto out;
+        }
+
+        LIST_FOREACH(wg, &c->writerGroups, listEntry) {
+            if(UA_NodeId_equal(&componentId, &wg->head.identifier)) {
+                /* Count the children */
+                size_t children = 0;
+                LIST_FOREACH(dsw, &wg->writers, listEntry)
+                    children++;
+
+                /* Empty array? */
+                if(children == 0) {
+                    *outChildren = NULL;
+                    *outChildrenSize = 0;
+                    return UA_STATUSCODE_GOOD;
+                }
+
+                /* Allocate the array */
+                *outChildren = (UA_NodeId*)UA_calloc(children, sizeof(UA_NodeId));
+                if(!*outChildren)
+                    return UA_STATUSCODE_BADOUTOFMEMORY;
+                *outChildrenSize = children;
+
+                /* Copy the NodeIds */
+                size_t pos = 0;
+                LIST_FOREACH(dsw, &wg->writers, listEntry) {
+                    res |= UA_NodeId_copy(&dsw->head.identifier, (*outChildren) + pos);
+                    pos++;
+                }
+                goto out;
+            }
+
+            /* DataSetWriter have no children (with a state machine) */
+            LIST_FOREACH(dsw, &wg->writers, listEntry) {
+                if(UA_NodeId_equal(&componentId, &dsw->head.identifier))
+                    return UA_STATUSCODE_BADNOTSUPPORTED;
+            }
+        }
+
+        LIST_FOREACH(rg, &c->readerGroups, listEntry) {
+            if(UA_NodeId_equal(&componentId, &rg->head.identifier)) {
+                /* Count the children */
+                size_t children = 0;
+                LIST_FOREACH(dsr, &rg->readers, listEntry)
+                    children++;
+
+                /* Empty array? */
+                if(children == 0) {
+                    *outChildren = NULL;
+                    *outChildrenSize = 0;
+                    return UA_STATUSCODE_GOOD;
+                }
+
+                /* Allocate the array */
+                *outChildren = (UA_NodeId*)UA_calloc(children, sizeof(UA_NodeId));
+                if(!*outChildren)
+                    return UA_STATUSCODE_BADOUTOFMEMORY;
+                *outChildrenSize = children;
+
+                /* Copy the NodeIds */
+                size_t pos = 0;
+                LIST_FOREACH(dsr, &rg->readers, listEntry) {
+                    res |= UA_NodeId_copy(&dsr->head.identifier, (*outChildren) + pos);
+                    pos++;
+                }
+                goto out;
+            }
+
+            /* DataSetReader have no children (with a state machine) */
+            LIST_FOREACH(dsr, &rg->readers, listEntry) {
+                if(UA_NodeId_equal(&componentId, &dsr->head.identifier))
+                    return UA_STATUSCODE_BADNOTSUPPORTED;
+            }
+        }
+    }
+
+    return UA_STATUSCODE_BADNOTFOUND;
+
+ out:
+    if(res != UA_STATUSCODE_GOOD)
+        UA_Array_delete(*outChildren, *outChildrenSize, &UA_TYPES[UA_TYPES_NODEID]);
+    return res;
+}
+
+UA_StatusCode
+UA_Server_getPubSubComponentChildren(UA_Server *server, UA_NodeId componentId,
+                                     size_t *outChildrenSize, UA_NodeId **outChildren) {
+    if(!outChildrenSize || !outChildren)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    lockServer(server);
+    UA_PubSubManager *psm = getPSM(server);
+    UA_StatusCode res = (psm) ?
+        getPubSubComponentChildren(psm, componentId,
+                                   outChildrenSize, outChildren) : UA_STATUSCODE_BADINTERNALERROR;
+    unlockServer(server);
+    return res;
+}
+
+void
+UA_PubSubManager_setState(UA_PubSubManager *psm, UA_LifecycleState state) {
+    if(state == UA_LIFECYCLESTATE_STOPPED)
+        state = UA_LIFECYCLESTATE_STOPPING;
+
+    /* Check if all connections are closed if we are started */
+    if(state == UA_LIFECYCLESTATE_STOPPING) {
+        UA_PubSubConnection *c;
+        TAILQ_FOREACH(c, &psm->connections, listEntry) {
+            if(c->sendChannel != 0 || c->recvChannelsSize > 0)
+                goto set_state;
+
+            UA_WriterGroup *wg;
+            LIST_FOREACH(wg, &c->writerGroups, listEntry) {
+                if(wg->sendChannel > 0)
+                    goto set_state;
+            }
+
+            UA_ReaderGroup *rg;
+            LIST_FOREACH(rg, &c->readerGroups, listEntry) {
+                if(rg->recvChannelsSize > 0)
+                    goto set_state;
+            }
+        }
+
+        /* No open connections -> stopped */
+        state = UA_LIFECYCLESTATE_STOPPED;
+    }
+
+ set_state:
+    if(state == psm->drv.state)
+        return;
+    psm->drv.state = state;
+
+    /* When we just started, trigger all connections to go from PAUSED to
+     * OPERATIONAL */
+    if(state == UA_LIFECYCLESTATE_STARTED) {
+        UA_PubSubConnection *c;
+        TAILQ_FOREACH(c, &psm->connections, listEntry) {
+            if (psm->pubSubInitialSetupMode) {
+                UA_PubSubConnection_setPubSubState(psm, c, UA_PUBSUBSTATE_OPERATIONAL);
+            } else {
+                UA_PubSubConnection_setPubSubState(psm, c, c->head.state);
+            }
+        }
+    }
+}
+
+UA_PubSubState
+UA_PubSubManager_getPubSubState(const UA_PubSubManager *psm) {
+    if(psm->drv.state == UA_LIFECYCLESTATE_STOPPED)
+        return UA_PUBSUBSTATE_DISABLED;
+    if(psm->drv.state != UA_LIFECYCLESTATE_STARTED)
+        return UA_PUBSUBSTATE_PAUSED;
+
+    UA_PubSubState state = UA_PUBSUBSTATE_OPERATIONAL;
+    UA_PubSubConnection *connection;
+    TAILQ_FOREACH(connection, &psm->connections, listEntry) {
+        UA_PubSubState childState = connection->head.state;
+        if(childState == UA_PUBSUBSTATE_ERROR)
+            return childState;
+        if(childState == UA_PUBSUBSTATE_PREOPERATIONAL)
+            state = childState;
+        else if(childState == UA_PUBSUBSTATE_PAUSED &&
+                state == UA_PUBSUBSTATE_OPERATIONAL)
+            state = childState;
+    }
+    return state;
+}
+
+static UA_StatusCode
+UA_PubSubManager_start(UA_Driver *drv) {
+    /* Check that the server backpointer is set */
+    UA_Server *server = drv->server;
+    if(!server)
+        return UA_STATUSCODE_BADINTERNALERROR;
+
+    /* Re-cache logging for the case that the configuration has been updated */
+    UA_PubSubManager *psm = (UA_PubSubManager*)drv;
+    psm->logging = server->config.logging;
+
+    /* Cannot start an already started PubSubManager */
+    if(psm->drv.state == UA_LIFECYCLESTATE_STOPPING) {
+        UA_LOG_ERROR(psm->logging, UA_LOGCATEGORY_PUBSUB,
+                     "The PubSubManager is still stopping");
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    UA_PubSubManager_setState(psm, UA_LIFECYCLESTATE_STARTED);
+
     return UA_STATUSCODE_GOOD;
 }
 
-#endif /* UA_ENABLE_PUBSUB_MONITORING */
+static void
+UA_PubSubManager_stop(UA_Driver *drv) {
+    UA_PubSubManager *psm = (UA_PubSubManager*)drv;
+    disableAllPubSubComponents(psm);
+    UA_PubSubManager_setState(psm, UA_LIFECYCLESTATE_STOPPED);
+}
+
+UA_StatusCode
+UA_PubSubManager_clear(UA_PubSubManager *psm) {
+    if(psm->drv.state != UA_LIFECYCLESTATE_STOPPED) {
+        UA_LOG_ERROR(psm->logging, UA_LOGCATEGORY_PUBSUB,
+                     "Cannot delete the PubSubManager because "
+                     "it is not stopped");
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    UA_LOCK_ASSERT(&psm->drv.server->serviceMutex);
+
+    /* Remove Connections - this also remove WriterGroups and ReaderGroups */
+    UA_PubSubConnection *c, *tmpC;
+    TAILQ_FOREACH_SAFE(c, &psm->connections, listEntry, tmpC) {
+        UA_PubSubConnection_delete(psm, c);
+    }
+
+    /* Remove the DataSets */
+    UA_PublishedDataSet *tmpPDS1, *tmpPDS2;
+    TAILQ_FOREACH_SAFE(tmpPDS1, &psm->publishedDataSets, listEntry, tmpPDS2) {
+        UA_StatusCode res = UA_PublishedDataSet_remove(psm, tmpPDS1);
+        if(res != UA_STATUSCODE_GOOD)
+            UA_LOG_WARNING_PUBSUB(psm->logging, tmpPDS1,
+                                  "The PublishedDataSet could not be removed (%s)",
+                                  UA_StatusCode_name(res));
+    }
+
+    /* Remove the ReserveIds*/
+    ZIP_ITER(UA_ReserveIdTree, &psm->reserveIds, removeReserveId, NULL);
+    psm->reserveIdsSize = 0;
+
+    /* Delete subscribed datasets */
+    UA_SubscribedDataSet *tmpSDS1, *tmpSDS2;
+    TAILQ_FOREACH_SAFE(tmpSDS1, &psm->subscribedDataSets, listEntry, tmpSDS2) {
+        UA_SubscribedDataSet_remove(psm, tmpSDS1);
+    }
+
+#ifdef UA_ENABLE_PUBSUB_SKS
+    /* Remove the SecurityGroups */
+    UA_SecurityGroup *tmpSG1, *tmpSG2;
+    TAILQ_FOREACH_SAFE(tmpSG1, &psm->securityGroups, listEntry, tmpSG2) {
+        UA_SecurityGroup_remove(psm, tmpSG1);
+    }
+
+    /* Remove the keyStorages */
+    UA_PubSubKeyStorage *ks, *ksTmp;
+    LIST_FOREACH_SAFE(ks, &psm->pubSubKeyList, keyStorageList, ksTmp) {
+        UA_PubSubKeyStorage_delete(psm, ks);
+    }
+    if(!LIST_EMPTY(&psm->pubSubKeyList))
+        return UA_STATUSCODE_BADWOULDBLOCK;
+#endif
+
+    return UA_STATUSCODE_GOOD;
+}
+
+static UA_StatusCode
+UA_PubSubManager_free(UA_Driver *drv) {
+    UA_PubSubManager *psm = (UA_PubSubManager *)drv;
+    UA_StatusCode res = UA_PubSubManager_clear(psm);
+    if(res == UA_STATUSCODE_GOOD)
+        UA_free(psm);
+    return res;
+}
+
+UA_Driver *
+UA_PubSubManager_new(UA_Server *server) {
+    UA_PubSubManager *psm = (UA_PubSubManager*)UA_calloc(1, sizeof(UA_PubSubManager));
+    if(!psm)
+        return NULL;
+
+    psm->drv.server = server;
+    psm->drv.name = UA_STRING("pubsub");
+    psm->drv.start = UA_PubSubManager_start;
+    psm->drv.stop = UA_PubSubManager_stop;
+    psm->drv.free = UA_PubSubManager_free;
+
+    /* Set the logging shortcut */
+    psm->logging = server->config.logging;
+
+    /* TODO: Using the Mac address to generate the defaultPublisherId.
+     * In the future, this can be retrieved from the Eventloop. */
+    psm->defaultPublisherId = generateRandomUInt64();
+
+    TAILQ_INIT(&psm->connections);
+    TAILQ_INIT(&psm->publishedDataSets);
+    TAILQ_INIT(&psm->subscribedDataSets);
+
+#ifdef UA_ENABLE_PUBSUB_SKS
+    TAILQ_INIT(&psm->securityGroups);
+#endif
+
+#ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
+    /* Build PubSub information model */
+    initPubSubNS0(server);
+#endif
+
+    return &psm->drv;
+}
 
 #endif /* UA_ENABLE_PUBSUB */

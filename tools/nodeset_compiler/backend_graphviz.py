@@ -1,4 +1,4 @@
-from nodeset import *
+from .nodeset import *
 import graphviz as gv
 import codecs
 
@@ -10,18 +10,18 @@ def nodePrintDot(node):
         if isinstance(r.target, Node):
             tgtname = "node_" + str(r.target.id).replace(";", "").replace("=", "")
             dot = dot + "\n"
-            if r.isForward == True:
+            if r.isForward:
                 dot = dot + cleanname + " -> " + tgtname + " [label=\"" + \
                       str(r.referenceType.browseName) + "\"]\n"
             else:
                 if len(r.referenceType.inverseName) == 0:
-                    logger.warn("Inverse name of reference is null " + str(r.referenceType.id))
+                    logger.warning("Inverse name of reference is null %s", r.referenceType.id)
                 dot = dot + cleanname + " -> " + tgtname + \
                       " [label=\"" + str(r.referenceType.inverseName) + "\"]\n"
     return dot
 
 def printDotGraphWalk(nodeset, depth=1, filename="out.dot", rootNode=None,
-                      followInverse=False, excludeNodeIds=[]):
+                      followInverse=False, excludeNodeIds=None):
     """ Outputs a graphiz/dot description the nodes centered around rootNode.
 
         References beginning from rootNode will be followed for depth steps. If
@@ -33,9 +33,11 @@ def printDotGraphWalk(nodeset, depth=1, filename="out.dot", rootNode=None,
 
         Output is written into filename to be parsed by dot/neato/srfp...
     """
-    iter = depth
+    if excludeNodeIds is None:
+        excludeNodeIds = []
+    iterate = depth
     processed = []
-    if rootNode is None or not isinstance(rootNode, Node) or not rootNode in nodeset.nodes:
+    if rootNode is None or not isinstance(rootNode, Node) or rootNode not in nodeset.nodes:
         root = nodeset.getRoot()
     else:
         root = rootNode
@@ -48,19 +50,19 @@ def printDotGraphWalk(nodeset, depth=1, filename="out.dot", rootNode=None,
     file.write("digraph ns {\n")
     file.write(nodePrintDot(root))
     refs = []
-    if followInverse == True:
+    if followInverse:
         refs = root.references  # + root.getInverseReferences()
     else:
         for ref in root.references:
             if ref.isForward:
                 refs.append(ref)
-    while iter > 0:
+    while iterate > 0:
         tmp = []
         for ref in refs:
             if isinstance(ref.target, NodeId):
                 tgt = nodeset.nodes[ref.target]
-                if not str(tgt.id) in excludeNodeIds:
-                    if not tgt in processed:
+                if str(tgt.id) not in excludeNodeIds:
+                    if tgt not in processed:
                         file.write(nodePrintDot(tgt))
                         processed.append(tgt)
                         if ref.isForward is False and followInverse is True:
@@ -71,7 +73,7 @@ def printDotGraphWalk(nodeset, depth=1, filename="out.dot", rootNode=None,
                             for targetRef in tgt.references:
                                 refs.append(targetRef)
         refs = tmp
-        iter = iter - 1
+        iterate = iterate - 1
 
     file.write("}\n")
     file.close()
@@ -121,7 +123,13 @@ def addReferenceToGraph(nodeset, nodeFrom, nodeTo, reference, graph):
     add_edges(graph, [((getNodeString(nodeFrom), getNodeString(nodeTo)), {'label': getReferenceString(nodeset, reference)})])
 
 
-def addNodeToGraph(nodeset, node, graph, alreadyAdded=set(), relevantReferences=set(), ignoreNodes=set(), isRoot=False, depth = 0):
+def addNodeToGraph(nodeset, node, graph, alreadyAdded=None, relevantReferences=None, ignoreNodes=None, depth=0):
+    if alreadyAdded is None:
+        alreadyAdded = set()
+    if relevantReferences is None:
+        relevantReferences = set()
+    if ignoreNodes is None:
+        ignoreNodes = set()
     if node.id in alreadyAdded or node.id in ignoreNodes:
         return
     alreadyAdded.add(node.id)
@@ -136,8 +144,8 @@ def addNodeToGraph(nodeset, node, graph, alreadyAdded=set(), relevantReferences=
             addReferenceToGraph(nodeset, node, targetNode, ref, graph)
 
 
-def generateGraphvizCode(nodeset, filename="dependencies", rootNode=None, excludeNodeIds=[]):
-    if rootNode is None or not isinstance(rootNode, Node) or not rootNode in nodeset.nodes:
+def generateGraphvizCode(nodeset, filename="dependencies", rootNode=None):
+    if rootNode is None or not isinstance(rootNode, Node) or rootNode not in nodeset.nodes:
         root = nodeset.getRoot()
     else:
         root = rootNode
@@ -153,7 +161,7 @@ def generateGraphvizCode(nodeset, filename="dependencies", rootNode=None, exclud
     ignoreNodes.add(NodeId("i=68")) # PropertyType
     ignoreNodes.add(NodeId("i=63")) # BaseDataVariableType
     ignoreNodes.add(NodeId("i=61")) # FolderType
-    addNodeToGraph(nodeset, root, g, alreadyAdded, isRoot=True,
+    addNodeToGraph(nodeset, root, g, alreadyAdded,
                    relevantReferences=nodeset.getRelevantOrderingReferences(),
                    ignoreNodes=ignoreNodes)
 

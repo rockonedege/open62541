@@ -1,0 +1,567 @@
+This changelog reports changes visible through the public API. Internal
+refactorings and bug fixes are not reported here.
+
+# Development
+
+### Deprecated ECC SecurityPolicies have SecurityLevel 0
+
+The OPC UA 1.05 Profile database marks the SecurityPolicies `ECC_nistP256`,
+`ECC_nistP384`, `ECC_brainpoolP256r1`, `ECC_brainpoolP384r1`, `ECC_curve25519`
+and `ECC_curve448` as deprecated. Their `securityLevel` is now 0, like
+`Basic128Rsa15` and `Basic256`. `UA_ServerConfig_addAllSecureEndpoints` creates
+no Endpoints for them, and clients that select an Endpoint by SecurityLevel rank
+them last.
+
+`ECC_curve25519` and `ECC_curve448` are no longer part of the default policy
+set (`UA_ServerConfig_addAllSecurityPolicies`,
+`UA_ServerConfig_setDefaultWithSecurityPolicies` and their `Secure` variants,
+`UA_ClientConfig_setDefaultEncryption`). To keep using them, add them with
+`UA_ServerConfig_addSecurityPolicyEccCurve25519` or
+`UA_ServerConfig_addSecurityPolicyEccCurve448` and create their Endpoints with
+`UA_ServerConfig_addEndpoint` or `UA_ServerConfig_addAllEndpoints`.
+
+`doc/security/policies.rst` lists all OPC UA 1.05 SecurityPolicies with their
+status, SecurityLevel and the backends that implement them.
+
+### Default ValueRank is scalar
+
+The default `ValueRank` for `UA_VariableAttributes` and
+`UA_VariableTypeAttributes` is now `UA_VALUERANK_SCALAR` (`-1`). Both the nodeset
+compiler and the runtime XML loader also apply the UANodeSet schema's scalar
+default when a Variable or VariableType omits `ValueRank`. They no longer
+inherit the rank from the type definition or supertype in that case.
+
+Array-valued nodes must declare a compatible rank explicitly. This also applies
+to VariableTypes intended to allow arrays. Older NodeSets that relied on rank
+inheritance can now contain incompatible nodes: the generated loader returns an
+error, while the runtime XML loader logs and omits rejected nodes.
+
+### Configure the advertised server profiles explicitly
+
+`UA_ServerConfig.serverProfileArray` and `serverProfileArraySize` now determine
+`Server.ServerCapabilities.ServerProfileArray` (`ns=0;i=2269`). The default is
+an empty String array. The SDK no longer automatically advertises
+`StandardUA2017`, `NodeManagement`, or `Methods` based on build options. Startup
+logs a warning when it writes an empty list, since clients and compliance tests
+expect the list to name the supported profiles.
+
+Applications must declare only profiles supported by their current configuration,
+including all mandatory ConformanceUnits. See
+[OPC UA Part 5, 6.3.2](https://reference.opcfoundation.org/specs/OPC-10000-5/6.3.2)
+and [Part 7, 4.5](https://reference.opcfoundation.org/specs/OPC-10000-7/4.5).
+Only Server Profiles and Facets belong in the list; Transport and Security
+Profile URIs are part of the EndpointDescriptions
+([Part 7, 4.4](https://reference.opcfoundation.org/specs/OPC-10000-7/4.4)).
+An empty declaration is not a claim of certification compliance. The SDK accepts
+vendor-defined URIs and preserves their order. It rejects empty entries but does
+not validate conformance.
+
+The config owns the array and strings. For example, after setting up the default
+config, allocate a declaration as follows (the URIs below are illustrative):
+
+```c
+UA_String profiles[] = {UA_STRING("urn:example:profile:server"),
+                        UA_STRING("urn:example:profile:facet")};
+UA_StatusCode res = UA_Array_copy(profiles, 2,
+    (void**)&config.serverProfileArray, &UA_TYPES[UA_TYPES_STRING]);
+if(res != UA_STATUSCODE_GOOD) {
+    UA_ServerConfig_clear(&config);
+    return res;
+}
+config.serverProfileArraySize = 2;
+```
+
+`UA_Server_newWithConfig()` takes ownership. When replacing an existing list,
+free it with `UA_Array_delete()` and reset both fields before assigning the new
+array. Modify the configuration only while stopped. A nonempty list is copied
+into the AddressSpace on creation and before each startup, including restarts.
+Direct node writes made before startup are overwritten, and the node has to
+accept the write.
+
+An empty list does not replace the value of a node with a read-only value
+source. With `MINIMAL` or `NONE` namespace zero, an empty list also keeps the
+node supplied by the application or an external nodestore (or its absence),
+unless it retracts a declaration applied earlier. A nonempty declaration
+requires the application to supply the node; the SDK does not create it.
+
+JSON configuration accepts `serverProfileArray: ["urn:example:profile:server"]`.
+Omitting the field leaves the default empty; `[]` clears a preceding declaration.
+Non-array values and non-string elements are rejected.
+
+Adding these fields changes the public configuration structure's binary layout.
+Rebuild dependent applications and bindings, and migrate profile declarations
+from direct node writes to the configuration fields.
+
+### Own memory functions on Zephyr
+
+With `CONFIG_OPEN62541_MALLOC_EXTERN`, `UA_malloc`, `UA_calloc`, `UA_realloc`
+and `UA_free` are declared as external functions that the application
+defines, instead of being mapped to `k_malloc` and friends.
+
+### Generate custom DataTypes from NodeSet2 definitions
+
+The NodeSet compiler now reads ``Definition`` elements from ``UADataType``
+nodes. It generates matching C declarations and const ``UA_TYPES_<NAME>``
+arrays. The generated loader can register these arrays unchanged or copy and
+remap their descriptors into server-owned storage. No-copy loading trusts the
+baked-in namespace indexes; the application must ensure they match the server.
+The ``DataTypeDefinition`` attribute is materialized from that layout when it
+is read. A separate BSD type dictionary is therefore no longer required when
+the NodeSet2 file contains complete datatype definitions.
+
+### Client reconnects with backoff and gives up
+
+A lost connection is re-dialed with a delay that starts at the new
+`UA_ClientConfig.reconnectInterval` (default 250 ms) and doubles up to
+`reconnectIntervalMax` (default 10 s). If the re-dial after the maximum delay
+fails, the client gives up with `BadConnectionRejected` or `BadConnectionClosed`.
+Before, a connection that closed before the SecureChannel opened was re-dialed
+without delay, and a refused re-dial ended the connection at once. The comment
+above these fields in `UA_ClientConfig` describes the full connect behavior.
+
+### Asynchronous client requests need an activated Session
+
+Asynchronous requests bound to a Session return `BadSessionNotActivated` while
+the Session is not activated, e.g. during its re-activation after a reconnect.
+Before, they were sent without an AuthenticationToken, and the rejection by the
+server discarded the Session.
+
+### Method support is always available
+
+`UA_ENABLE_METHODCALLS` is removed. The Method service set and method APIs are
+always compiled.
+
+### File transfer driver build option
+
+`UA_ENABLE_DRIVER_FILE_TRANSFER` controls the file transfer driver and defaults
+to ON on all architectures. The local filesystem backend supports POSIX and
+Win32; other architectures can supply a custom backend.
+
+### Percentage deadband support is always available
+
+`UA_ENABLE_DA` is removed. Percentage deadband support is always compiled with
+subscriptions, and DataAccess datatypes and the Part 8 subset are always included
+in the reduced namespace zero.
+
+### Discovery is controlled by server configuration
+
+`UA_ENABLE_DISCOVERY` and `UA_ENABLE_DISCOVERY_MULTICAST` are removed. Use
+`UA_ServerConfig.registeredServersEnabled` and `serversOnNetworkEnabled` to
+enable registration management and network discovery services. mDNS announcement
+and browsing require an attached driver, built with
+`UA_ENABLE_DRIVER_MDNS_MDNSD` or `UA_ENABLE_DRIVER_MDNS_AVAHI`.
+
+### Optional UTC-only local time on POSIX
+
+The POSIX CMake option `UA_ARCH_LOCAL_TIME_IS_UTC` (default OFF) makes
+`UA_DateTime_localTimeUtcOffset()` return zero without linking C library timezone
+conversion functions. The stdout logger consequently uses UTC timestamps.
+
+### Session and subscription diagnostics are named in the server namespace
+
+The per-session objects below `SessionsDiagnosticsSummary` and the
+per-subscription variables below the `SubscriptionDiagnosticsArray` variables
+have the BrowseName `1:<SessionName>` and `1:<SubscriptionId>` instead of
+namespace 0. Their children keep the namespace 0 BrowseNames of their types.
+Browse paths to these nodes have to use namespace 1.
+
+### Blocking and asynchronous server shutdown
+
+`UA_Server_run_shutdown` now waits for shutdown to complete even with an external
+EventLoop, which is left running for its other users. Use the new
+`UA_Server_run_shutdown_async` to initiate and advance nonblocking shutdown:
+drive the EventLoop and repeat the call while the server is STOPPING. Both
+functions are idempotent; `UA_Server_run_iterate` alone no longer completes shutdown.
+
+### The server startup fails without a server socket
+
+`UA_Server_run_startup` (and so `UA_Server_run` and
+`UA_Server_runUntilInterrupt`) returns an error when a transport (TCP, WebSocket
+or HTTP) cannot open its server socket, e.g. because the address cannot be bound
+or another application holds the port, and the server cannot be reached
+otherwise: no other transport listens and no reverse connect is registered. The
+startup is then undone as in `UA_Server_run_shutdown`. Before, the server
+reported success and ran without listening. A failed transport is only logged if
+the server can still be reached, as are failures of other drivers.
+
+### Server configuration no longer starts the EventLoop
+
+`UA_ServerConfig_setDefault` and `UA_ServerConfig_setMinimal` no longer start
+the EventLoop. `UA_Server_run_startup` starts it when needed. This lets an
+application configure servers and their PubSub connections before starting
+the EventLoop. If multiple clients or servers share one EventLoop, set
+`externalEventLoop = true` in every participating configuration. The
+application must keep the shared EventLoop alive until all users have finished,
+then stop and delete it.
+
+### lwIP network interface lifetime
+
+The default POSIX lwIP stack and TAP interface remain alive until process exit,
+independently of EventLoop lifetimes. They are initialized on the first loop
+start. Later loops reuse the interface and reject explicitly conflicting IP
+settings with `BadConfigurationError`.
+
+Custom `netifInit` callbacks are called once per successfully initialized loop,
+with retries after failure. Stop/start retains the interface. `netifShutdown`
+is called on deletion only after successful initialization.
+
+### Removing a PublishedDataSet removes the connected DataSetWriters
+
+`UA_Server_removePublishedDataSet` removes the connected DataSetWriters together
+with the PublishedDataSet. If a connected writer has frozen the configuration,
+it returns `Bad_ConfigurationError`. Otherwise, while the WriterGroup of a
+connected writer is enabled, it returns `Bad_InvalidState` and changes nothing.
+Before, the PublishedDataSet was freed even when removing a connected writer failed.
+
+### PubSub message security with OpenSSL and LibreSSL
+
+The PubSub SecurityPolicies `PubSub-Aes128-CTR` and `PubSub-Aes256-CTR`
+(`UA_PubSubSecurityPolicy_Aes128Ctr`, `UA_PubSubSecurityPolicy_Aes256Ctr`) are
+now available with every `UA_ENABLE_ENCRYPTION` backend. They were limited to
+mbedTLS before. The PubSub security tests and the encrypted PubSub examples
+build with OpenSSL and LibreSSL as well.
+
+### Async cancellation still requires completion
+
+Cancellation of an asynchronous Read, Write or Call now preserves operation
+storage until completion. Applications must follow these ownership rules:
+
+- Read/Call output remains valid after cancellation until its setter takes
+  ownership. Synchronize concurrent access from the cancellation callback.
+- Whether canceled or not, complete each operation with exactly one matching
+  `UA_Server_setAsync*Result` call, then stop accessing its storage: the server
+  may free or reuse it. Canceled results are discarded.
+- Continue completing operations during shutdown. Shutdown cancels pending
+  service and local operations with `UA_STATUSCODE_BADSHUTDOWN` and waits for
+  outstanding setter calls. Keep driving an external event loop if used.
+
+The local `UA_Server_cancelAsync` API has been removed. Local requests complete
+normally, time out, or are canceled during shutdown.
+
+Deleting a monitored item no longer cancels asynchronous reads already started
+to sample its value. Applications must still complete those reads with
+`UA_Server_setAsyncReadResult`; the server discards the results.
+
+After response handling or local result delivery, the server calls the optional
+`asyncOperationCancelCallback` for each canceled operation still awaiting its
+setter call.
+
+Session closure rejects new requests immediately. While the server is running,
+final notifications and session-context cleanup are deferred to the event loop.
+Outstanding async responses emit `SERVICE_END` before `SESSION_CLOSED` and before
+the access-control `closeSession` callback releases the session context.
+
+Local async requests are rejected with `BadShutdown` unless the server is
+started. `UA_Server_run_shutdown` waits until `STOPPED`, including when called
+while already `STOPPING`. Calling this blocking shutdown during operation
+dispatch or async callbacks returns `BadInvalidState`; defer it until the callback
+returns or use `UA_Server_run_shutdown_async`.
+Shutdown also drains workers left by synchronous calls before startup or after
+a completed shutdown. Blocking shutdown starts their EventLoop if necessary;
+with nonblocking shutdown the caller must start and drive it.
+Datachange monitored items sample only while the server is `STARTED`. Items
+created before startup wait for their next sampling trigger; startup does not
+take an initial sample. Zero-interval items sampled on writes wait for a write.
+If startup fails while the server is `STOPPING`, keep driving an external event
+loop until `STOPPED` before retrying startup.
+
+Synchronous local Read/Write/Call APIs cancel deferred operations and report
+`BadWaitingForResponse`; their operation storage also survives until the setter call.
+This does not extend the lifetime of callback inputs: copy any contents needed
+later. In particular, a Write value pointer is only an identifier after its
+callback returns.
+
+### PubSub security-policy nonce lengths
+
+Custom `UA_PubSubSecurityPolicy` implementations must initialize the new
+`messageNonceLength` member with the nonce size carried in each secured
+NetworkMessage. The `nonceLength` member is renamed to `keyMaterialLength`
+and describes the complete SKS key-material item.
+SignAndEncrypt groups reject policies that do not provide a valid message nonce
+length. This changes the public policy structure ABI; custom policies must be
+rebuilt and updated.
+
+### Automatic ModelChange and SemanticChange notifications
+
+Servers built with `UA_ENABLE_SUBSCRIPTIONS_EVENTS` now emit the standard
+`GeneralModelChangeEventType` and `SemanticChangeEventType` automatically for
+changes made through OPC UA Services and the corresponding local `UA_Server_*`
+APIs. Model changes update the affected Node's scalar String `NodeVersion`
+Property. Semantic changes also set the `SemanticsChanged` StatusCode bit on
+the next DataChange notification for Value MonitoredItems on the affected
+Variable.
+
+### Borrowed datatype arrays
+
+`UA_DataTypeArray` has a new trailing `borrowed` flag. With `cleanup = true`,
+configuration cleanup frees the list entry but leaves the datatypes and their
+referenced data untouched when `borrowed = true`. This supports per-client or
+per-server heap entries referring to shared static datatype arrays. With
+`cleanup = false`, neither the entry nor its contents are freed, regardless of
+`borrowed`.
+
+Zero-initialized entries and existing aggregate initializers retain their old
+cleanup behavior. Code that initializes entries field by field must initialize
+`borrowed` too. Rebuild consumers after this public structure change.
+
+### UA_DataTypeArray.types is const
+
+The `types` field in `UA_DataTypeArray` changed from `UA_DataType *` to
+`const UA_DataType *`. The built-in `UA_TYPES` array is now declared
+`const` as well. DataType definitions are immutable at runtime; declaring
+them `const` makes this explicit in the API, protects against accidental
+modification and allows the toolchain to place the definitions in
+read-only memory. DataType arrays generated for additional nodesets
+remain mutable by default (see below).
+
+The `members` field in `UA_DataType` changed from `UA_DataTypeMember *`
+to `const UA_DataTypeMember *`. Generated member arrays are declared
+`const` for all type arrays. Member definitions carry no
+namespace-dependent data, so this also applies to type arrays generated
+for additional nodesets. Code that builds DataType definitions at
+runtime must populate the members array through its own mutable pointer
+before assigning it to the `members` field.
+
+### Const DataType arrays for additional nodesets (companion specifications)
+
+Type arrays generated for additional nodesets (e.g. companion
+specifications like DI) can now also be declared `const` and placed in
+read-only memory. Pass the new `NAMESPACE_MAP` argument to the CMake
+generation macros (`--namespaceMap` to generate_datatypes.py) to pin the
+namespace indices at generation time, e.g.
+`NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"`. The generated init
+code then verifies each contributing namespace URI against its pinned
+index and fails with `UA_STATUSCODE_BADINTERNALERROR` otherwise, before
+registering any type arrays or adding nodes. This checks all supplied
+const arrays, including dependency arrays and arrays spanning multiple
+namespaces, independently of the generated nodeset's filename. Dependency
+nodesets must still be initialized before their dependent nodes. Without pinning,
+the generated array remains mutable and its namespace indices continue
+to be adjusted in-place when the nodeset is loaded (unchanged behavior;
+the `xmlEncodingId` is now adjusted as well, and null encoding NodeIds
+are left untouched instead of receiving the namespace index).
+
+Pinning is all-or-nothing: every namespace that contributes a type to the
+array must be pinned, otherwise the load-time rewrite would overwrite the
+pinned indices again. Namespaces that are only imported (they contribute
+no type to this array) do not need to be pinned. An incomplete
+`NAMESPACE_MAP`, a namespace URI that matches no namespace of the type
+array, one index pinned to two namespaces, one namespace pinned to conflicting
+indices, or an index outside the UInt16 range is reported as an error at
+generation time.
+
+For a pinned namespace the pinned index takes precedence over an
+explicit `ns=` prefix in the NodeId strings of the type definition files.
+Unpinned namespaces keep the previous behavior (the `ns=` prefix if
+present, otherwise 0).
+
+### PubSub DataSetOrdering Support (OPC UA Part 14)
+
+Support for DataSetOrdering mechanism as defined in OPC UA Part 14, section
+6.3.1.1.3 has been implemented for UADP encoding. The ordering of DataSetMessages
+within NetworkMessages can be controlled via the `dataSetOrdering` field in the
+`UA_UadpWriterGroupMessageDataType` configuration.
+
+### The AccessControl plugin needs its mandatory callbacks
+
+`UA_Server_run_startup` returns `Bad_ConfigurationError` if one of the
+AccessControl callbacks `activateSession`, `getUserRightsMask`,
+`getUserAccessLevel`, `getUserExecutable`, `getUserExecutableOnObject` or
+`allowBrowseNode` is NULL. Before, the server started and crashed on the first
+request that used it.
+
+### PubSub AddConnection rolls back incomplete configurations
+
+The `PublishSubscribe.AddConnection` information model method now removes the
+new connection and its children if any part of the supplied configuration
+cannot be created. Invalid PublisherIds are rejected before creating a
+connection.
+
+### Event API uses string-encoded of BrowsePaths
+
+The select-clause of EventFilters defines the fields to be returned in
+event-notifications. The clause is made up of SimpleAttributeOperand structures.
+The API now supports a key-value maps with string-encoded SimpleAttributeOperands
+(in addition to an instance of the EventType in the informationmodel) as the
+source of the event's fields. The key-value map significantly reduces the
+computational overhead associated with Events.
+
+The above has lead to breaking API changes in
+
+- Server-side monitoring of local events
+- Server-side creation of events (with a key-value map for the event properties)
+- Client-side monitoring of remove events
+
+### PubSub Components are enabled automatically if the enabled-flag is set
+
+The component configuration structure now includes the enabled flag. If the flag
+is true, the state-machine gets triggered automatically after the creation of
+the component. This is the same for the C-API, the information model methods and
+for loading the configuration from a binary file. If child-components are added
+at the same time, the children get enabled before the parents.
+
+### Client async methods are typed
+
+For more of the client async service calls, specialized callback types were
+added. With this the callbacks receive the accurate response type instead of
+void-pointers. The order of callback arguments did not change, thereby the
+change is ABI stable and old code continues to work (but might get a
+type-warning during compilation).
+
+### New Realtime-PubSub model
+
+The new Realtime-PubSub model builds upon two new public APIS: (i) The
+possibility to integrate custom state machines to control the state of
+PubSub-components and (ii) the generation of offset-tables for the content of
+PubSub NetworkMessages. The approach is described in
+/examples/pubsub_realtime/README.md with code examples in the same folder.
+
+### JSON encoding changed with the v1.05 specification
+
+The JSON encoding was reworked for the v1.05 version of the OPC UA
+specification. The change breaks backwards compatibility. The legacy JSON
+encoding is still available through the UA_ENABLE_JSON_ENCODING_LEGACY build
+option. This legacy feature will get removed at some point in the future.
+
+### PubSub NetworkMessage structure has an explicit DataSetMessageSize
+
+In prior versions of the standard, when the PayloadHeader was missing, the
+PubSub NetworkMessage needed to have exactly one DataSetMessage. In the current
+standard there can be several DataSetMessages also without a PayloadHeader. To
+allow for this the UA_NetworkMessage structure now contains an explicit
+DataSetMessageSize field outside of the PayloadHeader.
+
+Note that code could before rely on the default of one DataSetMessage. This code
+needs to be revised to set the new DataSetMessageSize field to one.
+
+### PubSub Components are disabled initially
+
+PubSubComponents (PubSubConnections, ReaderGroups, ...) are no longer enabled
+automatically after creating them. This makes the behavior uniform for all
+PubSubComponents. And the configuration can be finalized prior to enabling. A
+method UA_Server_enableAllPubSubComponents simplifies enabling the entire
+system of configured components.
+
+### PubSub Configuration freezing
+
+The configuration is now "frozen" automatically when the state machine switches
+to an enabled state (PAUSED / OPERATIONAL / PREOPERATIONAL). The freezing
+mechanism is no longer exposed in the public API.
+
+### Timer Simplification
+
+For timed callbacks that are not repeated, use the same API
+but with the UA_TIMERPOLICY_ONCE TimerPolicy.
+
+### EventLoop Canceling
+
+The `cancel` method of the EventLoop makes the (blocking) EventLoop `run` return
+immediately.
+
+### Unify PubSub PublisherId
+
+Use the same definition for the PublisherId everywhere. `UA_PublisherId` is a
+tagged union. Before the Subscriber API used a variant -- which is still used in
+some standard-defined data types. `UA_PublisherId_fromVariant` and
+`UA_PublisherId_toVariant` are provided for the conversion.
+
+### Empty trust list no longer falls back to accept-all
+
+`UA_ClientConfig_setDefaultEncryption()`, `UA_ServerConfig_setDefaultWithSecurityPolicies()`
+and `UA_ServerConfig_setDefaultWithSecureSecurityPolicies()` now always build a
+trust-list-backed certificate verifier, even when called with an empty trust
+list. Previously, an empty trust list left whatever certificate verifier the
+base configuration had already installed in place, which accepts any
+certificate. An empty trust list now results in a verifier that trusts
+nothing, so encrypted connections set up this way will fail certificate
+verification until a non-empty trust list is passed, or a verifying
+certificate group is assigned to `certificateVerification`/`secureChannelPKI`/
+`sessionPKI` afterwards.
+
+# Release 1.4
+
+### Decoding variant with array of structure
+
+When decoding an array of structures the extension objects that each structure
+is wrapped into is now unwrapped if the array contains only a single type.
+Previously the decoding API returned an array of extension objects. If the array
+of extension objects has more than one type the decoding result will be an array
+of extension objects.
+
+### KeyValueMap in PubSub configuration
+
+The UA_KeyValueMap structure is used everywhere instead of raw arrays of
+UA_KeyValuePair.
+
+### Thread-safe client
+
+A large portion of the client API is now marked UA_THREADSAFE. For those
+methods, if multithreading is enabled, an internal mutex protects the client.
+
+### Saving unknown client certificates
+
+'UA_CertificateVerification_CertFolders()' has been extended with an additional
+parameter - path to the folder where the rejected certificate should be stored.
+This change applies if `UA_ENABLE_CERT_REJECTED_DIR` is set.
+
+### JSON decoding based on JSON5
+
+The JSON decoding can parse the official encoding from the OPC UA specification.
+It now further allows the following extensions:
+
+- The strict JSON format is relaxed to also allow the JSON5 extensions
+  (https://json5.org/). This allows for more human-readable encoding and adds
+  convenience features such as trailing commas in arrays and comments within
+  JSON documents.
+- NodeIds and ExpandedNodeIds can be given in the string encoding (see
+  `UA_NodeId_parse`). The standard encoding is to express NodeIds as JSON
+  objects.
+
+These extensions are not intended to be used for the OPC UA protocol on the
+network. They were rather added to allow more convenient configuration file
+formats that also include data in the OPC UA type system.
+
+### LocaleId support in the server
+
+The server now supports that descriptions and display names for different
+locales are written to a nod e. The server selects a suitable localization
+depending on the locale ids that are set for the current session.
+
+Locales are added simply by writing a LocalizedText value with a different
+locale. A locale can be removed by writing a LocalizedText value of the
+corresponding locale and with an empty text.
+
+### PubSub PublisherId types
+
+The union for the PubSub publisher id 'UA_PublisherId' and the enumeration for
+the PubSub publisher type 'UA_PublisherIdType' have been changed to support all
+specified publisher id types.
+
+### PubSub state change functions
+
+The following functions in ua_pubsub.h have been extended with an additional
+parameter for the cause of the state change. Moreover the parameter order has
+been changed.
+
+- UA_DataSetWriter_setPubSubState
+- UA_WriterGroup_setPubSubState
+- UA_DataSetReader_setPubSubState
+- UA_ReaderGroup_setPubSubState
+
+### Server port and hostname configuration
+
+Instead of configuring the port number in the server's "NetworkLayer", the
+server configuration now takes a list of ServerURLs like
+`opc.tcp://my-server:4840` or `opc.wss://localhost:443`. The URLs are used both
+for discovery and to set up the server sockets based on the defined hostnames
+(and ports).
+
+The default is to listen on all interfaces with port 4840 for incoming TCP
+connections.
+
+### Empty arrays always match the array dimensions
+
+We consider empty arrays (also null-arrays) to have implied array dimensions
+[0,0,...]. So they always match the array dimensions defined in the variable.
+With this, the initialization of variables without a defined value has been
+simplified. We now create a null array if one is required.

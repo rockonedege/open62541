@@ -4,93 +4,362 @@
 
 #include "testing_networklayers.h"
 
-#include <open62541/server_config_default.h>
+#include <open62541/plugin/log_stdout.h>
 
-#include <assert.h>
-#include <stdlib.h>
+#define TEST_CM_MAX_CONNS 16
 
-#include "testing_clock.h"
+typedef struct {
+    uintptr_t connId;
+    void *application;
+    void *context;
+    UA_ConnectionManager_connectionCallback callback;
+    size_t rxCount;
+    size_t txCount;
+} TestCMConnection;
 
-static UA_ByteString *vBuffer;
-static UA_ByteString sendBuffer;
+/* TestCM embeds UA_ConnectionManager as its first member so that a
+ * UA_ConnectionManager* can be cast directly to TestCM* and back. */
+typedef struct TestCM {
+    UA_ConnectionManager cm;
+    void *context; /* opaque user context, get/set via public API */
+    UA_ByteString lastSent; /* last buffer stolen by sendWithConnection */
+    UA_Boolean logEvents;
+    UA_StatusCode (*sendWithConnectionOverload)(UA_ConnectionManager *cm,
+                                               uintptr_t connectionId,
+                                               const UA_KeyValueMap *params,
+                                               UA_ByteString *buf);
+    TestCMConnection conns[TEST_CM_MAX_CONNS];
+    size_t connCount;
+    uintptr_t nextConnId;
+} TestCM;
 
-UA_StatusCode UA_Client_recvTesting_result = UA_STATUSCODE_GOOD;
-
-static UA_StatusCode
-dummyGetSendBuffer(UA_Connection *connection, size_t length, UA_ByteString *buf) {
-    if(length > sendBuffer.length)
-        return UA_STATUSCODE_BADCOMMUNICATIONERROR;
-    *buf = sendBuffer;
-    buf->length = length;
-    return UA_STATUSCODE_GOOD;
-}
-
-static void
-dummyReleaseSendBuffer(UA_Connection *connection, UA_ByteString *buf) {
-}
-
-static UA_StatusCode
-dummySend(UA_Connection *connection, UA_ByteString *buf) {
-    assert(connection != NULL);
-    assert(buf != NULL);
-
-    if(vBuffer) {
-        UA_ByteString_clear(vBuffer);
-        UA_ByteString_copy(buf, vBuffer);
+static const char *
+testCM_connectionStateName(UA_ConnectionState state) {
+    switch(state) {
+    case UA_CONNECTIONSTATE_CLOSED:
+        return "closed";
+    case UA_CONNECTIONSTATE_OPENING:
+        return "opening";
+    case UA_CONNECTIONSTATE_ESTABLISHED:
+        return "established";
+    case UA_CONNECTIONSTATE_CLOSING:
+        return "closing";
+    case UA_CONNECTIONSTATE_BLOCKING:
+        return "blocking";
+    case UA_CONNECTIONSTATE_REOPENING:
+        return "reopening";
+    default:
+        return "unknown";
     }
-    return UA_STATUSCODE_GOOD;
 }
 
 static void
-dummyReleaseRecvBuffer(UA_Connection *connection, UA_ByteString *buf) {
+testCM_logEvent(TestCM *tcm, const char *eventName, uintptr_t connectionId,
+                UA_ConnectionState state, const UA_ByteString *msg) {
+    if(!tcm->logEvents)
+        return;
+
+    UA_String b64Payload = UA_STRING_NULL;
+    UA_ByteString_toBase64(msg, &b64Payload);
+
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_NETWORK,
+                "[Connection %u] protocol=%S event=%s state=%s payload=%S",
+                (unsigned)connectionId, tcm->cm.protocol, eventName,
+                testCM_connectionStateName(state), b64Payload);
+
+    UA_String_clear(&b64Payload);
 }
 
-static void
-dummyClose(UA_Connection *connection) {
-    if(vBuffer)
-        UA_ByteString_clear(vBuffer);
-    UA_ByteString_clear(&sendBuffer);
+void
+TestConnectionManager_setContext(UA_ConnectionManager *cm, void *context) {
+    ((TestCM *)(void *)cm)->context = context;
 }
 
-UA_Connection createDummyConnection(size_t sendBufferSize,
-                                    UA_ByteString *verificationBuffer) {
-    vBuffer = verificationBuffer;
-    UA_ByteString_allocBuffer(&sendBuffer, sendBufferSize);
-
-    UA_Connection c;
-    c.state = UA_CONNECTIONSTATE_ESTABLISHED;
-    c.channel = NULL;
-    c.sockfd = UA_INVALID_SOCKET;
-    c.handle = NULL;
-    c.getSendBuffer = dummyGetSendBuffer;
-    c.releaseSendBuffer = dummyReleaseSendBuffer;
-    c.send = dummySend;
-    c.recv = NULL;
-    c.releaseRecvBuffer = dummyReleaseRecvBuffer;
-    c.close = dummyClose;
-    return c;
+void *
+TestConnectionManager_getContext(UA_ConnectionManager *cm) {
+    return ((TestCM *)(void *)cm)->context;
 }
 
-UA_UInt32 UA_Client_recvSleepDuration;
-UA_StatusCode (*UA_Client_recv)(UA_Connection *connection, UA_ByteString *response,
-                                UA_UInt32 timeout);
+const UA_ByteString *
+TestConnectionManager_getLastSent(UA_ConnectionManager *cm) {
+    return &((TestCM *)(void *)cm)->lastSent;
+}
 
 UA_StatusCode
-UA_Client_recvTesting(UA_Connection *connection, UA_ByteString *response,
-                    UA_UInt32 timeout) {
+TestConnectionManager_createConnection(UA_ConnectionManager *cm,
+                                       void *application,
+                                       void *context,
+                                       UA_ConnectionManager_connectionCallback connectionCallback,
+                                       uintptr_t *outConnectionId) {
+    TestCM *tcm = (TestCM *)(void *)cm;
+    if(!tcm || !connectionCallback || !outConnectionId)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
 
-    if(UA_Client_recvTesting_result != UA_STATUSCODE_GOOD) {
-        UA_StatusCode temp = UA_Client_recvTesting_result;
-        UA_Client_recvTesting_result = UA_STATUSCODE_GOOD;
-        UA_fakeSleep(timeout);
-        return temp;
+    size_t slot = TEST_CM_MAX_CONNS;
+    for(size_t i = 0; i < TEST_CM_MAX_CONNS; i++) {
+        if(!tcm->conns[i].callback) {
+            slot = i;
+            break;
+        }
+    }
+    if(slot == TEST_CM_MAX_CONNS)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+
+    uintptr_t connId = tcm->nextConnId++;
+    tcm->conns[slot].connId = connId;
+    tcm->conns[slot].application = application;
+    tcm->conns[slot].context = context;
+    tcm->conns[slot].callback = connectionCallback;
+    tcm->connCount++;
+    *outConnectionId = connId;
+    return UA_STATUSCODE_GOOD;
+}
+
+UA_StatusCode
+TestConnectionManager_removeConnection(UA_ConnectionManager *cm,
+                                       uintptr_t connectionId) {
+    TestCM *tcm = (TestCM *)(void *)cm;
+    if(!tcm)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+
+    for(size_t i = 0; i < TEST_CM_MAX_CONNS; i++) {
+        if(!tcm->conns[i].callback || tcm->conns[i].connId != connectionId)
+            continue;
+        tcm->conns[i].callback = NULL;
+        tcm->conns[i].context = NULL;
+        tcm->conns[i].application = NULL;
+        tcm->connCount--;
+        if(tcm->connCount == 0 &&
+           tcm->cm.eventSource.state == UA_EVENTSOURCESTATE_STOPPING)
+            tcm->cm.eventSource.state = UA_EVENTSOURCESTATE_STOPPED;
+        return UA_STATUSCODE_GOOD;
+    }
+    return UA_STATUSCODE_BADNOTFOUND;
+}
+
+UA_StatusCode
+TestConnectionManager_inject(UA_ConnectionManager *cm,
+                             uintptr_t connectionId,
+                             UA_ConnectionState state,
+                             const UA_KeyValueMap *params,
+                             const UA_ByteString *msg) {
+    TestCM *tcm = (TestCM *)(void *)cm;
+    if(!tcm)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+
+    UA_KeyValueMap emptyKvm = UA_KEYVALUEMAP_NULL;
+    UA_ByteString emptyMsg = UA_BYTESTRING_NULL;
+    const UA_KeyValueMap *injectParams = params ? params : &emptyKvm;
+    UA_ByteString injectMsg = msg ? *msg : emptyMsg;
+    const char *eventName = (injectMsg.length > 0) ? "receive-injected" : "inject";
+
+    for(size_t i = 0; i < TEST_CM_MAX_CONNS; i++) {
+        if(!tcm->conns[i].callback || tcm->conns[i].connId != connectionId)
+            continue;
+
+        testCM_logEvent(tcm, eventName, connectionId, state, &injectMsg);
+
+        tcm->conns[i].callback(cm, tcm->conns[i].connId,
+                             tcm->conns[i].application,
+                             &tcm->conns[i].context,
+                             state, injectParams, injectMsg);
+
+        if(injectMsg.length > 0)
+            tcm->conns[i].rxCount++;
+
+        if(state == UA_CONNECTIONSTATE_CLOSING ||
+           state == UA_CONNECTIONSTATE_CLOSED) {
+            tcm->conns[i].callback = NULL;
+            tcm->conns[i].context = NULL;
+            tcm->conns[i].application = NULL;
+            tcm->connCount--;
+        }
+
+        return UA_STATUSCODE_GOOD;
     }
 
-    UA_StatusCode res = UA_Client_recv(connection, response, timeout);
-    if(res == UA_STATUSCODE_GOODNONCRITICALTIMEOUT)
-        UA_fakeSleep(timeout);
-    else
-        UA_fakeSleep(UA_Client_recvSleepDuration);
-    UA_Client_recvSleepDuration = 0;
-    return res;
+    return UA_STATUSCODE_BADNOTFOUND;
+}
+
+static UA_StatusCode
+testCM_eventSourceStart(UA_EventSource *es) {
+    UA_ConnectionManager *cm = (UA_ConnectionManager *)es;
+    TestCM *tcm = (TestCM *)(void *)cm;
+    UA_assert(tcm);
+
+    const UA_Boolean *enabled = (const UA_Boolean *)
+        UA_KeyValueMap_getScalar(&cm->eventSource.params,
+                                 UA_QUALIFIEDNAME(0, "log-events"),
+                                 &UA_TYPES[UA_TYPES_BOOLEAN]);
+    tcm->logEvents = enabled ? *enabled : false;
+
+    es->state = UA_EVENTSOURCESTATE_STARTED;
+    return UA_STATUSCODE_GOOD;
+}
+
+static void
+testCM_eventSourceStop(UA_EventSource *es) {
+    UA_ConnectionManager *cm = (UA_ConnectionManager *)es;
+    TestCM *tcm = (TestCM *)(void *)cm;
+    UA_assert(tcm);
+
+    if(tcm->connCount == 0) {
+        es->state = UA_EVENTSOURCESTATE_STOPPED;
+        return;
+    }
+
+    es->state = UA_EVENTSOURCESTATE_STOPPING;
+
+    UA_KeyValueMap emptyKvm = UA_KEYVALUEMAP_NULL;
+    UA_ByteString emptyMsg = UA_BYTESTRING_NULL;
+    for(size_t i = 0; i < TEST_CM_MAX_CONNS; i++) {
+        if(!tcm->conns[i].callback)
+            continue;
+        testCM_logEvent(tcm, "close", tcm->conns[i].connId,
+                        UA_CONNECTIONSTATE_CLOSING, &emptyMsg);
+        tcm->conns[i].callback(cm, tcm->conns[i].connId,
+                                 tcm->conns[i].application,
+                                 &tcm->conns[i].context,
+                                 UA_CONNECTIONSTATE_CLOSING,
+                                 &emptyKvm, emptyMsg);
+        /* Remove the connection entry so connCount drops to 0 and the CM can
+         * transition to STOPPED. The callback (e.g. DiscoveryManager) must NOT
+         * call closeConnection in response to a CLOSING notification — that is
+         * the CM's responsibility during shutdown. */
+        tcm->conns[i].callback = NULL;
+        tcm->conns[i].context = NULL;
+        tcm->conns[i].application = NULL;
+        tcm->connCount--;
+    }
+    es->state = UA_EVENTSOURCESTATE_STOPPED;
+}
+
+static UA_StatusCode
+testCM_eventSourceFree(UA_EventSource *es) {
+    UA_ConnectionManager *cm = (UA_ConnectionManager *)es;
+    TestCM *tcm = (TestCM *)(void *)cm;
+    UA_assert(tcm);
+
+    testCM_eventSourceStop(es);
+    UA_KeyValueMap_clear(&cm->eventSource.params);
+    UA_ByteString_clear(&tcm->lastSent);
+    UA_free(tcm);
+    return UA_STATUSCODE_GOOD;
+}
+
+static UA_StatusCode
+testCM_sendWithConnection(UA_ConnectionManager *cm, uintptr_t connectionId,
+                          const UA_KeyValueMap *params, UA_ByteString *buf) {
+    TestCM *tcm = (TestCM *)(void *)cm;
+    testCM_logEvent(tcm, "send", connectionId,
+                    UA_CONNECTIONSTATE_ESTABLISHED, buf);
+    /* Update tx counter if the connection is tracked (opportunistic). */
+    for(size_t i = 0; i < TEST_CM_MAX_CONNS; i++) {
+        if(tcm->conns[i].callback && tcm->conns[i].connId == connectionId) {
+            tcm->conns[i].txCount++;
+            break;
+        }
+    }
+    if(tcm->sendWithConnectionOverload)
+        return tcm->sendWithConnectionOverload(cm, connectionId, params, buf);
+    /* Default: steal the buffer into lastSent */
+    UA_ByteString_clear(&tcm->lastSent);
+    tcm->lastSent = *buf;
+    UA_ByteString_init(buf);
+    return UA_STATUSCODE_GOOD;
+}
+
+static UA_StatusCode
+testCM_openConnection(UA_ConnectionManager *cm, const UA_KeyValueMap *params,
+                      void *application, void *context,
+                      UA_ConnectionManager_connectionCallback cb) {
+    TestCM *tcm = (TestCM *)(void *)cm;
+    (void)params;
+    uintptr_t connId;
+    UA_StatusCode ret = TestConnectionManager_createConnection(cm, application,
+                                                               context, cb, &connId);
+    if(ret != UA_STATUSCODE_GOOD)
+        return ret;
+    testCM_logEvent(tcm, "open", connId, UA_CONNECTIONSTATE_OPENING, NULL);
+    UA_KeyValueMap emptyKvm = UA_KEYVALUEMAP_NULL;
+    UA_ByteString emptyMsg = UA_BYTESTRING_NULL;
+    return TestConnectionManager_inject(cm, connId, UA_CONNECTIONSTATE_ESTABLISHED,
+                                        &emptyKvm, &emptyMsg);
+}
+
+static UA_StatusCode
+testCM_closeConnection(UA_ConnectionManager *cm, uintptr_t connectionId) {
+    TestCM *tcm = (TestCM *)(void *)cm;
+    UA_KeyValueMap emptyKvm = UA_KEYVALUEMAP_NULL;
+    UA_ByteString emptyMsg = UA_BYTESTRING_NULL;
+    testCM_logEvent(tcm, "close", connectionId, UA_CONNECTIONSTATE_CLOSING, &emptyMsg);
+    TestConnectionManager_inject(cm, connectionId, UA_CONNECTIONSTATE_CLOSING,
+                                 &emptyKvm, &emptyMsg);
+    return TestConnectionManager_removeConnection(cm, connectionId);
+}
+
+UA_StatusCode
+TestConnectionManager_getCounters(UA_ConnectionManager *cm, uintptr_t connectionId,
+                                   size_t *rxCount, size_t *txCount) {
+    TestCM *tcm = (TestCM *)(void *)cm;
+    for(size_t i = 0; i < TEST_CM_MAX_CONNS; i++) {
+        if(!tcm->conns[i].callback || tcm->conns[i].connId != connectionId)
+            continue;
+        if(rxCount) *rxCount = tcm->conns[i].rxCount;
+        if(txCount) *txCount = tcm->conns[i].txCount;
+        return UA_STATUSCODE_GOOD;
+    }
+    return UA_STATUSCODE_BADNOTFOUND;
+}
+
+static UA_StatusCode
+testCM_allocNetworkBuffer(UA_ConnectionManager *cm, uintptr_t connectionId,
+                          UA_ByteString *buf, size_t bufSize) {
+    (void)cm;
+    (void)connectionId;
+    return UA_ByteString_allocBuffer(buf, bufSize);
+}
+
+static void
+testCM_freeNetworkBuffer(UA_ConnectionManager *cm, uintptr_t connectionId,
+                         UA_ByteString *buf) {
+    (void)cm;
+    (void)connectionId;
+    UA_ByteString_clear(buf);
+}
+
+UA_ConnectionManager *
+TestConnectionManager_new(const char *protocol,
+                          const TestConnectionManager_CallbackOverloads *overloads) {
+    if(!protocol || !protocol[0])
+        return NULL;
+
+    TestCM *tcm = (TestCM*)UA_calloc(1, sizeof(TestCM));
+    if(!tcm)
+        return NULL;
+
+    tcm->nextConnId = 100;
+    tcm->logEvents = false;
+
+    UA_ConnectionManager *cm = &tcm->cm;
+    cm->eventSource.next = NULL;
+    cm->eventSource.eventSourceType = UA_EVENTSOURCETYPE_CONNECTIONMANAGER;
+    cm->eventSource.name = UA_STRING((char*)(uintptr_t)"test-cm");
+    cm->eventSource.eventLoop = NULL;
+    cm->eventSource.params = UA_KEYVALUEMAP_NULL;
+    cm->eventSource.state = UA_EVENTSOURCESTATE_FRESH;
+    cm->eventSource.start = testCM_eventSourceStart;
+    cm->eventSource.stop = testCM_eventSourceStop;
+    cm->eventSource.free = testCM_eventSourceFree;
+    cm->protocol = UA_STRING((char*)(uintptr_t)protocol);
+    cm->openConnection = (overloads && overloads->openConnection) ?
+                         overloads->openConnection : testCM_openConnection;
+    cm->sendWithConnection = testCM_sendWithConnection;
+    cm->closeConnection = (overloads && overloads->closeConnection) ?
+                          overloads->closeConnection : testCM_closeConnection;
+    tcm->sendWithConnectionOverload = overloads ? overloads->sendWithConnection : NULL;
+    cm->allocNetworkBuffer = testCM_allocNetworkBuffer;
+    cm->freeNetworkBuffer = testCM_freeNetworkBuffer;
+
+    return cm;
 }

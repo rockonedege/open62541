@@ -5,36 +5,55 @@
  * Copyright (c) 2017 - 2018 Fraunhofer IOSB (Author: Andreas Ebner)
  */
 
-#include <open62541/plugin/pubsub_udp.h>
 #include <open62541/server_config_default.h>
 #include <open62541/server_pubsub.h>
 #include <open62541/types.h>
-#include <open62541/types_generated_encoding_binary.h>
 
-#include "ua_pubsub.h"
-#include "ua_server_internal.h"
+#include "ua_pubsub_internal.h"
+#include "test_helpers.h"
+#include "pubsub_test_helpers.h"
 
 #include <check.h>
+#include <stdlib.h>
 
-UA_Server *server = NULL;
-UA_NodeId connection1, writerGroup1, publishedDataSet1, dataSetWriter1;
+#if defined(__unix__) || defined(__APPLE__)
+# include <pthread.h>
+#endif
+
+static UA_Server *server = NULL;
+static UA_NodeId connection1, writerGroup1, publishedDataSet1, dataSetWriter1;
+
+#if defined(__unix__) || defined(__APPLE__)
+typedef struct {
+    UA_Server *server;
+    UA_WriterGroup *writerGroup;
+} PublishContext;
+
+static void *
+publishOnSmallStack(void *data) {
+    PublishContext *ctx = (PublishContext*)data;
+    UA_WriterGroup_publishCallback(getPSM(ctx->server), ctx->writerGroup);
+    return NULL;
+}
+#endif
 
 static void setup(void) {
-    server = UA_Server_new();
-    UA_ServerConfig *config = UA_Server_getConfig(server);
-    UA_ServerConfig_setDefault(config);
-
-    UA_ServerConfig_addPubSubTransportLayer(config, UA_PubSubTransportLayerUDPMP());
-
+    server = UA_Server_newForUnitTest();
+    ck_assert(server != NULL);
     UA_Server_run_startup(server);
+
+    UA_StatusCode retVal = UA_STATUSCODE_GOOD;
     UA_PubSubConnectionConfig connectionConfig;
     memset(&connectionConfig, 0, sizeof(UA_PubSubConnectionConfig));
     connectionConfig.name = UA_STRING("UADP Connection");
-    UA_NetworkAddressUrlDataType networkAddressUrl = {UA_STRING_NULL, UA_STRING("opc.udp://224.0.0.22:4840/")};
+    UA_NetworkAddressUrlDataType networkAddressUrl =
+        UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
     UA_Variant_setScalar(&connectionConfig.address, &networkAddressUrl,
                          &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
-    connectionConfig.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
-    UA_Server_addPubSubConnection(server, &connectionConfig, &connection1);
+    connectionConfig.transportProfileUri =
+        UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
+    retVal |= UA_Server_addPubSubConnection(server, &connectionConfig, &connection1);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
 }
 
 static void teardown(void) {
@@ -43,56 +62,133 @@ static void teardown(void) {
 }
 
 START_TEST(SinglePublishDataSetField){
-        UA_WriterGroupConfig writerGroupConfig;
-        memset(&writerGroupConfig, 0, sizeof(writerGroupConfig));
+    UA_WriterGroupConfig writerGroupConfig;
+    memset(&writerGroupConfig, 0, sizeof(writerGroupConfig));
 
-        writerGroupConfig.messageSettings.encoding = UA_EXTENSIONOBJECT_DECODED;
-        writerGroupConfig.messageSettings.content.decoded.type = &UA_TYPES[UA_TYPES_JSONWRITERGROUPMESSAGEDATATYPE];
-        UA_JsonDataSetWriterMessageDataType d;
-        d.dataSetMessageContentMask = UA_JSONDATASETMESSAGECONTENTMASK_SEQUENCENUMBER;
-        writerGroupConfig.messageSettings.content.decoded.data = &d;
+    writerGroupConfig.messageSettings.encoding = UA_EXTENSIONOBJECT_DECODED;
+    writerGroupConfig.messageSettings.content.decoded.type =
+        &UA_TYPES[UA_TYPES_JSONWRITERGROUPMESSAGEDATATYPE];
+    UA_JsonWriterGroupMessageDataType d;
+    UA_JsonWriterGroupMessageDataType_init(&d);
+    d.networkMessageContentMask = UA_JSONNETWORKMESSAGECONTENTMASK_NETWORKMESSAGEHEADER |
+        UA_JSONNETWORKMESSAGECONTENTMASK_DATASETMESSAGEHEADER | UA_JSONNETWORKMESSAGECONTENTMASK_PUBLISHERID;
+    writerGroupConfig.messageSettings.content.decoded.data = &d;
 
-        writerGroupConfig.name = UA_STRING("WriterGroup 1");
-        writerGroupConfig.publishingInterval = 10;
-        writerGroupConfig.encodingMimeType = UA_PUBSUB_ENCODING_JSON;
-        UA_StatusCode retVal = UA_Server_addWriterGroup(server, connection1, &writerGroupConfig, &writerGroup1);
-        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
-        retVal = UA_Server_setWriterGroupOperational(server, writerGroup1);
-        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    writerGroupConfig.name = UA_STRING("WriterGroup 1");
+    writerGroupConfig.publishingInterval = 10;
+    writerGroupConfig.encodingMimeType = UA_PUBSUB_ENCODING_JSON;
 
-        UA_PublishedDataSetConfig pdsConfig;
-        memset(&pdsConfig, 0, sizeof(UA_PublishedDataSetConfig));
-        pdsConfig.publishedDataSetType = UA_PUBSUB_DATASET_PUBLISHEDITEMS;
-        pdsConfig.name = UA_STRING("PublishedDataSet 1");
-        UA_AddPublishedDataSetResult result = UA_Server_addPublishedDataSet(server, &pdsConfig, &publishedDataSet1);
-        ck_assert_int_eq(result.addResult, UA_STATUSCODE_GOOD);
-        UA_DataSetWriterConfig dataSetWriterConfig;
-        memset(&dataSetWriterConfig, 0, sizeof(dataSetWriterConfig));
-        dataSetWriterConfig.name = UA_STRING("DataSetWriter 1");
-        retVal = UA_Server_addDataSetWriter(server, writerGroup1, publishedDataSet1, &dataSetWriterConfig, &dataSetWriter1);
-        ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
-        UA_DataSetFieldConfig dataSetFieldConfig;
-        memset(&dataSetFieldConfig, 0, sizeof(UA_DataSetFieldConfig));
-        dataSetFieldConfig.dataSetFieldType = UA_PUBSUB_DATASETFIELD_VARIABLE;
-        dataSetFieldConfig.field.variable.fieldNameAlias = UA_STRING("Server localtime");
-        dataSetFieldConfig.field.variable.promotedField = UA_FALSE;
-        dataSetFieldConfig.field.variable.publishParameters.publishedVariable = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_LOCALTIME);
-        dataSetFieldConfig.field.variable.publishParameters.attributeId = UA_ATTRIBUTEID_VALUE;
-        UA_DataSetFieldResult dsFieldResult = UA_Server_addDataSetField(server, publishedDataSet1, &dataSetFieldConfig, NULL);
-        ck_assert_int_eq(dsFieldResult.result, UA_STATUSCODE_GOOD);
+    UA_DatagramWriterGroupTransport2DataType udpTransportSettings;
+    memset(&udpTransportSettings, 0, sizeof(UA_DatagramWriterGroupTransport2DataType));
+    UA_NetworkAddressUrlDataType writerGroupAddress =
+        UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
+    UA_ExtensionObject_setValue(&udpTransportSettings.address, &writerGroupAddress,
+                         &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
 
-        UA_WriterGroup *wg = UA_WriterGroup_findWGbyId(server, writerGroup1);
-        ck_assert(wg != 0);
-        UA_WriterGroup_publishCallback(server, wg);
-    } END_TEST
+    UA_ExtensionObject_setValue(&writerGroupConfig.transportSettings, &udpTransportSettings,
+                         &UA_TYPES[UA_TYPES_DATAGRAMWRITERGROUPTRANSPORT2DATATYPE]);
+
+    UA_StatusCode retVal =
+        UA_Server_addWriterGroup(server, connection1, &writerGroupConfig, &writerGroup1);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_PublishedDataSetConfig pdsConfig;
+    memset(&pdsConfig, 0, sizeof(UA_PublishedDataSetConfig));
+    pdsConfig.publishedDataSetType = UA_PUBSUB_DATASET_PUBLISHEDITEMS;
+    pdsConfig.name = UA_STRING("PublishedDataSet 1");
+    UA_AddPublishedDataSetResult result =
+        UA_Server_addPublishedDataSet(server, &pdsConfig, &publishedDataSet1);
+    ck_assert_int_eq(result.addResult, UA_STATUSCODE_GOOD);
+
+    UA_DataSetFieldConfig dataSetFieldConfig;
+    memset(&dataSetFieldConfig, 0, sizeof(UA_DataSetFieldConfig));
+    dataSetFieldConfig.dataSetFieldType = UA_PUBSUB_DATASETFIELD_VARIABLE;
+    dataSetFieldConfig.field.variable.fieldNameAlias = UA_STRING("Server localtime");
+    dataSetFieldConfig.field.variable.promotedField = UA_FALSE;
+    dataSetFieldConfig.field.variable.publishParameters.publishedVariable =
+        UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE);
+    dataSetFieldConfig.field.variable.publishParameters.attributeId = UA_ATTRIBUTEID_VALUE;
+    UA_DataSetFieldResult dsFieldResult =
+        UA_Server_addDataSetField(server, publishedDataSet1, &dataSetFieldConfig, NULL);
+    ck_assert_int_eq(dsFieldResult.result, UA_STATUSCODE_GOOD);
+
+    UA_DataSetWriterConfig dataSetWriterConfig;
+    memset(&dataSetWriterConfig, 0, sizeof(dataSetWriterConfig));
+    dataSetWriterConfig.name = UA_STRING("DataSetWriter 1");
+    retVal = UA_Server_addDataSetWriter(server, writerGroup1, publishedDataSet1,
+                                        &dataSetWriterConfig, &dataSetWriter1);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    retVal = UA_Server_enableDataSetWriter(server, dataSetWriter1);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    retVal = UA_Server_enableWriterGroup(server, writerGroup1);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    retVal = UA_Server_enableAllPubSubComponents(server);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+
+    UA_Server_WriterGroup_publish(server, writerGroup1);
+
+    UA_PubSubManager *psm = getPSM(server);
+    UA_WriterGroup *wg = UA_WriterGroup_find(psm, writerGroup1);
+    ck_assert(wg != 0);
+    UA_WriterGroup_publishCallback(psm, wg);
+
+    UA_PubSubState state;
+    retVal = UA_Server_WriterGroup_getState(server, writerGroup1, &state);
+    ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
+    ck_assert_int_eq(state, UA_PUBSUBSTATE_OPERATIONAL);
+} END_TEST
+
+START_TEST(PublishManyDataSetWritersOnSmallStack) {
+#if defined(__unix__) || defined(__APPLE__)
+    UA_WriterGroupConfig writerGroupConfig;
+    memset(&writerGroupConfig, 0, sizeof(writerGroupConfig));
+    writerGroupConfig.name = UA_STRING("WriterGroup with many writers");
+    writerGroupConfig.encodingMimeType = UA_PUBSUB_ENCODING_UADP;
+    UA_StatusCode res = UA_Server_addWriterGroup(
+        server, connection1, &writerGroupConfig, &writerGroup1);
+    ck_assert_int_eq(res, UA_STATUSCODE_GOOD);
+
+    UA_WriterGroup *wg = UA_WriterGroup_find(getPSM(server), writerGroup1);
+    ck_assert_ptr_ne(wg, NULL);
+    const size_t writersCount = 4096;
+    UA_DataSetWriter *writers = (UA_DataSetWriter*)
+        UA_calloc(writersCount, sizeof(UA_DataSetWriter));
+    ck_assert_ptr_ne(writers, NULL);
+    for(size_t i = 0; i < writersCount; i++)
+        LIST_INSERT_HEAD(&wg->writers, &writers[i], listEntry);
+    wg->writersCount = (UA_UInt32)writersCount;
+
+    PublishContext ctx = {server, wg};
+    pthread_attr_t attr;
+    ck_assert_int_eq(pthread_attr_init(&attr), 0);
+    ck_assert_int_eq(pthread_attr_setstacksize(&attr, 128 * 1024), 0);
+    pthread_t worker;
+    ck_assert_int_eq(pthread_create(&worker, &attr,
+                                    publishOnSmallStack, &ctx), 0);
+    ck_assert_int_eq(pthread_attr_destroy(&attr), 0);
+    ck_assert_int_eq(pthread_join(worker, NULL), 0);
+
+    LIST_INIT(&wg->writers);
+    wg->writersCount = 0;
+    UA_free(writers);
+#endif
+}
+END_TEST
 
 int main(void) {
     TCase *tc_pubsub_publish = tcase_create("PubSub publish");
     tcase_add_checked_fixture(tc_pubsub_publish, setup, teardown);
     tcase_add_test(tc_pubsub_publish, SinglePublishDataSetField);
 
+    TCase *tc_stack_hardening = tcase_create("PubSub stack hardening");
+    tcase_add_checked_fixture(tc_stack_hardening, setup, teardown);
+    tcase_add_test(tc_stack_hardening, PublishManyDataSetWritersOnSmallStack);
+
     Suite *s = suite_create("PubSub publishing json via udp");
     suite_add_tcase(s, tc_pubsub_publish);
+    suite_add_tcase(s, tc_stack_hardening);
 
     SRunner *sr = srunner_create(s);
     srunner_set_fork_status(sr, CK_NOFORK);

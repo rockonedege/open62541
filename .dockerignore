@@ -1,2 +1,7 @@
-Dockerfile
-/build/*
+.github
+.dockerignore
+.travis*
+appveyor.yml
+docker
+build
+TinyDockerfile

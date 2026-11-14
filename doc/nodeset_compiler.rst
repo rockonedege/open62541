@@ -1,14 +1,170 @@
 XML Nodeset Compiler
 --------------------
 
-When writing an application, it is more comfortable to create information models using some GUI tools. Most tools can export data according the OPC UA Nodeset XML schema. open62541 contains a python based nodeset compiler that can transform these information model definitions into a working server.
+When writing an application, it is more comfortable to create information models
+using GUI tools. Most tools can export data according the OPC UA Nodeset XML
+schema. open62541 contains a Python based nodeset compiler that transforms
+Nodeset XML files into code for the open62541 SDK.
 
-Note that the nodeset compiler you can find in the *tools/nodeset_compiler* subfolder is *not* an XML transformation tool but a compiler. That means that it will create an internal representation when parsing the XML files and attempt to understand and verify the correctness of this representation in order to generate C Code.
+Custom DataTypes
+^^^^^^^^^^^^^^^^
 
-Getting started
-...............
+When a ``UADataType`` contains a NodeSet2 ``Definition`` element, the compiler
+generates the matching C enum, structure, optional structure, or union in a
+static ``UA_TYPES_<NAME>`` array. The generated loader takes a
+``UA_Boolean copy_types`` argument, for example
+``namespace_example_generated(server, true)``. The ``DataTypeDefinition``
+attribute is reconstructed from the registered layout when it is read.
+Definitions can refer to custom
+datatypes declared later in the same NodeSet2 file; the compiler resolves those
+dependencies before code generation. Inheritance is expanded once by the
+NodeSet input adapter; the existing C datatype backend is shared with BSD input.
+Structure members must be scalar or one-dimensional arrays. Matrix and
+variable-rank fields produce a warning: their native descriptors, and native
+layouts that depend on them, are omitted because the current datatype layout
+cannot represent their encoding. The namespace nodes are still generated. ``AllowSubTypes`` fields use ExtensionObjects for
+structures and Variants for other types, as in the runtime loader. OptionSets
+retain their integer base width or, for subtypes of the standard OptionSet,
+the two ByteStrings ``Value`` and ``ValidBits``. Simple aliases retain the
+builtin C representation and receive their own descriptors, preserving field
+datatype IDs across model boundaries.
 
-We take the following information model snippet as the starting point of the following tutorial. A more detailed tutorial on how to create your own information model and NodeSet2.xml can be found in this blog post: https://opcua.rocks/custom-information-models/
+For static XML generation, inline definitions also determine the layouts of
+XML dependencies. Embedded legacy BSD dictionaries provide fallbacks for types
+without inline definitions. An explicitly supplied BSD remains authoritative
+for its imported layouts. A companion type that conflicts with an SDK type name
+receives a deterministic namespace suffix in its C name. Uppercase companion
+type names are qualified the same way to avoid SDK macro and factory names.
+Datatype metadata retains the original XML BrowseName and field spellings.
+
+CMake imports standard types from the schema used to build the library. Direct
+compiler calls can select that schema directory with ``--types-schema``.
+
+Use ``copy_types = true`` to reuse generated code in several servers. The loader
+reconstructs server-owned descriptors through the same DataTypeDescription
+loading used by runtime type loading. ``UA_DataType_toDescription`` describes each
+exported static datatype. Nodes, types, member references and encoding IDs share
+one compile-time namespace plan. ``UA_Server_addDataTypeFromDescriptionEx`` applies the same
+namespace mapping as node loading, resolves members, constructs the C layout,
+and allocates the server-owned descriptor. Both encoding IDs are supplied as
+borrowed overrides in the same source context; the server copies and maps them
+before registering the complete datatype.
+All linked generated dependencies must use compatible source namespace indexes.
+Conflicts between imported datatype arrays and a loader's plan are rejected at
+C compilation. Use batch generation or supply the same complete ``NAMESPACE_MAP`` /
+``--namespaceMap`` to each generation call. Dependencies must be
+loaded first, each with its own loader call; neither
+namespace zero nor all companion specifications need to be loaded in one call.
+One generated array can contain types from several namespaces. Direct
+self-references through arrays or optional members are supported by the SDK. Other datatype dependencies are ordered at generation time; mutually
+recursive definitions and cycles of inline fields are rejected.
+
+Generate several companion modules together with a manifest::
+
+    {
+      "modules": [
+        {"name": "devices", "xml": ["Devices.NodeSet2.xml"]},
+        {"name": "machines", "xml": ["Machines.NodeSet2.xml"],
+         "depends": ["devices"]}
+      ]
+    }
+
+XML paths are relative to the manifest. Module names use lowercase letters,
+digits and underscores, starting with a letter. Each module can contain several
+XML files. Run::
+
+    python tools/nodeset_compiler/nodeset_compiler.py \
+        --existing path/to/Opc.Ua.NodeSet2.xml --types-array UA_TYPES \
+        --batch models.json output-directory
+
+The driver reads all namespace URI tables before generating code, freezes one
+plan, and emits separate ``namespace_<name>_generated.c/.h`` and
+``types_<name>_generated.c/.h`` files, plus private datatype headers. The chosen
+plan is saved as ``namespace_plan.json``. Optional ``--namespaceMap`` entries
+reserve indexes; remaining URIs receive unused indexes in dependency/input order.
+All modules must be regenerated when that plan changes. Generation together does
+not require loading together: each loader registers only namespaces used by its
+own inputs and dependencies, and copy mode still supports arbitrary server indexes.
+
+In copy mode, the exported ``UA_TYPES_<NAME>`` addresses remain templates.
+Resolve an exported static descriptor to the server's descriptor before setting a Variant,
+encoding a value, or comparing datatype pointers::
+
+    size_t ns;
+    UA_Server_getNamespaceByName(server, UA_STRING("urn:example"), &ns);
+    UA_NodeId id = UA_TYPES_EXAMPLE[UA_TYPES_EXAMPLE_MYTYPE].typeId;
+    id.namespaceIndex = (UA_UInt16)ns;
+    const UA_DataType *type = UA_Server_findDataType(server, &id);
+
+The C structure layouts and generated allocation/copy/clear helpers remain
+usable. Descriptor addresses returned for different servers need not be equal.
+The server owns copied descriptors and releases them after its values and nodes.
+The generated modules must remain loaded until server deletion. Array-specific
+loading functions and description-conversion helpers are local to the generated
+namespace ``.c`` file and refer directly to the generated arrays. Private
+``*_generated_internal.h`` headers contain only array declarations and constants. Conversion order is computed at generation
+time. Application code only includes the public
+generated headers. Registration uses the generic server datatype APIs.
+Private symbols include the generated module or datatype-array name so multiple
+sources can be compiled together, including in an SDK amalgamation. Imported
+public C types retain their existing names and are reused from dependency headers.
+
+Use ``copy_types = false`` to register the exported descriptor addresses directly.
+The caller must ensure that the baked indexes of datatype IDs, encoding IDs and
+referenced datatypes already match the server. This path neither validates nor
+remaps namespace indexes. Use ``NAMESPACE_MAP`` (CMake) or ``--namespaceMap``
+(command line) to choose the baked indexes when needed. For example::
+
+    ua_generate_nodeset_and_datatypes(
+        NAME "example"
+        FILE_NS "Example.NodeSet2.xml"
+        NAMESPACE_MAP "2:urn:example" "3:urn:example:encodings")
+
+All generated arrays are ``const``. Without an explicit map, their baked
+namespace indexes are compiler-local; no-copy loading is valid when the caller
+arranges matching server indexes. Arrays can be shared by several servers with
+matching namespace indexes. No arrays are modified and no process-lifetime
+binding state is needed. Additional namespaces can be appended later.
+
+Generated modules and their dependencies must use matching model definitions
+and the same SDK configuration. The loader does not compare native layouts at
+runtime. Static structure members must point at their dependencies' registered
+static descriptors. A static consumer of a copied dependency is therefore rejected;
+use copy mode consistently when servers need different namespace orders.
+The generated loader links one heap-allocated ``UA_DataTypeArray`` entry into
+``config->customDataTypes``, with both ``cleanup`` and ``borrowed`` set to true.
+Configuration cleanup frees the entry without clearing or freeing the static
+descriptors.
+Regenerate the loaders and datatype files for the entire dependency chain when
+upgrading to this API.
+
+The loader creates ReferenceTypes and raw DataType nodes before registering the
+types, then creates typed values and finishes the remaining nodes. XML values
+use the namespace table of their originating XML file, including nested
+ExtensionObjects, embedded binary bodies, NodeIds and QualifiedNames. Loading
+several XML files together therefore does not change the meaning of their local
+namespace indexes.
+
+Copy mode delegates mapping, layout construction and registration to
+``UA_Server_addDataTypeFromDescriptionEx``. The SDK owns descriptor storage and
+cleanup. A failed
+namespace load removes the nodes explicitly declared by that loader.
+Application callback side effects follow the existing node lifecycle contract. Namespaces and
+successfully registered types remain owned by the server and are cleaned up
+with it. Load each generated namespace once per server. Existing datatype IDs
+are rejected with ``BadNodeIdExists`` in both modes, even when their descriptors
+match. Loading is not atomic: after a failure that registered types, recreate
+the server before loading the namespace again. Serialize model-loading calls on
+each server and do not modify the server's custom-type chain while its nodes use those descriptors.
+
+A separate BSD type dictionary is still supported. It is only required when
+the NodeSet2 file does not contain complete ``Definition`` elements for its
+custom datatypes.
+
+We take the following information model snippet as the starting point of the
+following tutorial. A more detailed tutorial on how to create your own
+information model and NodeSet2.xml can be found in this blog post:
+https://profanter.medium.com/how-to-create-custom-opc-ua-information-models-1e9a461f5b58
 
 .. code-block:: xml
 
@@ -203,60 +359,65 @@ We take the following information model snippet as the starting point of the fol
         </UAVariable>
     </UANodeSet>
 
-Take the previous snippet and save it to a file ``myNS.xml``. To compile this nodeset into the corresponding C code, which can then be used by the open62541 stack, the nodeset compiler needs some arguments when you call it. The output of the help command gives you the following info:
+Take the previous snippet and save it to a file ``myNS.xml``. The file is
+compiled using the following function call in the CMake build system::
+
+    ua_generate_nodeset(
+        NAME "myNs"
+        FILE "${PROJECT_SOURCE_DIR}/examples/nodeset/myNS.xml"
+        DEPENDS_TYPES "UA_TYPES"
+        DEPENDS_NS "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/Schema/Opc.Ua.NodeSet2.xml
+    )
+
+If you look into the files generated by the nodeset compiler, you will see that
+it generated a method called ``extern UA_StatusCode myNS(UA_Server *server);``.
+You need to include the header and source file and then call ``myNS(server)``
+right after creating the server instance with ``UA_Server_new``. This will
+automatically add all the nodes to the server and return ``UA_STATUSCODE_GOOD``
+if there weren't any errors. Additionally you need to compile the open62541
+stack with the full NS0 by setting ``UA_NAMESPACE_ZERO=FULL`` in CMake.
+Otherwise the stack uses a subset where many nodes are not included and thus
+adding a custom nodeset may fail.
+
+If you also want to generate custom DataTypes for the nodeset, use the CMake
+function ``ua_generate_nodeset_and_datatypes``. It uses some best practice
+settings and you only need to pass a name and the NodeSet2 file. Inline
+``Definition`` elements generate datatypes automatically. ``FILE_CSV``
+optionally generates symbolic NodeId constants. ``FILE_BSD`` selects the legacy
+dictionary path when the XML definitions are incomplete. You can also define
+dependencies between nodesets using the ``DEPENDS`` argument. Here are some
+examples for the ``DI`` and ``PLCOpen`` nodesets::
+
+    # Generate types and namespace for DI
+    ua_generate_nodeset_and_datatypes(
+        NAME "di"
+        FILE_CSV "${UA_NODESET_DIR}/DI/Opc.Ua.Di.NodeIds.csv"
+        FILE_NS "${UA_NODESET_DIR}/DI/Opc.Ua.Di.NodeSet2.xml"
+    )
+
+    # generate PLCopen namespace which is using DI
+    ua_generate_nodeset_and_datatypes(
+        NAME "plc"
+        # PLCopen does not define custom types. Only generate the nodeset
+        FILE_NS "${UA_NODESET_DIR}/PLCopen/Opc.Ua.PLCopen.NodeSet2_V1.02.xml"
+        # PLCopen depends on the di nodeset, which must be generated before
+        DEPENDS "di"
+    )
+
+Manually calling the Nodeset Compiler
+.....................................
+
+Besides the CMake macros, the underlying Python code of the Nodeset compiler can
+be called directly. The call looks like this:
 
 .. code-block:: bash
 
-    $ python ./nodeset_compiler.py -h
-    usage: nodeset_compiler.py [-h] [-e <existingNodeSetXML>] [-x <nodeSetXML>]
-                               [--internal-headers]
-                               [-b <blacklistFile>] [-i <ignoreFile>]
-                               [-t <typesArray>]
-                               [-v]
-                               <outputFile>
+    $ python ./nodeset_compiler.py --types-array=UA_TYPES \
+        --types-output=types_myNS \
+        --existing ../../deps/ua-nodeset/Schema/Opc.Ua.NodeSet2.xml \
+        --xml myNS.xml myNS
 
-    positional arguments:
-      <outputFile>          The path/basename for the <output file>.c and <output
-                            file>.h files to be generated. This will also be the
-                            function name used in the header and c-file.
-
-    optional arguments:
-      -h, --help            show this help message and exit
-      -e <existingNodeSetXML>, --existing <existingNodeSetXML>
-                            NodeSet XML files with nodes that are already present
-                            on the server.
-      -x <nodeSetXML>, --xml <nodeSetXML>
-                            NodeSet XML files with nodes that shall be generated.
-      --internal-headers    Include internal headers instead of amalgamated header
-      -b <blacklistFile>, --blacklist <blacklistFile>
-                            Loads a list of NodeIDs stored in blacklistFile (one
-                            NodeID per line). Any of the nodeIds encountered in
-                            this file will be removed from the nodeset prior to
-                            compilation. Any references to these nodes will also
-                            be removed
-      -i <ignoreFile>, --ignore <ignoreFile>
-                            Loads a list of NodeIDs stored in ignoreFile (one
-                            NodeID per line). Any of the nodeIds encountered in
-                            this file will be kept in the nodestore but not
-                            printed in the generated code
-      -t <typesArray>, --types-array <typesArray>
-                            Types array for the given namespace. Can be used
-                            mutliple times to define (in the same order as the
-                            .xml files, first for --existing, then --xml) the type
-                            arrays
-      --max-string-length MAX_STRING_LENGTH
-                            Maximum allowed length of a string literal. If longer,
-                            it will be set to an empty string
-      -v, --verbose         Make the script more verbose. Can be applied up to 4
-                            times
-
-So the resulting call looks like this:
-
-.. code-block:: bash
-
-    $ python ./nodeset_compiler.py --types-array=UA_TYPES --existing ../../deps/ua-nodeset/Schema/Opc.Ua.NodeSet2.xml --xml myNS.xml myNS
-
-And the output of the command:
+The output of the command is:
 
 .. code-block:: bash
 
@@ -265,56 +426,43 @@ And the output of the command:
     INFO:__main__:Generating Code
     INFO:__main__:NodeSet generation code successfully printed
 
-The first argument ``--types-array=UA_TYPES`` defines the name of the global array in open62541 which contains the corresponding types used within the nodeset in ``NodeSet2.xml``. If you do not define your own datatypes, you can always use the ``UA_TYPES`` value. More on that later in this tutorial.
-The next argument ``--existing ../../deps/ua-nodeset/Schema/Opc.Ua.NodeSet2.xml`` points to the XML definition of the standard-defined namespace 0 (NS0). Namespace 0 is assumed to be loaded beforehand and provides definitions for data type, reference types, and so. Since we reference nodes from NS0 in our myNS.xml we need to tell the nodeset compiler that it should also load that nodeset, but not compile it into the output.
-Note that you may need to initialize the git submodule to get the ``deps/ua-nodeset`` folder (``git submodule update --init``) or download the full ``NodeSet2.xml`` manually.
-The argument ``--xml myNS.xml`` points to the user-defined information model, whose nodes will be added to the abstract syntax tree. The script will then create the files ``myNS.c`` and ``myNS.h`` (indicated by the last argument ``myNS``) containing the C code necessary to instantiate those namespaces.
+The first argument ``--types-array=UA_TYPES`` defines the name of the global
+array in open62541 which contains the corresponding types used within the
+nodeset in ``NodeSet2.xml``. If you do not define your own datatypes, you can
+always use the ``UA_TYPES`` value. More on that later in this tutorial. The next
+argument ``--existing ../../deps/ua-nodeset/Schema/Opc.Ua.NodeSet2.xml`` points
+to the XML definition of the standard-defined namespace 0 (NS0). Namespace 0 is
+assumed to be loaded beforehand and provides definitions for data type,
+reference types, and so. Since we reference nodes from NS0 in our myNS.xml we
+need to tell the nodeset compiler that it should also load that nodeset, but not
+compile it into the output. Note that you may need to initialize the git
+submodule to get the ``deps/ua-nodeset`` folder (``git submodule update
+--init``) or download the full ``NodeSet2.xml`` manually. The argument ``--xml
+myNS.xml`` points to the user-defined information model, whose nodes will be
+added to the abstract syntax tree. The script will then create the files
+``myNS.c`` and ``myNS.h`` (indicated by the last argument ``myNS``) containing
+the C code necessary to instantiate those namespaces. ``--types-output`` also
+creates ``types_myNS_generated.c`` and ``types_myNS_generated.h`` for inline
+datatype definitions. Omit that option when only namespace nodes are required
+or when the datatype array is generated separately from a BSD dictionary.
 
-Although it is possible to run the compiler this way, it is highly discouraged. If you care to examine the CMakeLists.txt (examples/nodeset/CMakeLists.txt), you will find out that the file ``server_nodeset.xml`` is compiled using the following function::
+The help command show which additional options are available:
 
-    ua_generate_nodeset(
-        NAME "example"
-        FILE "${PROJECT_SOURCE_DIR}/examples/nodeset/server_nodeset.xml"
-        DEPENDS_TYPES "UA_TYPES"
-        DEPENDS_NS    "${UA_FILE_NS0}"
-    )
+.. code-block:: bash
 
-If you look into the files generated by the nodeset compiler, you will see that it generated a method called ``extern UA_StatusCode myNS(UA_Server *server);``. You need to include the header and source file and then call the ``myNS(server)`` method right after creating the server instance with ``UA_Server_new``. This will automatically add all the nodes to the server and return ``UA_STATUSCODE_GOOD`` if there weren't any errors. Additionally you need to compile the open62541 stack with the full NS0 by setting ``UA_NAMESPACE_ZERO=FULL`` in CMake. Otherwise the stack uses a subset where many nodes are not included and thus adding a custom nodeset may fail.
-
-This is how you can use the nodeset compiler to compile simple NodeSet XMLs to be used by the open62541 stack.
-
-For your convenience and for simpler use we also provide a CMake function which simplifies the use of the ``ua_generate_datatypes`` and ``ua_generate_nodeset`` function even more.
-It is highly recommended to use this function: ``ua_generate_nodeset_and_datatypes``. It uses some best practice settings and you only need to pass a name, the namespace mapping ``NAMESPACE_MAP`` (as described further below) and the nodeset files.
-Passing the .csv and .bsd files is optional and if not given, generating datatypes for that noteset will be skipped. You can also define dependencies between nodesets using the ``DEPENDS`` argument.
-
-Here are some examples for the ``DI`` and ``PLCOpen`` nodesets::
-
-    # Generate types and namespace for DI
-    ua_generate_nodeset_and_datatypes(
-        NAME "di"
-        FILE_CSV "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/DI/OpcUaDiModel.csv"
-        FILE_BSD "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/DI/Opc.Ua.Di.Types.bsd"
-        NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"
-        FILE_NS "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/DI/Opc.Ua.Di.NodeSet2.xml"
-    )
-
-    # generate PLCopen namespace which is using DI
-    ua_generate_nodeset_and_datatypes(
-        NAME "plc"
-        # PLCopen does not define custom types. Only generate the nodeset
-        FILE_NS "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/PLCopen/Opc.Ua.PLCopen.NodeSet2_V1.02.xml"
-        # PLCopen depends on the di nodeset, which must be generated before
-        DEPENDS "di"
-    )
+    $ python ./nodeset_compiler.py -h
 
 Creating object instances
 .........................
 
-One of the key benefits of defining object types is being able to create object instances fairly easily. Object instantiation is handled automatically when the typedefinition NodeId points to a valid ObjectType node. All Attributes and Methods contained in the objectType definition will be instantiated along with the object node.
+One of the key benefits of defining object types is being able to create object
+instances fairly easily. Object instantiation is handled automatically when the
+TypeDefinition NodeId points to a valid ObjectType node. All Attributes and
+Methods contained in the objectType definition will be instantiated along with
+the object node.
 
-While variables are copied from the objetType definition (allowing the user for example to attach new dataSources to them), methods are always only linked. This paradigm is identical to languages like C++: The method called is always the same piece of code, but the first argument is a pointer to an object. Likewise, in OPC UA, only one methodCallback can be attached to a specific methodNode. If that methodNode is called, the parent objectId will be passed to the method - it is the methods job to derefence which object instance it belongs to in that moment.
-
-Let's look at an example that will create a pump instance given the newly defined objectType from myNS.xml:
+Let's look at an example that will create a pump instance given the newly
+defined objectType from myNS.xml:
 
 .. code-block:: c
 
@@ -342,7 +490,7 @@ Let's look at an example that will create a pump instance given the newly define
         UA_Server *server = UA_Server_new();
         UA_ServerConfig_setDefault(UA_Server_getConfig(server));
 
-        UA_StatusCode retval = myNS(server);
+        UA_StatusCode retval = myNS(server, true);
         /* Create nodes from nodeset */
         if(retval != UA_STATUSCODE_GOOD) {
             UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Could not add the example nodeset. "
@@ -374,11 +522,8 @@ Let's look at an example that will create a pump instance given the newly define
         return (int) retval;
     }
 
-Make sure you have updated the headers and libs in your project, then recompile and run the server. Make especially sure you have added ``myNS.h`` to your include folder.
-
-As you can see instantiating an object is not much different from creating an object node. The main difference is that you *must* use an objectType node as typeDefinition.
-
-If you start the server and inspect the nodes with UA Expert, you will find the pump in the objects folder, which look like this :numref:`nodeset-compiler-pump`.
+If you start the server and inspect the nodes, you will find the pump in the
+objects folder, which look like this :numref:`nodeset-compiler-pump`.
 
 .. _nodeset-compiler-pump:
 
@@ -387,59 +532,93 @@ If you start the server and inspect the nodes with UA Expert, you will find the 
 
    Instantiated Pump Object with inherited children
 
-As you can see the pump has inherited it's parents attributes (ManufacturerName and ModelName). Methods, in contrast to objects and variables, are never cloned but instead only linked. The reason is that you will quite propably attach a method callback to a central method, not each object. Objects are instantiated if they are *below* the object you are creating, so any object (like an object called associatedServer of ServerType) that is part of pump will be instantiated as well. Objects *above* you object are never instantiated, so the same ServerType object in Fielddevices would have been ommitted (the reason is that the recursive instantiation function protects itself from infinite recursions, which are hard to track when first ascending, then redescending into a tree).
+As you can see the pump has inherited its parents attributes (ManufacturerName
+and ModelName). Methods, in contrast to objects and variables, are never cloned
+but instead only linked. The reason is that you will quite probably attach a
+method callback to a central method, not each object. Objects are instantiated
+if they are *below* the object you are creating, so any object (like an object
+called associatedServer of ServerType) that is part of pump will be instantiated
+as well. Objects *above* you object are never instantiated, so the same
+ServerType object in Fielddevices would have been omitted (the reason is that
+the recursive instantiation function protects itself from infinite recursions,
+which are hard to track when first ascending, then redescending into a tree).
 
 
 Combination of multiple nodesets
 ................................
 
-In previous section you have seen how you can use the nodeset compiler with one single nodeset which depends on the default nodeset (NS0) ``Opc.Ua.NodeSet2.xml``. The nodeset compiler also supports nodesets which depend on more than one nodeset. We will show this use-case with the PLCopen nodeset. The PLCopen nodeset ``Opc.Ua.PLCopen.NodeSet2_V1.02.xml`` depends on the DI nodeset ``Opc.Ua.Di.NodeSet2.xml`` which then depends on NS0. This example is also shown in ``examples/nodeset/CMakeLists.txt``.
+In the previous section you have seen how you can use the nodeset compiler with
+one single nodeset which depends on the default nodeset (NS0)
+``Opc.Ua.NodeSet2.xml``. The nodeset compiler also supports nodesets which
+depend on more than one nodeset. We will show this use-case with the PLCopen
+nodeset. The PLCopen nodeset ``Opc.Ua.PLCopen.NodeSet2_V1.02.xml`` depends on
+the DI nodeset ``Opc.Ua.Di.NodeSet2.xml`` which then depends on NS0. This
+example is also shown in ``examples/nodeset/CMakeLists.txt``.
 
-This DI nodeset makes use of some additional data types in ``deps/ua-nodeset/DI/Opc.Ua.Di.Types.bsd``. Since we also need these types within the generated code, we first need to compile the types into C code. The generated code is mainly a definition of the binary representation of the types required for encoding and decoding. The generation can be done using the ``ua_generate_datatypes`` CMake function, which uses the ``tools/generate_datatypes.py`` script::
+For legacy NodeSets whose XML does not contain complete definitions, a BSD
+dictionary can still be compiled separately. The generated code describes the
+binary representation required for encoding and decoding. Use the
+``ua_generate_datatypes`` CMake function, which calls
+``tools/generate_datatypes.py``::
 
     ua_generate_datatypes(
         NAME "ua_types_di"
         TARGET_SUFFIX "types-di"
-        NAMESPACE_MAP "2:http://opcfoundation.org/UA/DI/"
-        FILE_CSV "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/DI/OpcUaDiModel.csv"
-        FILES_BSD "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/DI/Opc.Ua.Di.Types.bsd"
+        FILE_CSV "${UA_NODESET_DIR}/DI/Opc.Ua.Di.NodeIds.csv"
+        FILES_BSD "${UA_NODESET_DIR}/DI/Opc.Ua.Di.Types.bsd"
     )
 
-The ``NAMESPACE_MAP`` parameter is an array of strings which indicates the mapping of specific namespace uris to the resulting namespace index.
-This mapping is required for correct mapping of DataType nodes and their node ids. Currently we need to rely that the namespace is also added at this position in the final server. There is no automatic inferring yet (pull requests are warmly welcome).
-If you are using the `DEPENDS` option on the ``ua_generate_nodeset_and_datatypes``, the ``NAMESPACE_MAP`` is also inherited and you do not need to pass all mappings for dependent types.
-The CSV and BSD files contain the metadata and definition for the types. ``TARGET_SUFFIX`` is used to create a new target with the name ``open62541-generator-TARGET_SUFFIX``.
+``TARGET_SUFFIX`` is used to create a new target with the name
+``open62541-generator-TARGET_SUFFIX``.
 
 Now you can compile the DI nodeset XML using the following command::
 
     ua_generate_nodeset(
         NAME "di"
-        FILE "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/DI/Opc.Ua.Di.NodeSet2.xml"
+        FILE "${UA_NODESET_DIR}/DI/Opc.Ua.Di.NodeSet2.xml"
         TYPES_ARRAY "UA_TYPES_DI"
         INTERNAL
         DEPENDS_TYPES "UA_TYPES"
-        DEPENDS_NS    "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/Schema/Opc.Ua.NodeSet2.xml"
+        DEPENDS_NS    "${UA_NODESET_DIR}/Schema/Opc.Ua.NodeSet2.xml"
         DEPENDS_TARGET "open62541-generator-types-di"
     )
 
-There are now two new arguments: ``INTERNAL`` indicates that internal headers (and non public API) should be included within the generated source code. This is currently required for nodesets which use structures as data values, and will probably be fixed in the future.
-The ``DEPENDS_TYPES`` types array argument is matched with the nodesets in the same order as they appear on the ``DEPENDS_TARGET`` parameter. It tells the nodeset compiler which types array it should use: ``UA_TYPES`` for ``Opc.Ua.NodeSet2.xml`` and ``UA_TYPES_DI`` for ``Opc.Ua.Di.NodeSet2.xml``. This is the type array generated by the ``generate_datatypes.py`` script. The rest is similar to the example in previous section: ``Opc.Ua.NodeSet2.xml`` is assumed to exist already and only needs to be loaded for consistency checks, ``Opc.Ua.Di.NodeSet2.xml`` will be generated in the output file ``ua_namespace_di.c/.h``
+There are now two new arguments: ``INTERNAL`` indicates that internal headers
+(and non public API) should be included within the generated source code. This
+is currently required for nodesets which use structures as data values, and will
+probably be fixed in the future. The ``DEPENDS_TYPES`` types array argument is
+matched with the nodesets in the same order as they appear on the
+``DEPENDS_TARGET`` parameter. It tells the nodeset compiler which types array it
+should use: ``UA_TYPES`` for ``Opc.Ua.NodeSet2.xml`` and ``UA_TYPES_DI`` for
+``Opc.Ua.Di.NodeSet2.xml``. This is the type array generated by the
+``generate_datatypes.py`` script. The rest is similar to the example in previous
+section: ``Opc.Ua.NodeSet2.xml`` is assumed to exist already and only needs to
+be loaded for consistency checks, ``Opc.Ua.Di.NodeSet2.xml`` will be generated
+in the output file ``ua_namespace_di.c/.h``
 
-Next we can generate the PLCopen nodeset. Since it doesn't require any additional datatype definitions, we can immediately start with the nodeset compiler command::
+Next we can generate the PLCopen nodeset. Since it doesn't require any
+additional datatype definitions, we can immediately start with the nodeset
+compiler command::
 
     ua_generate_nodeset(
         NAME "plc"
-        FILE "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/PLCopen/Opc.Ua.PLCopen.NodeSet2_V1.02.xml"
+        FILE "${UA_NODESET_DIR}/PLCopen/Opc.Ua.PLCopen.NodeSet2_V1.02.xml"
         INTERNAL
         DEPENDS_TYPES
             "UA_TYPES" "UA_TYPES_DI"
         DEPENDS_NS
-            "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/Schema/Opc.Ua.NodeSet2.xml"
-            "${PROJECT_SOURCE_DIR}/deps/ua-nodeset/DI/Opc.Ua.Di.NodeSet2.xml"
+            "${UA_NODESET_DIR}/Schema/Opc.Ua.NodeSet2.xml"
+            "${UA_NODESET_DIR}/DI/Opc.Ua.Di.NodeSet2.xml"
         DEPENDS_TARGET "open62541-generator-ns-di"
     )
 
-This call is quite similar to the compilation of the DI nodeset. As you can see, we do not define any specific types array for the PLCopen nodeset. Since the PLCopen nodeset depends on the NS0 and DI nodeset, we need to tell the nodeset compiler that these two nodesets should be seen as already existing. Make sure that the order is the same as in your XML file, e.g., in this case the order indicated in ``Opc.Ua.PLCopen.NodeSet2_V1.02.xml -> UANodeSet -> Models -> Model``.
+This call is quite similar to the compilation of the DI nodeset. As you can see,
+we do not define any specific types array for the PLCopen nodeset. Since the
+PLCopen nodeset depends on the NS0 and DI nodeset, we need to tell the nodeset
+compiler that these two nodesets should be seen as already existing. Make sure
+that the order is the same as in your XML file, e.g., in this case the order
+indicated in ``Opc.Ua.PLCopen.NodeSet2_V1.02.xml -> UANodeSet -> Models ->
+Model``.
 
 As a result of the previous scripts you will have multiple source files:
 
@@ -452,7 +631,9 @@ As a result of the previous scripts you will have multiple source files:
 * ua_namespace_plc.c
 * ua_namespace_plc.h
 
-Finally you need to include all these files in your build process and call the corresponding initialization methods for the nodesets. An example application could look like this:
+Finally you need to include all these files in your build process and call the
+corresponding initialization methods for the nodesets. An example application
+could look like this:
 
 .. code-block:: c
 
@@ -477,3 +658,206 @@ Finally you need to include all these files in your build process and call the c
     }
 
     retval = UA_Server_run(server, &running);
+
+Outstanding Companion Spec Issues
+.................................
+
+There are some Companion Specifications that currently cannot be compiled with
+the Nodeset compiler. Which Companion Specifications are affected and what
+causes this is described below.
+
+Safety, Glass, DEXPI
+   Do not specify a BSD file or BSD blob in the XML file.
+   The BSD file is considered deprecated.
+   However, it is currently still required by the Nodeser compiler.
+
+I4AAS, RSL, FDI
+   Attempting to load will result in a runtime error
+   ("Type-checking failed with error code BadTypeMismatch" or "Parent node not found").
+
+BACnet
+   Defines data types whose fields have the names signed or unsigned.
+   This leads to errors when creating C structures, because signed and unsigned are keywords in C.
+
+Automatic Nodesetinjection
+..........................
+
+The nodesetinjector is a mechanism for automatically loading nodeset/companion
+specifications during server initialization. It provides a fast and easy way to
+load nodesets in all applications, focusing on the official
+OPCFoundation/UANodeset Repository
+(https://github.com/OPCFoundation/UA-Nodeset). Specify the required information
+models using CMake.
+
+Which nodesets are to be loaded is determined by the Cmake flag
+``UA_INFORMATION_MODEL_AUTOLOAD``. All nodesets that are to be loaded
+automatically are listed here. The naming is based on the folder name of the
+Companion Specification in the ua-nodeset folder. Shortnames are case-sensitive;
+nested models use the names listed below. Where a folder contains several
+revisions of the same model, the shortname selects the revision configured in
+``tools/nodeset_injector/CMakeLists.txt``.
+
+A CMake call could look like this.
+
+.. code-block:: bash
+
+    -DCMAKE_BUILD_TYPE=Debug
+    -DUA_BUILD_EXAMPLES=ON
+    -DUA_INFORMATION_MODEL_AUTOLOAD="DI;POWERLINK;PROFINET;MachineVision"
+    -DUA_NAMESPACE_ZERO=FULL
+
+The order of nodesets is important! Nodesets that build on other nodesets must
+be placed after them in the list. The following nodesets are currently
+supported, grouped by dependency depth:
+
+**Level 0 — Standalone (no companion-spec dependency, only ns0):**
+
+AML-BaseTypes, AMB, BACnet, CNC, DemoModel, DEXPI, DI, DI-PackageMetadata,
+GDS, I4AAS, IOLinkIODD, IREDES, ISA-95,
+ISA95-JOBCONTROL, MachineVision, Machinery-Result,
+MDIS, MTConnect, OpenSCS, PackML, PROFINET, RSL,
+Safety, Scheduler, TestModel, UAFX-Data, WireHarness-VEC, WoT, XML
+
+**Level 1 — Depends on Level-0 specs (typically DI):**
+
+ADI (DI), AML-Libraries (AML-BaseTypes), AutoID (DI), CommercialKitchenEquipment (DI),
+CSPPlusForMachine (DI), FDI5 (DI), FDI7 (DI), FDT (DI), GPOS (RSL), IA (DI),
+IOLink (DI), Machinery-Jobs (ISA95-JOBCONTROL),
+Onboarding (GDS), PADIM (DI),
+PlasticsRubber-GeneralTypes (DI), PLCopen (DI),
+PNEM (DI), PNENC (DI), PNGSDGM (DI), PNRIO (DI), POWERLINK (DI),
+Robotics (DI), Sercos (DI),
+UAFX-AC (DI, UAFX-Data), UAFX-CM (DI, UAFX-Data), UnattendedRetail (DI)
+
+**Level 2 — Depends on Level-1 specs (two or more dependency hops):**
+
+Each entry lists its required dependencies in parentheses.
+
+CAS (DI, Machinery, IA),
+CranesHoists (DI, IA, Machinery, Robotics),
+ECM (DI, IA),
+Eumabois (DI, Machinery, Woodworking),
+Glass (DI, Machinery),
+Glass-v2 (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs),
+IA-Examples (DI, IA),
+LADS (DI, AMB, Machinery),
+Machinery (DI, IA),
+MachineVision-AMCM (DI, IA, Machinery),
+Machinery-Energy (DI, IA, ECM),
+Machinery-ProcessValues (DI, PADIM),
+MachineTool (DI, Machinery, IA, ISA95-JOBCONTROL, Machinery-Jobs),
+Mining-General (DI, IA, Machinery),
+PNDRV (DI, PNENC),
+PlasticsRubber-Dosing (DI, IA, Machinery, PlasticsRubber-GeneralTypes),
+PlasticsRubber-FoamCutting (DI, IA, Machinery, PlasticsRubber-GeneralTypes),
+PlasticsRubber-GDD (DI, IA, Machinery, PlasticsRubber-GeneralTypes),
+PlasticsRubber-TCD (DI, PlasticsRubber-GeneralTypes),
+PlasticsRubber-IMM2MES (DI, PlasticsRubber-GeneralTypes),
+PlasticsRubber-LDS (DI, PlasticsRubber-GeneralTypes),
+PlasticsRubber-HotRunner (DI, PlasticsRubber-GeneralTypes),
+Pumps (DI, Machinery),
+Scales (DI, Machinery, PackML),
+Shotblasting (DI, Machinery, ISA95-JOBCONTROL, Machinery-Jobs),
+STGeneralTypes (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs),
+SurfaceTechnology (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs),
+TMC (DI, PackML),
+Weihenstephan (DI, Machinery, PackML),
+Woodworking (DI, Machinery, ISA95-JOBCONTROL, Machinery-Jobs)
+
+**Level 3 — Deep stacks (depends on Level-2 specs):**
+
+Each entry lists its full dependency chain in parentheses,
+i.e. every spec that must be loaded before it.
+
+AdditiveManufacturing (DI, IA, Machinery, PADIM, Machinery-ProcessValues, ISA95-JOBCONTROL, Machinery-Jobs, MachineTool),
+CuttingTool (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs, Machinery-Result, MachineTool, GMS),
+GMS (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs, Machinery-Result, MachineTool),
+IJT (DI, AMB, IA, Machinery, Machinery-Result — loads both IJT/Base and IJT/Tightening),
+LaserSystems (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs, MachineTool),
+LaserSystems-Example (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs, MachineTool, LaserSystems),
+Machinery-Examples (DI, IA, Machinery, PADIM, Machinery-ProcessValues, ISA95-JOBCONTROL, Machinery-Jobs, Machinery-Result),
+MetalForming (DI, IA, Machinery, PADIM, Machinery-ProcessValues, ISA95-JOBCONTROL, Machinery-Jobs, MachineTool),
+Mining-Extraction-General (DI, IA, Machinery, Mining-General),
+Mining-Extraction-ShearerLoader (DI, IA, Machinery, Mining-General, Mining-Extraction-General),
+Mining-Loading-General (DI, IA, Machinery, Mining-General),
+Mining-Loading-HydraulicExcavator (DI, IA, Machinery, Mining-General, Mining-Loading-General),
+Mining-DevelopmentSupport-General (DI, IA, Machinery, Mining-General),
+Mining-DevelopmentSupport-RoofSupportSystem (DI, IA, Machinery, Mining-General, Mining-DevelopmentSupport-General),
+Mining-DevelopmentSupport-Dozer (DI, IA, Machinery, Mining-General, Mining-DevelopmentSupport-General),
+Mining-TransportDumping-Conveying (DI, IA, Machinery, Mining-General),
+Mining-TransportDumping-General (DI, IA, Machinery, Mining-General),
+Mining-TransportDumping-RearDumpTruck (DI, IA, Machinery, Mining-General, Mining-TransportDumping-General),
+Mining-TransportDumping-ArmouredFaceConveyor (DI, IA, Machinery, Mining-General, Mining-TransportDumping-General),
+Mining-MineralProcessing-General (DI, IA, Machinery, Mining-General),
+Mining-MineralProcessing-RockCrusher (DI, IA, Machinery, Mining-General, Mining-MineralProcessing-General),
+Mining-PELOServices-General (DI, IA, Machinery, Mining-General),
+Mining-PELOServices-FaceAlignmentSystem (DI, IA, Machinery, Mining-General, Mining-PELOServices-General),
+Mining-MonitoringSupervisionServices-General (DI, IA, Machinery, Mining-General),
+PAEFS (DI, Machinery, PADIM, Machinery-ProcessValues),
+Powertrain (DI, Machinery, UAFX-Data, UAFX-AC),
+SurfaceTechnology-CleaningPretreatment (DI, IA, Machinery, PADIM, Machinery-ProcessValues, ISA95-JOBCONTROL, Machinery-Jobs, STGeneralTypes),
+SurfaceTechnology-OCT-MSS (DI, IA, Machinery, PADIM, Machinery-ProcessValues, ISA95-JOBCONTROL, Machinery-Jobs, STGeneralTypes),
+WMTP (DI, Machinery, PADIM, Machinery-ProcessValues),
+PlasticsRubber-Extrusion-GeneralTypes (DI, IA, Machinery, PlasticsRubber-GeneralTypes),
+PlasticsRubber-Extrusion-{ExtrusionLine,Extruder,Die,Filter,MeltPump,HaulOff,
+Pelletizer,Calender,Calibrator,Corrugator,Cutter}
+(DI, IA, Machinery, PlasticsRubber-GeneralTypes, PlasticsRubber-Extrusion-GeneralTypes),
+PlasticsRubber-Extrusion_v2-GeneralTypes (DI, IA, Machinery, PlasticsRubber-GeneralTypes),
+PlasticsRubber-Extrusion_v2-{ExtrusionLine,Extruder,Die,Filter,MeltPump,HaulOff,
+Pelletizer,Calender,Calibrator,Corrugator,Cutter}
+(DI, IA, Machinery, PlasticsRubber-GeneralTypes, PlasticsRubber-Extrusion_v2-GeneralTypes),
+TTD (DI, IA, Machinery, ISA95-JOBCONTROL, Machinery-Jobs, Machinery-Result, MachineTool),
+WireHarness (DI, Machinery, ISA95-JOBCONTROL, Machinery-Jobs, Machinery-Result, WireHarness-VEC)
+
+.. note::
+
+   **PADIM** also loads the IRDI dictionary. List **PADIM** and
+   **Machinery-ProcessValues** explicitly before models that require them.
+   **SurfaceTechnology** selects the Plasma model; **STGeneralTypes** selects
+   its shared general types. **Glass** and **Glass-v2** select the original
+   and v2 Flat Glass models, respectively.
+
+.. warning::
+
+   Some companion specifications define types with the same C name in
+   different OPC UA namespaces. These cannot be loaded simultaneously:
+
+   - **DemoModel** and **TestModel** share test datatype names, including
+     ``UA_EnumUnderscoreTest``.
+   - **Pumps** and **PAEFS** both define ``UA_ControlModeEnum``.
+   - **TMC** and **PlasticsRubber-GeneralTypes** both define
+     ``UA_ControlModeEnumeration`` / ``UA_ProductionStatusEnumeration``.
+   - **CommercialKitchenEquipment** and **PlasticsRubber-TCD** both
+     define ``UA_OperatingModeEnumeration``.
+   - **PlasticsRubber-LDS** and **PlasticsRubber-Extrusion-GeneralTypes**
+     both define ``UA_ComponentStatusEnumeration``.
+   - **PlasticsRubber-Extrusion** (v1) and **PlasticsRubber-Extrusion_v2**
+     share multiple type names and cannot be loaded together.
+   - **MachineVision** and **Machinery-Result** both define
+     ``ProcessingTimesDataType`` / ``ResultDataType``.
+     Choose Machinery-Result when IJT, GMS, or TTD are needed.
+   - **PNEM** and **ECM** both define ``AcPeDataType`` /
+     ``AcPpDataType`` / ``EnergyStateInformationDataType``.
+     Choose ECM when Machinery-Energy is needed.
+
+When the open62541 library is installed on the system, the automatically
+generated autoinject library is installed alongside it. Additionally, the header
+files for the specified nodesets will be accessible on the system.
+
+Integrating the autoinject library into an existing CMake project is
+straightforward. To achieve this, the CMake configuration should include the
+following:
+
+.. code-block:: cmake
+
+    set(open62541_LIBRARIES "")
+    find_package(open62541 REQUIRED)
+    list(APPEND open62541_LIBRARIES open62541::open62541 open62541::autoinject)
+
+The generated namespace header files can also be included and used with the following code:
+
+.. code-block:: c
+
+    #include <autoinject/namespace_di_generated.h>
+    #include <autoinject/namespace_amb_generated.h>
+    #include <autoinject/namespace_machinery_generated.h>
